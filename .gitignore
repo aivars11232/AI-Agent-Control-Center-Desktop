@@ -1,0 +1,16 @@
+node_modules/
+dist/
+src-tauri/target/
+*.log
+.DS_Store
+.env
+.env.local
+.env.*.local
+
+# Generated audio files
+temp.raw
+temp.wav
+
+# Python cache
+__pycache__/
+*.pyc

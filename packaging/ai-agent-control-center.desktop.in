@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=AI Agent Control Center
+GenericName=AI Agent Manager
+Comment=Create, configure, and monitor AI agents
+Exec=@EXEC@
+Icon=@ICON@
+Terminal=false
+Categories=Development;Utility;
+Keywords=AI;Agents;Automation;Control Center;
+StartupNotify=true
+StartupWMClass=ai-agent-control-center
