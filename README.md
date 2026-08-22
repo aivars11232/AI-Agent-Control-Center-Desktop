@@ -43,26 +43,54 @@ Other platforms are not current release targets.
 
 ## Development
 
-Install JavaScript dependencies from the lockfile and start the Tauri
-development application:
+The locked frontend toolchain requires Node.js <code>^20.19.0</code> or
+<code>>=22.12.0</code>. The verification routes also require npm, Bash,
+Python 3, Cargo, rustfmt, and Clippy. Install JavaScript dependencies without
+package lifecycle scripts:
 
 ```bash
-npm ci
-npm run desktop
+npm ci --ignore-scripts
 ```
 
-Build the frontend or desktop bundle with the checked-in scripts:
+Run the deterministic fast characterization gate from the repository root:
 
 ```bash
-npm run build
+npm run verify:fast
+```
+
+It runs 18 frontend characterization tests, the TypeScript check, the Rust
+format check, and 9 locked/offline Rust tests. The full gate adds the frontend
+build, Clippy, shell/Python/JSON checks, dependency-tree checks, and production
+plus development npm audits:
+
+```bash
+npm run verify:full
+```
+
+Both routes print each command and stop on the first failure. They never start
+Codex, Ollama, microphone capture, the Python listener, a KDE portal,
+installation/removal, or desktop control. The full route accesses the npm
+advisory service, so its audit result is a fresh time-dependent check rather
+than offline evidence.
+
+If `cargo-audit` is available, the full route audits
+`src-tauri/Cargo.lock`. If it is unavailable, the route prints an explicit
+skip and reports the Rust advisory result as **indeterminate**; absence of the
+tool is never reported as a pass. Installing security tooling and making it a
+mandatory CI gate belongs to TASK-0019.
+
+Start or build the desktop application only when the active task explicitly
+owns that runtime action:
+
+```bash
+npm run desktop
 npm run desktop:build
 ```
 
 The repository also contains `install-kde.sh` and `uninstall-kde.sh`. Those
 scripts mutate the local desktop installation and must only be run as an
-explicitly approved live action. No build, provider, microphone, portal,
-installer, uninstaller, or desktop-control action was run while establishing
-this documentation baseline.
+explicitly approved live action. TASK-0002 syntax-checks them but does not
+execute them.
 
 ## Working on the project
 

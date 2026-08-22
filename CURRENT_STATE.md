@@ -1,10 +1,11 @@
 # Current State
 
-> **Classification: Current static evidence.** This snapshot was established
-> for TASK-0001 on 2026-08-22 from baseline commit
-> <code>9805c71056d894a9f57029773323f3a6f25ca6b0</code> on branch
-> <code>main</code>. Reverify details that may drift before relying on them in a
-> later task.
+> **Classification: Current static and fresh non-live evidence.** This snapshot
+> was refreshed for TASK-0002 on 2026-08-22 from starting commit
+> <code>91db386df910d91e488b5710ab65490963579475</code> on branch
+> <code>main</code>. TASK-0002 changes remain in the working tree pending user
+> review and Git closure. Reverify details that may drift before relying on
+> them in a later task.
 
 This document owns statements about what is implemented now. Planned behavior
 belongs in [ARCHITECTURE.md](ARCHITECTURE.md) and
@@ -12,20 +13,17 @@ belongs in [ARCHITECTURE.md](ARCHITECTURE.md) and
 
 ## Evidence boundary
 
-Fresh TASK-0001 inspection established the repository root, branch, HEAD,
-manifests, source structure, relevant code paths, and checked-in tests. The
-working tree was clean before the documentation task began.
+TASK-0001 established the repository authority baseline. TASK-0002 then ran
+fresh frontend and Rust characterization tests, TypeScript and Vite checks,
+Rust formatting and Clippy, syntax checks, dependency-tree checks, and npm
+audits. These checks establish the non-live verification baseline described
+below; they do not establish live runtime readiness.
 
-TASK-0001 did **not** run:
-
-- the frontend or Rust build and test suites;
-- Codex, Ollama, or any other model/provider;
-- microphone capture or the Python voice listener;
-- KDE/XDG portal authorization or desktop-control commands;
-- install, uninstall, package, or system mutation.
-
-Runtime readiness and live behavior are therefore unverified by this task.
-Earlier audit observations are historical evidence only.
+TASK-0002 did **not** run Codex, Ollama, or another model/provider; capture
+microphone input; import or start the Python listener; authorize a KDE/XDG
+portal; execute install/remove scripts; build a desktop package; or perform a
+desktop/system-control action. Earlier audit observations remain historical
+unless this document identifies a fresh TASK-0002 result.
 
 ## Product and release identity
 
@@ -55,9 +53,9 @@ Earlier audit observations are historical evidence only.
 | <code>install-kde.sh</code> / <code>uninstall-kde.sh</code> | KDE-oriented local install and removal scripts |
 
 The implementation is concentrated: at this snapshot, <code>src/App.tsx</code>
-has 8,908 lines, <code>src/App.css</code> has 1,952 lines, and
-<code>src-tauri/src/lib.rs</code> has 2,734 lines. These counts are
-observations, not architectural requirements.
+has 8,908 lines, <code>src/App.css</code> has 1,952 lines, and the formatted
+<code>src-tauri/src/lib.rs</code> with its expanded test module has 3,205 lines.
+These counts are observations, not architectural requirements.
 
 ## Renderer behavior
 
@@ -200,23 +198,43 @@ The Tauri configuration currently sets Content Security Policy to
 
 ## Verification inventory
 
-The checked-in Rust module contains four unit tests covering:
+TASK-0002 adds two Vitest files containing 18 deterministic frontend tests.
+They characterize the current renderer safety assessment, approval
+normalization, execution and review routing, stored preference/performance
+normalization, and voice-command interpretation. The production functions are
+exported as minimal test seams; their bodies and callers are unchanged.
 
-- Ollama HTTP request connection behavior;
-- Qwen JSON tool-call fallback parsing;
-- rejection of workspace paths outside the selected workspace;
-- omission of Ollama write tools for read-only runs.
+The Rust module now contains nine passing unit tests: the four earlier tests
+covering the Ollama connection, Qwen fallback parsing, workspace path
+containment, and read-only tool exposure, plus five tests characterizing run
+safety validation and voice configuration normalization. The Ollama connection
+test uses an isolated loopback test server; it does not contact a live
+provider.
 
-<code>package.json</code> has development, build, preview, Tauri, and install
-scripts, but no frontend <code>test</code> or <code>lint</code> script.
-TASK-0002 owns a reproducible baseline and characterization verification. The
-four Rust tests were inspected but not executed during TASK-0001.
+The repository-root entry points are:
+
+- <code>npm run verify:fast</code> — Vitest, TypeScript, rustfmt, and locked
+  offline Rust tests;
+- <code>npm run verify:full</code> — the fast route plus the Vite build,
+  Clippy, shell/Python/strict-JSON syntax checks, npm/Cargo dependency trees,
+  and production plus full npm audits.
+
+Both fresh routes passed on 2026-08-22. The frontend build transformed 34
+modules; both npm audits reported zero vulnerabilities. The full route produced
+large dependency-tree output that was truncated in the captured console view,
+but the process completed with exit status 0 and its final audit/status lines
+were captured.
+
+<code>cargo-audit</code> is not installed in the inspected environment. The
+full route therefore reports the Rust advisory result as **indeterminate** and
+does not represent the skip as a pass. Mandatory installed/CI security tooling
+belongs to TASK-0019.
 
 ## Known gaps and roadmap ownership
 
 | Gap | Owning task |
 | --- | --- |
-| Reproducible baseline and characterization suite | TASK-0002 |
+| Mandatory installed/CI Rust advisory tooling | TASK-0019 |
 | Backend persistence and migrations | TASK-0003 |
 | Authoritative approval/policy boundary and CSP | TASK-0004 |
 | Single-run coordinator, lifecycle, ledger, and output contract | TASK-0005 |

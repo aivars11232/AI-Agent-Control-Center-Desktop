@@ -59,7 +59,7 @@ type VoiceTranscriptEvent = {
   transcript: string;
 };
 
-type VoiceState = "VOICE_OFF" | "VOICE_PASSIVE" | "VOICE_ACTIVE";
+export type VoiceState = "VOICE_OFF" | "VOICE_PASSIVE" | "VOICE_ACTIVE";
 type VoiceUiState = "VOICE OFF" | "PASSIVE" | "LISTENING" | "PROCESSING" | "EXECUTING" | "SUCCESS" | "ERROR";
 
 type DesktopControlStatus = {
@@ -380,7 +380,7 @@ type TaskStatus =
   | "Completed"
   | "Failed";
 
-type TaskCategory =
+export type TaskCategory =
   | "Development"
   | "Research"
   | "Browsing"
@@ -390,7 +390,7 @@ type TaskCategory =
   | "System Control"
   | "General";
 
-type TaskPriority = "Low" | "Normal" | "High" | "Critical";
+export type TaskPriority = "Low" | "Normal" | "High" | "Critical";
 type HistoryRetentionDays = 7 | 30 | 90 | "never";
 type AgentStatus = "Working" | "Waiting" | "Paused";
 type ThemeMode = "dark" | "light" | "system";
@@ -398,7 +398,7 @@ type AccentColor = "violet" | "blue" | "cyan" | "green";
 type InterfaceDensity = "comfortable" | "compact";
 type ExecutionFocus = "speed" | "balanced" | "strength";
 type OverflowAction = "queue" | "redirect";
-type SafetyMode = "balanced" | "strict" | "locked";
+export type SafetyMode = "balanced" | "strict" | "locked";
 type RoutingMode = "selected" | "automatic";
 type ReviewMode = "off" | "manual" | "automatic";
 type ReviewStatus =
@@ -417,7 +417,7 @@ type WorkspaceDefinition = {
   path: string;
 };
 
-type AgentPerformance = {
+export type AgentPerformance = {
   strength: number;
   focus: ExecutionFocus;
   cpuLimit: number;
@@ -426,7 +426,7 @@ type AgentPerformance = {
   redirectAgentId: number | null;
 };
 
-type AppPreferences = {
+export type AppPreferences = {
   theme: ThemeMode;
   accentColor: AccentColor;
   density: InterfaceDensity;
@@ -457,7 +457,7 @@ type AppPreferences = {
 
 type ApprovalRequestStatus = "Pending" | "Approved" | "Denied" | "Expired";
 
-type ApprovalRequest = {
+export type ApprovalRequest = {
   id: number;
   agentId: number;
   taskId: number | null;
@@ -483,7 +483,7 @@ type TaskPhase =
   | "Finished"
   | "Failed";
 
-type AgentTask = {
+export type AgentTask = {
   id: number;
   title: string;
   category: TaskCategory;
@@ -516,7 +516,7 @@ type ModelProvider = "OpenAI" | "Anthropic" | "Google" | "Ollama" | "Custom";
 
 type AiProvider = "codex" | "ollama";
 
-type ModelDefinition = {
+export type ModelDefinition = {
   id: number;
   name: string;
   provider: ModelProvider;
@@ -570,7 +570,7 @@ type AgentCategory =
 
 type AuthorityLevel = 1 | 2 | 3 | 4;
 
-type Agent = {
+export type Agent = {
   id: number;
   name: string;
   description: string;
@@ -604,7 +604,7 @@ type Agent = {
   };
 };
 
-type TaskSafetyAssessment = {
+export type TaskSafetyAssessment = {
   riskLevel: RiskLevel;
   scopes: SafetyScope[];
   approvalScopes: SafetyScope[];
@@ -623,7 +623,7 @@ const safetyScopeLabels: Record<SafetyScope, string> = {
   system: "system control",
 };
 
-function taskSafetyAssessment(
+export function taskSafetyAssessment(
   task: AgentTask,
   agent: Agent,
   safetyMode: SafetyMode,
@@ -746,7 +746,7 @@ function taskSafetyAssessment(
   };
 }
 
-function normalizeApprovalRequest(
+export function normalizeApprovalRequest(
   request: Partial<ApprovalRequest>,
 ): ApprovalRequest | null {
   if (
@@ -808,7 +808,7 @@ function normalizeApprovalRequest(
   };
 }
 
-function executionRouteForTask(
+export function executionRouteForTask(
   agents: Agent[],
   models: ModelDefinition[],
   category: TaskCategory,
@@ -871,7 +871,7 @@ function executionRouteForTask(
   };
 }
 
-function reviewAgentForTask(
+export function reviewAgentForTask(
   agents: Agent[],
   ownerAgentId: number,
   category: TaskCategory,
@@ -957,7 +957,7 @@ function clampNumber(
     : fallback;
 }
 
-function normalizePerformance(
+export function normalizePerformance(
   performance?: Partial<AgentPerformance>,
 ): AgentPerformance {
   return {
@@ -981,7 +981,7 @@ function normalizePerformance(
   };
 }
 
-function normalizePreferences(
+export function normalizePreferences(
   preferences?: Partial<AppPreferences>,
 ): AppPreferences {
   const legacyWorkspacePath =
