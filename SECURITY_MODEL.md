@@ -2,8 +2,9 @@
 
 > **Current status:** version 0.5.1 is a development prototype, not a hardened
 > or production-ready control plane. This document distinguishes checked-in
-> controls from planned security invariants. TASK-0001 made no security or
-> runtime behavior change.
+> controls from planned security invariants. TASK-0003 establishes backend
+> persistence but does not implement TASK-0004 approval authority or IPC/CSP
+> hardening.
 
 ## Security objective
 
@@ -56,6 +57,15 @@ Static inspection found these implemented controls:
   and <code>.git</code> rejection;
 - per-run cancellation flags and bounded timeouts;
 - changed-file and Git diff capture where available.
+- typed, bounded backend validation for persisted application state;
+- schema-versioned SQLite persistence with foreign keys, integrity checks,
+  explicit migration evidence, atomic writes, and stale-revision rejection;
+- fail-closed desktop startup/save behavior when persistence is unavailable;
+- Unix application-data directory/file modes restricted to the current user;
+- one-time legacy migration that commits before renderer cleanup and refuses
+  malformed input without partial state;
+- downgrade of pending/approved legacy approvals to expired records whose
+  database rows are constrained to <code>authoritative = 0</code>.
 
 These controls reduce risk but do not establish the target authorization model.
 
@@ -63,11 +73,12 @@ These controls reduce risk but do not establish the target authorization model.
 
 ### Approval authority
 
-Approval records, expiry, status, matching, and consumption are renderer-owned.
-The renderer sends <code>approvalId</code>, <code>authorizedScopes</code>, and
-<code>destructiveActionsApproved</code> to the backend. The backend validates
-their shape and some combinations, but has no authoritative approval record
-against which to prove:
+Approval records are now durable backend data, but their lifecycle decisions
+remain renderer-managed and every schema-v1 row is explicitly
+non-authoritative. The renderer sends <code>approvalId</code>,
+<code>authorizedScopes</code>, and <code>destructiveActionsApproved</code> to the
+backend. The execution boundary validates their shape and some combinations,
+but does not consult an authoritative approval record to prove:
 
 - who or what issued the approval;
 - exact task, agent, workspace, action, and scope matching;
@@ -80,11 +91,13 @@ TASK-0004 owns the authoritative approval/policy contract.
 
 ### State integrity and recovery
 
-Core domain state is stored in WebView <code>localStorage</code>. It has no
-backend transaction boundary, durable schema/migration ledger, integrity
-protection, or authoritative crash-recovery protocol. Backup import expands the
-untrusted input surface. TASK-0003 and TASK-0014 own persistence and lifecycle
-controls.
+Desktop core domain state now uses a backend-owned SQLite transaction boundary,
+schema/migration ledger, integrity check, and compare-and-swap revision. The
+renderer cannot fall back to WebView storage after desktop persistence starts
+or fails. Remaining lifecycle gaps include strict backup/export contracts,
+continuous bounded retention, recovery UX, and integrated live upgrade
+evidence. TASK-0014 owns those controls. The browser preview remains
+non-authoritative.
 
 ### IPC and web content
 
@@ -112,10 +125,11 @@ through TASK-0008 own these boundaries.
 
 ### Verification coverage
 
-Four Rust unit tests cover selected Ollama transport/tool containment cases.
-There is no checked-in frontend test or lint script. Security claims have not
-yet passed the reproducible characterization, end-to-end, packaging, or live
-acceptance gates.
+The checked-in non-live suite now includes 24 frontend tests and 23 Rust tests,
+including persistence validation, migration, corruption, concurrency, and
+rollback cases. These checks do not establish end-to-end, packaging, upgrade,
+or live acceptance. Rust advisory status remains indeterminate when
+<code>cargo-audit</code> is unavailable.
 
 ## Target security invariants
 
@@ -202,6 +216,8 @@ least-privilege workarounds before any code change.
 ## Privacy rules
 
 - Do not store provider credentials in ordinary renderer state or backups.
+- Treat the SQLite application-state database as sensitive local user data;
+  keep its path out of routine errors and preserve private filesystem modes.
 - Do not include secrets, complete private prompts, workspace contents, or raw
   microphone audio in routine logs.
 - Make retention and deletion behavior explicit and testable.

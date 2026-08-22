@@ -16,15 +16,17 @@ The current checkout contains:
 
 - a React 19 and TypeScript renderer built with Vite;
 - a Tauri 2 and Rust desktop backend;
+- a backend-owned, versioned SQLite store for desktop application state;
 - execution paths for the installed Codex CLI and a local Ollama server;
 - local workspace, task, agent, approval, reminder, and model-management UI;
 - an included Python voice runtime and KDE-oriented install/remove scripts.
 
 Important limits are documented in [CURRENT_STATE.md](CURRENT_STATE.md) and
-[SECURITY_MODEL.md](SECURITY_MODEL.md). In particular, most product state and
-several orchestration and approval decisions are currently renderer-owned and
-stored in browser `localStorage`; the planned backend-authoritative design has
-not yet been implemented.
+[SECURITY_MODEL.md](SECURITY_MODEL.md). Desktop product state is now persisted
+through typed Tauri commands and a schema-versioned backend database. Routing,
+run coordination, and approval authorization are still prototype boundaries;
+durable approval rows are explicitly non-authoritative until TASK-0004.
+Browser preview storage is retained only as a non-authoritative preview path.
 
 The supported product direction is Arch Linux, KDE Plasma, and Wayland first.
 Other platforms are not current release targets.
@@ -45,8 +47,9 @@ Other platforms are not current release targets.
 
 The locked frontend toolchain requires Node.js <code>^20.19.0</code> or
 <code>>=22.12.0</code>. The verification routes also require npm, Bash,
-Python 3, Cargo, rustfmt, and Clippy. Install JavaScript dependencies without
-package lifecycle scripts:
+Python 3, Cargo, rustfmt, Clippy, <code>pkg-config</code>, and the platform
+SQLite development files. Install JavaScript dependencies without package
+lifecycle scripts:
 
 ```bash
 npm ci --ignore-scripts
@@ -58,10 +61,10 @@ Run the deterministic fast characterization gate from the repository root:
 npm run verify:fast
 ```
 
-It runs 18 frontend characterization tests, the TypeScript check, the Rust
-format check, and 9 locked/offline Rust tests. The full gate adds the frontend
-build, Clippy, shell/Python/JSON checks, dependency-tree checks, and production
-plus development npm audits:
+It runs 24 frontend characterization/persistence tests, the TypeScript check,
+the Rust format check, and 23 locked/offline Rust tests. The full gate adds the
+frontend build, Clippy, shell/Python/JSON checks, dependency-tree checks, and
+production plus development npm audits:
 
 ```bash
 npm run verify:full

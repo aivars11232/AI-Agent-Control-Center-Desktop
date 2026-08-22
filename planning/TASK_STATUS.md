@@ -21,8 +21,8 @@ ready merely because its predecessor's code was edited.
 | Task | Depends | Phase A | Approved | Phase B | Verification | Git closure | Title |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | TASK-0001 | None | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Authoritative project baseline and development contract |
-| TASK-0002 | TASK-0001 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Reproducible verification and characterization baseline |
-| TASK-0003 | TASK-0002 | NOT STARTED | NO | NOT STARTED | — | — | Backend persistence and state-migration foundation |
+| TASK-0002 | TASK-0001 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Reproducible verification and characterization baseline |
+| TASK-0003 | TASK-0002 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Backend persistence and state-migration foundation |
 | TASK-0004 | TASK-0003 | NOT STARTED | NO | NOT STARTED | — | — | Authoritative approvals, capability policy, IPC, and CSP boundary |
 | TASK-0005 | TASK-0004 | NOT STARTED | NO | NOT STARTED | — | — | Single-run coordinator, task lifecycle, ledger, and bounded output |
 | TASK-0006 | TASK-0005 | NOT STARTED | NO | NOT STARTED | — | — | Truthful provider registry and common runtime contract |
@@ -58,10 +58,10 @@ ready merely because its predecessor's code was edited.
 - Full documentation gate: passed on 2026-08-22; ten approved documentation
   paths, twenty roadmap rows, twenty status rows, local-link validation,
   catalog parity, scope checks, whitespace checks, and package checksums passed
-- User-selected closure: local commit
-  <code>91db386df910d91e488b5710ab65490963579475</code> (<code>task1</code>) and
-  a clean worktree were explicitly confirmed on 2026-08-22. This records the
-  alternate closure method allowed below; no push claim is inferred.
+- Git closure: user commit
+  <code>91db386df910d91e488b5710ab65490963579475</code> (<code>task1</code>) is an
+  ancestor of <code>origin/main</code>; commit/push closure and the later clean
+  preflight were confirmed from checkout evidence on 2026-08-22.
 
 ## TASK-0002 evidence
 
@@ -91,13 +91,47 @@ ready merely because its predecessor's code was edited.
   and desktop/system-control actions: not run
 - IPC, persistence, schema, migration, capability, and runtime behavior
   changes: none
+- Git closure: user commit <code>908ace6efcad39b7adff62a7a64e9f65b28119a0</code>
+  (<code>task2</code>) is the checked-out <code>main</code> HEAD and matches
+  <code>origin/main</code>; the TASK-0003 preflight confirmed a clean tree and
+  zero ahead/behind on 2026-08-22
+
+## TASK-0003 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>908ace6efcad39b7adff62a7a64e9f65b28119a0</code>
+- Starting status: clean; <code>main</code> matched <code>origin/main</code>
+- Dependency: TASK-0002 closed by the user commit/push evidence above
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0003 AS PLANNED.</code>
+- Added schema version 1, a migration ledger, typed backend state validation,
+  an atomic SQLite repository/service, private Unix data modes, integrity and
+  newer-schema refusal, and compare-and-swap revisions
+- Added typed persistence IPC plus a renderer bootstrap/write adapter; desktop
+  startup and saves do not fall back to <code>localStorage</code>
+- Legacy migration validates all supplied data before commit, downgrades
+  pending/approved approvals to non-authoritative expired history, deletes
+  legacy keys only after commit, and can finish cleanup after restart
+- Current version 2 backup import remains compatible through bounded backend
+  validation and non-authoritative approval downgrade; TASK-0014 retains
+  ownership of the strict long-term backup/data-lifecycle contract
+- Focused verification: 3 frontend files/24 tests, TypeScript, and 23 Rust
+  library tests passed
+- Full non-live gate: passed on 2026-08-22; exact route and environment-limited
+  Rust advisory result are recorded in the TASK-0003 final report
+- Live provider, microphone, listener, portal, install/remove, desktop package,
+  and desktop/system-control actions: not run
 - Git closure: pending user diff review, commit/push choice, and clean-tree
   confirmation
 
 ## Closure rule
 
-TASK-0003 must not begin automatically. Before successor work, the user reviews
-the TASK-0002 diff and either:
+TASK-0004 must not begin automatically. Before successor work, the user reviews
+the TASK-0003 diff and either:
 
 1. commits and pushes the approved task and records the commit plus clean
    worktree; or

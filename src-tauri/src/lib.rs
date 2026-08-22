@@ -1,3 +1,7 @@
+mod app_state;
+mod persistence;
+
+use app_state::{ApplicationState, LegacyRendererState};
 use ashpd::desktop::{
     remote_desktop::{
         Axis, DeviceType, KeyState, NotifyKeyboardKeysymOptions, NotifyPointerAxisDiscreteOptions,
@@ -6,6 +10,9 @@ use ashpd::desktop::{
     PersistMode, Session,
 };
 use keyring::Entry;
+use persistence::{
+    PersistenceError, PersistenceService, SaveReceipt, StateEnvelope, StateRepository,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -126,6 +133,39 @@ struct AgentRunRequest {
 struct OpenWorkspaceItemRequest {
     workspace_path: String,
     item_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InitializeApplicationStateRequest {
+    legacy: LegacyRendererState,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SaveApplicationStateRequest {
+    expected_revision: i64,
+    state: ApplicationState,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResetApplicationStateRequest {
+    expected_revision: i64,
+    confirmation: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImportLegacyBackupRequest {
+    expected_revision: i64,
+    backup_json: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AcknowledgeLegacyCleanupRequest {
+    expected_revision: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -2860,6 +2900,65 @@ fn stop_voice_listener(app: AppHandle, state: State<'_, VoiceListener>) -> Resul
 }
 
 #[tauri::command]
+async fn load_application_state(
+    state: State<'_, PersistenceService>,
+) -> Result<Option<StateEnvelope>, PersistenceError> {
+    state.inner().load().await
+}
+
+#[tauri::command]
+async fn initialize_application_state(
+    state: State<'_, PersistenceService>,
+    request: InitializeApplicationStateRequest,
+) -> Result<StateEnvelope, PersistenceError> {
+    state.inner().initialize(request.legacy).await
+}
+
+#[tauri::command]
+async fn save_application_state(
+    state: State<'_, PersistenceService>,
+    request: SaveApplicationStateRequest,
+) -> Result<SaveReceipt, PersistenceError> {
+    state
+        .inner()
+        .save(request.expected_revision, request.state)
+        .await
+}
+
+#[tauri::command]
+async fn reset_application_state(
+    state: State<'_, PersistenceService>,
+    request: ResetApplicationStateRequest,
+) -> Result<StateEnvelope, PersistenceError> {
+    state
+        .inner()
+        .reset(request.expected_revision, request.confirmation)
+        .await
+}
+
+#[tauri::command]
+async fn import_legacy_backup(
+    state: State<'_, PersistenceService>,
+    request: ImportLegacyBackupRequest,
+) -> Result<StateEnvelope, PersistenceError> {
+    state
+        .inner()
+        .import_legacy_backup(request.expected_revision, request.backup_json)
+        .await
+}
+
+#[tauri::command]
+async fn acknowledge_legacy_cleanup(
+    state: State<'_, PersistenceService>,
+    request: AcknowledgeLegacyCleanupRequest,
+) -> Result<StateEnvelope, PersistenceError> {
+    state
+        .inner()
+        .acknowledge_legacy_cleanup(request.expected_revision)
+        .await
+}
+
+#[tauri::command]
 async fn run_agent_task(
     app: AppHandle,
     state: State<'_, ActiveRuns>,
@@ -2887,6 +2986,21 @@ pub fn run() {
         .manage(VoiceListener::default())
         .manage(DesktopControl::default())
         .setup(|app| {
+            let repository = app
+                .path()
+                .app_data_dir()
+                .map_err(|_| {
+                    PersistenceError::new(
+                        "APP_DATA_DIRECTORY_UNAVAILABLE",
+                        "The operating system did not provide an application data directory.",
+                        false,
+                    )
+                })
+                .and_then(|directory| {
+                    StateRepository::open(&directory.join("application-state.sqlite3"))
+                });
+            app.manage(PersistenceService::new(repository));
+
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -2931,6 +3045,12 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            load_application_state,
+            initialize_application_state,
+            save_application_state,
+            reset_application_state,
+            import_legacy_backup,
+            acknowledge_legacy_cleanup,
             codex_runtime_status,
             ollama_runtime_status,
             choose_workspace_folder,

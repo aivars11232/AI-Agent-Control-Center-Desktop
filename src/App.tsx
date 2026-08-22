@@ -1,6 +1,63 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import type {
+  ActivityEntry,
+  Agent,
+  AgentCategory,
+  AgentPerformance,
+  AgentRole,
+  AgentStatus,
+  AgentTask,
+  AiProvider,
+  AppPreferences,
+  ApprovalMode,
+  ApprovalRequest,
+  ApprovalRequestStatus,
+  AuthorityLevel,
+  ExecutionFocus,
+  HistoryRetentionDays,
+  InterfaceDensity,
+  ModelDefinition,
+  ModelProvider,
+  OverflowAction,
+  Reminder,
+  ReminderStatus,
+  ReviewMode,
+  ReviewStatus,
+  RiskLevel,
+  RoutingMode,
+  SafetyMode,
+  SafetyScope,
+  TaskCategory,
+  TaskPhase,
+  TaskPriority,
+  TaskStatus,
+  ThemeMode,
+  VoiceState,
+  WorkspaceDefinition,
+  ApplicationState,
+  AccentColor,
+} from "./applicationState";
+export type {
+  Agent,
+  AgentPerformance,
+  AgentTask,
+  AppPreferences,
+  ApprovalRequest,
+  ModelDefinition,
+  SafetyMode,
+  TaskCategory,
+  TaskPriority,
+  VoiceState,
+} from "./applicationState";
+import {
+  ApplicationStateWriter,
+  LEGACY_STORAGE_KEYS,
+  bootstrapDesktopApplicationState,
+  persistenceErrorMessage,
+  type InvokeFunction,
+} from "./persistence";
 import { interpretVoiceCommand } from "./voiceCommand";
 import logoUrl from "../AI-Agents.png";
 import "./App.css";
@@ -59,7 +116,6 @@ type VoiceTranscriptEvent = {
   transcript: string;
 };
 
-export type VoiceState = "VOICE_OFF" | "VOICE_PASSIVE" | "VOICE_ACTIVE";
 type VoiceUiState = "VOICE OFF" | "PASSIVE" | "LISTENING" | "PROCESSING" | "EXECUTING" | "SUCCESS" | "ERROR";
 
 type DesktopControlStatus = {
@@ -70,6 +126,11 @@ type DesktopControlStatus = {
 function isDesktopRuntime() {
   return "__TAURI_INTERNALS__" in window;
 }
+
+const invokeApplicationState: InvokeFunction = <T,>(
+  command: string,
+  args?: Record<string, unknown>,
+) => invoke<T>(command, args);
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
@@ -366,161 +427,9 @@ function DashboardPage({
 }
 
 
-type AccessLevel = "none" | "read" | "write" | "full";
-type ApprovalMode = "allow" | "ask" | "deny";
 type WorkspaceTab = "Overview" | "Capabilities" | "Memory" | "Tasks" | "Activity";
 type CapabilityKey = keyof Agent["capabilities"];
 type ApprovalKey = keyof Agent["approvals"];
-
-type TaskStatus =
-  | "Pending"
-  | "Running"
-  | "Blocked"
-  | "Under Review"
-  | "Completed"
-  | "Failed";
-
-export type TaskCategory =
-  | "Development"
-  | "Research"
-  | "Browsing"
-  | "Finance"
-  | "Business"
-  | "Communication"
-  | "System Control"
-  | "General";
-
-export type TaskPriority = "Low" | "Normal" | "High" | "Critical";
-type HistoryRetentionDays = 7 | 30 | 90 | "never";
-type AgentStatus = "Working" | "Waiting" | "Paused";
-type ThemeMode = "dark" | "light" | "system";
-type AccentColor = "violet" | "blue" | "cyan" | "green";
-type InterfaceDensity = "comfortable" | "compact";
-type ExecutionFocus = "speed" | "balanced" | "strength";
-type OverflowAction = "queue" | "redirect";
-export type SafetyMode = "balanced" | "strict" | "locked";
-type RoutingMode = "selected" | "automatic";
-type ReviewMode = "off" | "manual" | "automatic";
-type ReviewStatus =
-  | "Not Requested"
-  | "Pending"
-  | "Running"
-  | "Approved"
-  | "Changes Requested"
-  | "Failed";
-type SafetyScope = "files" | "internet" | "clipboard" | "terminal" | "system";
-type RiskLevel = "Low" | "Medium" | "High" | "Critical";
-
-type WorkspaceDefinition = {
-  id: string;
-  name: string;
-  path: string;
-};
-
-export type AgentPerformance = {
-  strength: number;
-  focus: ExecutionFocus;
-  cpuLimit: number;
-  gpuLimit: number;
-  overflowAction: OverflowAction;
-  redirectAgentId: number | null;
-};
-
-export type AppPreferences = {
-  theme: ThemeMode;
-  accentColor: AccentColor;
-  density: InterfaceDensity;
-  reducedMotion: boolean;
-  defaultModel: string;
-  activeAiProvider: AiProvider;
-  defaultAgentStatus: AgentStatus;
-  defaultTaskCategory: TaskCategory;
-  defaultTaskPriority: TaskPriority;
-  defaultPerformance: AgentPerformance;
-  workspacePath: string;
-  workspaces: WorkspaceDefinition[];
-  activeWorkspaceId: string | null;
-  agentTimeoutMinutes: number;
-  safetyMode: SafetyMode;
-  approvalExpiryMinutes: number;
-  defaultRoutingMode: RoutingMode;
-  reviewMode: ReviewMode;
-  backgroundVoiceEnabled: boolean;
-  voiceControlMasterEnabled: boolean;
-  voiceWakePhrase: string;
-  voiceDeactivatePhrase: string;
-  voiceOpenPhrases: string;
-  voiceClosePhrases: string;
-  voiceCommandReplacements: string;
-  voiceState: VoiceState;
-};
-
-type ApprovalRequestStatus = "Pending" | "Approved" | "Denied" | "Expired";
-
-export type ApprovalRequest = {
-  id: number;
-  agentId: number;
-  taskId: number | null;
-  title: string;
-  reason: string;
-  status: ApprovalRequestStatus;
-  createdAt: string;
-  resolvedAt: string | null;
-  riskLevel: RiskLevel;
-  scopes: SafetyScope[];
-  workspaceId: string | null;
-  taskSnapshot: string;
-  expiresAt: string;
-  consumedAt: string | null;
-};
-
-type TaskPhase =
-  | "Assigned"
-  | "Specialist Work"
-  | "Senior Review"
-  | "Team Leader Review"
-  | "Supervisor Approval"
-  | "Finished"
-  | "Failed";
-
-export type AgentTask = {
-  id: number;
-  title: string;
-  category: TaskCategory;
-  priority: TaskPriority;
-  assignedAgentId: number;
-  status: TaskStatus;
-  phase: TaskPhase;
-  createdAt: string;
-  completedAt: string | null;
-  result: string | null;
-  responseId: string | null;
-  runtimeModel: string | null;
-  totalTokens: number | null;
-  workspaceId: string | null;
-  changedFiles: string[];
-  diff: string | null;
-  durationSeconds: number | null;
-  routingMode: RoutingMode;
-  routedFromAgentId: number | null;
-  routingReason: string | null;
-  reviewAgentId: number | null;
-  reviewStatus: ReviewStatus;
-  reviewResult: string | null;
-  reviewModel: string | null;
-  reviewDurationSeconds: number | null;
-  reviewedAt: string | null;
-};
-
-type ModelProvider = "OpenAI" | "Anthropic" | "Google" | "Ollama" | "Custom";
-
-type AiProvider = "codex" | "ollama";
-
-export type ModelDefinition = {
-  id: number;
-  name: string;
-  provider: ModelProvider;
-};
 
 const ollamaCodingModelName = "qwen2.5-coder:7b";
 
@@ -532,77 +441,6 @@ function ollamaCodingModel(id: number): ModelDefinition {
   };
 }
 
-type ActivityEntry = {
-  id: number;
-  message: string;
-  createdAt: string;
-};
-
-type ReminderStatus = "Upcoming" | "Completed" | "Dismissed";
-
-type Reminder = {
-  id: number;
-  title: string;
-  notes: string;
-  dueAt: string;
-  status: ReminderStatus;
-  agentId: number | null;
-  taskId: number | null;
-  createdAt: string;
-};
-
-type AgentRole =
-  | "Supervisor"
-  | "Team Leader"
-  | "Senior Agent"
-  | "Specialist";
-
-type AgentCategory =
-  | "Management"
-  | "Development"
-  | "Research"
-  | "Browsing"
-  | "Finance"
-  | "Business"
-  | "Communication"
-  | "System Control"
-  | "General";
-
-type AuthorityLevel = 1 | 2 | 3 | 4;
-
-export type Agent = {
-  id: number;
-  name: string;
-  description: string;
-  status: AgentStatus;
-  role: AgentRole;
-  category: AgentCategory;
-  reportsTo: number | null;
-  authorityLevel: AuthorityLevel;
-
-  model: string;
-  memory: string;
-  tasks: AgentTask[];
-  activity: ActivityEntry[];
-  performance: AgentPerformance;
-
-  capabilities: {
-    files: AccessLevel;
-    internet: AccessLevel;
-    clipboard: AccessLevel;
-
-    terminal: "none" | "safe" | "user" | "admin";
-    system: "none" | "notifications" | "power" | "full";
-  };
-
-  approvals: {
-    files: ApprovalMode;
-    internet: ApprovalMode;
-    clipboard: ApprovalMode;
-    terminal: ApprovalMode;
-    system: ApprovalMode;
-  };
-};
 
 export type TaskSafetyAssessment = {
   riskLevel: RiskLevel;
@@ -6275,6 +6113,8 @@ function SettingsPage({
   setPreferences,
   providerConnected,
   setProviderConnected,
+  onImportBackup,
+  onResetApplication,
 }: {
   models: ModelDefinition[];
   setModels: React.Dispatch<React.SetStateAction<ModelDefinition[]>>;
@@ -6300,6 +6140,8 @@ function SettingsPage({
   >;
   providerConnected: boolean;
   setProviderConnected: React.Dispatch<React.SetStateAction<boolean>>;
+  onImportBackup: (backupJson: string) => Promise<void>;
+  onResetApplication: (confirmation: string) => Promise<void>;
 }) {
   const [managedAgentId, setManagedAgentId] = useState<number | null>(
     agents[0]?.id ?? null,
@@ -6560,9 +6402,26 @@ function SettingsPage({
   function importData(file: File) {
     const reader = new FileReader();
 
-    reader.onload = () => {
+    reader.onload = async () => {
+      const backupJson = String(reader.result);
+      if (isDesktopRuntime()) {
+        const shouldImport = window.confirm(
+          "Import this backup? Current application data will be replaced.",
+        );
+        if (!shouldImport) {
+          return;
+        }
+        try {
+          await onImportBackup(backupJson);
+          window.alert("Backup imported successfully.");
+        } catch (error) {
+          window.alert(persistenceErrorMessage(error));
+        }
+        return;
+      }
+
       try {
-        const parsed = JSON.parse(String(reader.result)) as {
+        const parsed = JSON.parse(backupJson) as {
           agents?: Agent[];
           models?: ModelDefinition[];
           approvalRequests?: ApprovalRequest[];
@@ -6731,7 +6590,7 @@ function SettingsPage({
     reader.readAsText(file);
   }
 
-  function resetApplication() {
+  async function resetApplication() {
     const confirmation = window.prompt(
       'Type RESET to delete all local agents, tasks, activity, models, approvals, and settings.',
     );
@@ -6740,21 +6599,19 @@ function SettingsPage({
       return;
     }
 
-    localStorage.removeItem("ai-agent-control-center-agents");
-    localStorage.removeItem("ai-agent-control-center-models");
-    localStorage.removeItem("ai-agent-control-center-reminders");
-    localStorage.removeItem(
-      "ai-agent-control-center-approval-requests",
-    );
-    localStorage.removeItem(
-      "ai-agent-control-center-task-retention",
-    );
-    localStorage.removeItem(
-      "ai-agent-control-center-activity-retention",
-    );
-    localStorage.removeItem(
-      "ai-agent-control-center-preferences",
-    );
+    if (isDesktopRuntime()) {
+      try {
+        await onResetApplication(confirmation);
+        window.alert("Application data was reset.");
+      } catch (error) {
+        window.alert(persistenceErrorMessage(error));
+      }
+      return;
+    }
+
+    for (const key of Object.values(LEGACY_STORAGE_KEYS)) {
+      localStorage.removeItem(key);
+    }
 
     window.location.reload();
   }
@@ -7664,6 +7521,7 @@ function PlaceholderPage({ page }: { page: Page }) {
 }
 
 function App() {
+  const desktopRuntime = isDesktopRuntime();
   const [activePage, setActivePage] = useState<Page>("Dashboard");
   const [providerConnected, setProviderConnected] = useState(false);
   const [ollamaRuntimeStatus, setOllamaRuntimeStatus] =
@@ -7671,12 +7529,18 @@ function App() {
   const [aiProviderBusy, setAiProviderBusy] = useState(false);
   const [aiProviderMessage, setAiProviderMessage] = useState("");
   const [agentRunActive, setAgentRunActive] = useState(false);
+  const [persistencePhase, setPersistencePhase] = useState<
+    "loading" | "mutating" | "hydrating" | "ready" | "error"
+  >(desktopRuntime ? "loading" : "ready");
+  const [persistenceMessage, setPersistenceMessage] = useState("");
+  const persistenceWriter = useRef<ApplicationStateWriter | null>(null);
 
   const [taskRetentionDays, setTaskRetentionDays] =
     useState<HistoryRetentionDays>(() => {
-      const saved = localStorage.getItem(
-        "ai-agent-control-center-task-retention",
-      );
+      if (desktopRuntime) {
+        return 30;
+      }
+      const saved = localStorage.getItem(LEGACY_STORAGE_KEYS.taskRetentionDays);
 
       return saved === "7" || saved === "30" || saved === "90"
         ? (Number(saved) as 7 | 30 | 90)
@@ -7687,8 +7551,11 @@ function App() {
 
   const [activityRetentionDays, setActivityRetentionDays] =
     useState<HistoryRetentionDays>(() => {
+      if (desktopRuntime) {
+        return 30;
+      }
       const saved = localStorage.getItem(
-        "ai-agent-control-center-activity-retention",
+        LEGACY_STORAGE_KEYS.activityRetentionDays,
       );
 
       return saved === "7" || saved === "30" || saved === "90"
@@ -7700,9 +7567,10 @@ function App() {
 
   const [preferences, setPreferences] =
     useState<AppPreferences>(() => {
-      const saved = localStorage.getItem(
-        "ai-agent-control-center-preferences",
-      );
+      if (desktopRuntime) {
+        return defaultAppPreferences;
+      }
+      const saved = localStorage.getItem(LEGACY_STORAGE_KEYS.preferences);
 
       if (!saved) {
         return defaultAppPreferences;
@@ -7719,8 +7587,11 @@ function App() {
 
   const [approvalRequests, setApprovalRequests] =
     useState<ApprovalRequest[]>(() => {
+      if (desktopRuntime) {
+        return [];
+      }
       const saved = localStorage.getItem(
-        "ai-agent-control-center-approval-requests",
+        LEGACY_STORAGE_KEYS.approvalRequests,
       );
 
       if (!saved) {
@@ -7740,7 +7611,10 @@ function App() {
     });
 
   const [reminders, setReminders] = useState<Reminder[]>(() => {
-    const saved = localStorage.getItem("ai-agent-control-center-reminders");
+    if (desktopRuntime) {
+      return [];
+    }
+    const saved = localStorage.getItem(LEGACY_STORAGE_KEYS.reminders);
     if (!saved) return [];
 
     try {
@@ -7789,9 +7663,10 @@ function App() {
   ];
 
   const [models, setModels] = useState<ModelDefinition[]>(() => {
-    const savedModels = localStorage.getItem(
-      "ai-agent-control-center-models",
-    );
+    if (desktopRuntime) {
+      return defaultModels;
+    }
+    const savedModels = localStorage.getItem(LEGACY_STORAGE_KEYS.models);
 
     if (!savedModels) {
       return defaultModels;
@@ -8416,9 +8291,10 @@ function App() {
   }
 
   const [agents, setAgents] = useState<Agent[]>(() => {
-    const savedAgents = localStorage.getItem(
-      "ai-agent-control-center-agents",
-    );
+    if (desktopRuntime) {
+      return defaultAgents;
+    }
+    const savedAgents = localStorage.getItem(LEGACY_STORAGE_KEYS.agents);
 
     if (!savedAgents) {
       return defaultAgents;
@@ -8470,6 +8346,99 @@ function App() {
       return defaultAgents;
     }
   });
+
+  function hydrateApplicationState(state: ApplicationState) {
+    setPersistencePhase("hydrating");
+    setAgents(state.agents);
+    setModels(state.models);
+    setApprovalRequests(state.approvalRequests);
+    setReminders(state.reminders);
+    setTaskRetentionDays(state.taskRetentionDays);
+    setActivityRetentionDays(state.activityRetentionDays);
+    setPreferences(state.preferences);
+  }
+
+  useEffect(() => {
+    if (!desktopRuntime) {
+      return;
+    }
+    let active = true;
+    void bootstrapDesktopApplicationState(invokeApplicationState, localStorage)
+      .then(({ envelope, cleanupWarning }) => {
+        if (!active) {
+          return;
+        }
+        persistenceWriter.current = new ApplicationStateWriter(
+          invokeApplicationState,
+          envelope.revision,
+          (error) => {
+            if (active) {
+              setPersistenceMessage(persistenceErrorMessage(error));
+              setPersistencePhase("error");
+            }
+          },
+        );
+        setPersistenceMessage(cleanupWarning ?? "");
+        hydrateApplicationState(envelope.state);
+      })
+      .catch((error: unknown) => {
+        if (active) {
+          setPersistenceMessage(persistenceErrorMessage(error));
+          setPersistencePhase("error");
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [desktopRuntime]);
+
+  useEffect(() => {
+    if (persistencePhase === "hydrating") {
+      setPersistencePhase("ready");
+    }
+  }, [persistencePhase]);
+
+  async function importApplicationBackup(backupJson: string) {
+    const writer = persistenceWriter.current;
+    if (!desktopRuntime || !writer) {
+      throw new Error("Application persistence is not ready.");
+    }
+    setPersistenceMessage("");
+    setPersistencePhase("mutating");
+    try {
+      const envelope = await writer.importLegacyBackup(backupJson);
+      hydrateApplicationState(envelope.state);
+    } catch (error) {
+      if (writer.hasFailed) {
+        setPersistenceMessage(persistenceErrorMessage(error));
+        setPersistencePhase("error");
+      } else {
+        setPersistencePhase("ready");
+      }
+      throw error;
+    }
+  }
+
+  async function resetPersistedApplication(confirmation: string) {
+    const writer = persistenceWriter.current;
+    if (!desktopRuntime || !writer) {
+      throw new Error("Application persistence is not ready.");
+    }
+    setPersistenceMessage("");
+    setPersistencePhase("mutating");
+    try {
+      const envelope = await writer.reset(confirmation);
+      hydrateApplicationState(envelope.state);
+    } catch (error) {
+      if (writer.hasFailed) {
+        setPersistenceMessage(persistenceErrorMessage(error));
+        setPersistencePhase("error");
+      } else {
+        setPersistencePhase("ready");
+      }
+      throw error;
+    }
+  }
 
   const activeAiProvider = preferences.activeAiProvider;
   const activeAiProviderName =
@@ -8594,27 +8563,6 @@ function App() {
   ]);
 
   useEffect(() => {
-    localStorage.setItem(
-      "ai-agent-control-center-preferences",
-      JSON.stringify(preferences),
-    );
-  }, [preferences]);
-
-  useEffect(() => {
-    localStorage.setItem(
-      "ai-agent-control-center-approval-requests",
-      JSON.stringify(approvalRequests),
-    );
-  }, [approvalRequests]);
-
-  useEffect(() => {
-    localStorage.setItem(
-      "ai-agent-control-center-reminders",
-      JSON.stringify(reminders),
-    );
-  }, [reminders]);
-
-  useEffect(() => {
     function expireUnusedApprovals() {
       const now = Date.now();
       const expiring = approvalRequests.filter(
@@ -8659,20 +8607,6 @@ function App() {
   }, [approvalRequests]);
 
   useEffect(() => {
-    localStorage.setItem(
-      "ai-agent-control-center-task-retention",
-      String(taskRetentionDays),
-    );
-  }, [taskRetentionDays]);
-
-  useEffect(() => {
-    localStorage.setItem(
-      "ai-agent-control-center-activity-retention",
-      String(activityRetentionDays),
-    );
-  }, [activityRetentionDays]);
-
-  useEffect(() => {
     if (
       taskRetentionDays === "never" &&
       activityRetentionDays === "never"
@@ -8690,10 +8624,10 @@ function App() {
         ? null
         : now - activityRetentionDays * 24 * 60 * 60 * 1000;
 
-    setAgents((currentAgents) =>
-      currentAgents.map((agent) => ({
-        ...agent,
-        tasks:
+    setAgents((currentAgents) => {
+      let changed = false;
+      const retainedAgents = currentAgents.map((agent) => {
+        const tasks =
           taskCutoff === null
             ? agent.tasks
             : agent.tasks.filter((task) => {
@@ -8708,35 +8642,109 @@ function App() {
                   return true;
                 }
 
-                return (
-                  new Date(task.completedAt).getTime() >= taskCutoff
-                );
-              }),
-        activity:
+                return new Date(task.completedAt).getTime() >= taskCutoff;
+              });
+        const activity =
           activityCutoff === null
             ? agent.activity
             : agent.activity.filter(
                 (entry) =>
-                  new Date(entry.createdAt).getTime() >=
-                  activityCutoff,
-              ),
-      })),
-    );
+                  new Date(entry.createdAt).getTime() >= activityCutoff,
+              );
+        if (
+          tasks.length === agent.tasks.length &&
+          activity.length === agent.activity.length
+        ) {
+          return agent;
+        }
+        changed = true;
+        return { ...agent, tasks, activity };
+      });
+      return changed ? retainedAgents : currentAgents;
+    });
   }, [taskRetentionDays, activityRetentionDays]);
 
   useEffect(() => {
-    localStorage.setItem(
-      "ai-agent-control-center-models",
-      JSON.stringify(models),
-    );
-  }, [models]);
+    const state: ApplicationState = {
+      agents,
+      models,
+      approvalRequests,
+      reminders,
+      taskRetentionDays,
+      activityRetentionDays,
+      preferences,
+    };
+    if (desktopRuntime) {
+      if (persistencePhase === "ready") {
+        persistenceWriter.current?.enqueue(state);
+      }
+      return;
+    }
 
-  useEffect(() => {
     localStorage.setItem(
-      "ai-agent-control-center-agents",
+      LEGACY_STORAGE_KEYS.agents,
       JSON.stringify(agents),
     );
-  }, [agents]);
+    localStorage.setItem(
+      LEGACY_STORAGE_KEYS.models,
+      JSON.stringify(models),
+    );
+    localStorage.setItem(
+      LEGACY_STORAGE_KEYS.approvalRequests,
+      JSON.stringify(approvalRequests),
+    );
+    localStorage.setItem(
+      LEGACY_STORAGE_KEYS.reminders,
+      JSON.stringify(reminders),
+    );
+    localStorage.setItem(
+      LEGACY_STORAGE_KEYS.taskRetentionDays,
+      String(taskRetentionDays),
+    );
+    localStorage.setItem(
+      LEGACY_STORAGE_KEYS.activityRetentionDays,
+      String(activityRetentionDays),
+    );
+    localStorage.setItem(
+      LEGACY_STORAGE_KEYS.preferences,
+      JSON.stringify(preferences),
+    );
+  }, [
+    agents,
+    models,
+    approvalRequests,
+    reminders,
+    taskRetentionDays,
+    activityRetentionDays,
+    preferences,
+    desktopRuntime,
+  ]);
+
+  if (desktopRuntime && persistencePhase !== "ready") {
+    const failed = persistencePhase === "error";
+    return (
+      <div className="app-shell">
+        <main className="main-content">
+          <section className="panel" role={failed ? "alert" : "status"}>
+            <span className="eyebrow">APPLICATION STATE</span>
+            <h1>{failed ? "Application data unavailable" : "Loading application data"}</h1>
+            <p className="page-message">
+              {failed
+                ? persistenceMessage
+                : persistencePhase === "mutating"
+                  ? "Updating the versioned local application database…"
+                  : "Opening the versioned local application database…"}
+            </p>
+            {failed && (
+              <p className="form-hint">
+                No desktop data was written to browser storage. Resolve the database error and restart the app.
+              </p>
+            )}
+          </section>
+        </main>
+      </div>
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -8810,6 +8818,11 @@ function App() {
       </aside>
 
       <main className="main-content">
+        {persistenceMessage && (
+          <p className="page-message" role="status">
+            {persistenceMessage}
+          </p>
+        )}
         {activePage === "Dashboard" ? (
           <DashboardPage
             agents={agents}
@@ -8887,6 +8900,8 @@ function App() {
             setPreferences={setPreferences}
             providerConnected={providerConnected}
             setProviderConnected={setProviderConnected}
+            onImportBackup={importApplicationBackup}
+            onResetApplication={resetPersistedApplication}
           />
         ) : (
           <PlaceholderPage page={activePage} />

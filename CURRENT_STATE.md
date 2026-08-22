@@ -1,9 +1,9 @@
 # Current State
 
 > **Classification: Current static and fresh non-live evidence.** This snapshot
-> was refreshed for TASK-0002 on 2026-08-22 from starting commit
-> <code>91db386df910d91e488b5710ab65490963579475</code> on branch
-> <code>main</code>. TASK-0002 changes remain in the working tree pending user
+> was refreshed for TASK-0003 on 2026-08-22 from starting commit
+> <code>908ace6efcad39b7adff62a7a64e9f65b28119a0</code> on branch
+> <code>main</code>. TASK-0003 changes remain in the working tree pending user
 > review and Git closure. Reverify details that may drift before relying on
 > them in a later task.
 
@@ -13,13 +13,14 @@ belongs in [ARCHITECTURE.md](ARCHITECTURE.md) and
 
 ## Evidence boundary
 
-TASK-0001 established the repository authority baseline. TASK-0002 then ran
-fresh frontend and Rust characterization tests, TypeScript and Vite checks,
-Rust formatting and Clippy, syntax checks, dependency-tree checks, and npm
-audits. These checks establish the non-live verification baseline described
-below; they do not establish live runtime readiness.
+TASK-0001 established the repository authority baseline and TASK-0002 added
+the reproducible verification routes. TASK-0003 adds typed application-state
+contracts, a versioned SQLite repository, legacy migration, persistence IPC,
+and a renderer adapter. Fresh deterministic checks establish the non-live
+verification baseline described below; they do not establish live runtime
+readiness.
 
-TASK-0002 did **not** run Codex, Ollama, or another model/provider; capture
+TASK-0003 did **not** run Codex, Ollama, or another model/provider; capture
 microphone input; import or start the Python listener; authorize a KDE/XDG
 portal; execute install/remove scripts; build a desktop package; or perform a
 desktop/system-control action. Earlier audit observations remain historical
@@ -35,6 +36,7 @@ unless this document identifies a fresh TASK-0002 result.
 | Primary platform direction | Arch Linux, KDE Plasma, and Wayland |
 | Frontend | React 19, TypeScript, and Vite |
 | Desktop backend | Tauri 2 and Rust |
+| Persistence dependency | <code>rusqlite 0.32.1</code> using the platform SQLite library |
 | AI execution paths | Installed Codex CLI and local Ollama |
 | Mandatory paid API key | None in the current Codex/Ollama execution design |
 | Production gate | TASK-0020, not yet reached |
@@ -43,18 +45,22 @@ unless this document identifies a fresh TASK-0002 result.
 
 | Path | Current responsibility |
 | --- | --- |
-| <code>src/App.tsx</code> | Main renderer UI, domain types, defaults, persistence, routing, review, approval workflow, and IPC calls |
+| <code>src/App.tsx</code> | Main renderer UI, browser-preview compatibility, routing, review, approval workflow, and IPC callers |
+| <code>src/applicationState.ts</code> / <code>src/application-state-seed.json</code> | Shared renderer state types and the canonical fresh-state seed |
+| <code>src/persistence.ts</code> | Typed desktop bootstrap, one-time legacy cleanup, serialized writes, backup import, and reset adapter |
 | <code>src/App.css</code> | Main application styling and responsive behavior |
 | <code>src/voiceCommand.ts</code> | Renderer voice-command interpretation |
-| <code>src-tauri/src/lib.rs</code> | Tauri commands, provider execution, workspace operations, native desktop control, voice process management, and Rust tests |
+| <code>src-tauri/src/lib.rs</code> | Tauri command/startup composition, provider execution, workspace operations, native desktop control, and voice process management |
+| <code>src-tauri/src/app_state.rs</code> | Backend application-state types, validation, canonical seed loading, and legacy normalization |
+| <code>src-tauri/src/persistence.rs</code> / <code>src-tauri/migrations/</code> | SQLite repository/service, schema migration, crash-safe transactions, and persistence tests |
 | <code>src-tauri/src/main.rs</code> | Desktop entry point |
 | <code>src-tauri/tauri.conf.json</code> | Tauri window, security, bundle, and resource configuration |
 | <code>voice-runtime/</code> | Python offline listener plus setup scripts |
 | <code>install-kde.sh</code> / <code>uninstall-kde.sh</code> | KDE-oriented local install and removal scripts |
 
-The implementation is concentrated: at this snapshot, <code>src/App.tsx</code>
-has 8,908 lines, <code>src/App.css</code> has 1,952 lines, and the formatted
-<code>src-tauri/src/lib.rs</code> with its expanded test module has 3,205 lines.
+The implementation remains concentrated: at this snapshot,
+<code>src/App.tsx</code> has 8,923 lines, <code>src/App.css</code> has 1,952
+lines, and the formatted <code>src-tauri/src/lib.rs</code> has 3,325 lines.
 These counts are observations, not architectural requirements.
 
 ## Renderer behavior
@@ -71,15 +77,17 @@ The current renderer exposes nine pages:
 8. Models
 9. Settings
 
-It contains renderer-side types and logic for agents, tasks, workspaces,
-capabilities, approval policy, routing, review, reminders, activity, models,
-preferences, and retention. It can export and import a JSON backup through the
-UI.
+It contains renderer-side logic for agents, tasks, workspaces, capabilities,
+approval policy, routing, review, reminders, activity, models, preferences,
+and retention. Shared persisted types now live in
+<code>src/applicationState.ts</code>. It can export and import a version 2 JSON
+backup through the UI; TASK-0014 still owns the strict long-term backup format.
 
 ### Persistence
 
-Core product state is stored in the WebView's <code>localStorage</code>,
-including:
+In the desktop runtime, core product state is stored in
+<code>application-state.sqlite3</code> below Tauri's operating-system-provided
+application data directory. Schema version 1 stores:
 
 - agents and their nested tasks, activity, memory, roles, and policies;
 - approval requests;
@@ -88,9 +96,25 @@ including:
 - application preferences and workspace definitions;
 - task/activity retention preferences and routing/review preferences.
 
-Normalization functions attempt to make older or partial values usable, but
-there is no backend-owned durable state schema or migration ledger yet.
-TASK-0003 owns that transition.
+The backend validates aggregate size, counts, identifiers, enums, numeric
+ranges, text bounds, and selected relationships before an atomic replacement.
+SQLite foreign keys, rollback-journal mode, full synchronous writes, integrity
+checks, transactional aggregate reads, a migration ledger,
+<code>PRAGMA user_version = 1</code>, and compare-and-swap revisions protect the
+repository boundary. The database and its parent directory are restricted to
+the current user on Unix.
+
+On first desktop startup, the renderer supplies the seven legacy
+<code>localStorage</code> values as untrusted strings. The backend parses and
+validates the complete candidate before one transaction commits. Pending or
+approved legacy approvals become expired, remain marked non-authoritative,
+and cannot inherit authority from migration. Legacy keys are removed only
+after commit, and cleanup acknowledgement is restart-safe. Malformed legacy
+data remains available for recovery and does not partially initialize state.
+
+Desktop startup and saves fail closed on database errors; they do not fall
+back to browser storage. A browser-only preview continues to use
+<code>localStorage</code> and is explicitly non-authoritative.
 
 ### Default hierarchy
 
@@ -155,7 +179,7 @@ No live provider connectivity or model output was checked in TASK-0001.
 - Review requests are backend-checked for read-only files, no terminal access,
   no elevated scopes, and no destructive approval.
 - Results, review outcomes, routing reasons, changed files, and diffs return to
-  renderer-owned task state.
+  renderer-managed state and are durably saved through the backend repository.
 
 There is no durable backend run ledger or authoritative system-wide single-run
 coordinator yet. TASK-0005 owns those guarantees. The current renderer behavior
@@ -188,9 +212,11 @@ The backend currently:
 - constrains Ollama tools to paths below the selected workspace.
 
 These are useful prototype controls, not a complete backend-authoritative
-approval system. The renderer supplies the approval identifier, scopes, and
-destructive flag, while the backend has no durable approval repository against
-which to verify their issue, expiry, match, consumption, or replay state.
+approval system. Approval rows are now durable but intentionally carry
+<code>authoritative = 0</code>. The renderer still supplies the approval
+identifier, scopes, and destructive flag, and execution does not yet verify
+their issue, expiry, exact match, consumption, or replay state against an
+authoritative policy record.
 [SECURITY_MODEL.md](SECURITY_MODEL.md) owns the full boundary and gap list.
 
 The Tauri configuration currently sets Content Security Policy to
@@ -198,18 +224,21 @@ The Tauri configuration currently sets Content Security Policy to
 
 ## Verification inventory
 
-TASK-0002 adds two Vitest files containing 18 deterministic frontend tests.
-They characterize the current renderer safety assessment, approval
-normalization, execution and review routing, stored preference/performance
-normalization, and voice-command interpretation. The production functions are
-exported as minimal test seams; their bodies and callers are unchanged.
+Three Vitest files now contain 24 deterministic frontend tests. Eighteen retain
+the TASK-0002 renderer/voice characterization baseline and six cover legacy
+key composition, commit-before-cleanup ordering, cleanup recovery, malformed
+migration refusal, serialized saves, revision advancement, and fail-closed
+writer behavior.
 
-The Rust module now contains nine passing unit tests: the four earlier tests
-covering the Ollama connection, Qwen fallback parsing, workspace path
-containment, and read-only tool exposure, plus five tests characterizing run
-safety validation and voice configuration normalization. The Ollama connection
-test uses an isolated loopback test server; it does not contact a live
-provider.
+The Rust library contains 23 passing tests. Nine retain the earlier provider,
+workspace, run-safety, and voice characterization baseline. Fourteen cover the
+canonical seed and validation, exact schema version, fresh/restart behavior,
+private permissions, corruption/newer-schema refusal, atomic legacy migration,
+malformed data, interrupted write/migration rollback, backup downgrade and
+rollback, stale revisions, unsafe database-path refusal, and two-connection
+lost-update prevention. The
+Ollama connection test uses an isolated loopback server; it does not contact a
+live provider.
 
 The repository-root entry points are:
 
@@ -219,11 +248,12 @@ The repository-root entry points are:
   Clippy, shell/Python/strict-JSON syntax checks, npm/Cargo dependency trees,
   and production plus full npm audits.
 
-Both fresh routes passed on 2026-08-22. The frontend build transformed 34
-modules; both npm audits reported zero vulnerabilities. The full route produced
-large dependency-tree output that was truncated in the captured console view,
-but the process completed with exit status 0 and its final audit/status lines
-were captured.
+The TASK-0003 focused gates and <code>npm run verify:full</code> passed on
+2026-08-22. The full route ran all 24 frontend tests, TypeScript, rustfmt, all
+23 Rust tests, a 35-module production build, Clippy with warnings denied,
+shell/Python/JSON checks, dependency trees, and both npm audits. Dependency
+tree output was truncated in the captured console view, but the command
+completed with exit status 0 and both npm audits reported zero vulnerabilities.
 
 <code>cargo-audit</code> is not installed in the inspected environment. The
 full route therefore reports the Rust advisory result as **indeterminate** and
@@ -235,12 +265,11 @@ belongs to TASK-0019.
 | Gap | Owning task |
 | --- | --- |
 | Mandatory installed/CI Rust advisory tooling | TASK-0019 |
-| Backend persistence and migrations | TASK-0003 |
 | Authoritative approval/policy boundary and CSP | TASK-0004 |
 | Single-run coordinator, lifecycle, ledger, and output contract | TASK-0005 |
 | Truthful provider registry and hardened Codex/Ollama paths | TASK-0006–TASK-0008 |
 | Dynamic hierarchy, routing, review, and workspace evidence | TASK-0009–TASK-0012 |
-| Frontend modularity and data lifecycle | TASK-0013–TASK-0014 |
+| Frontend modularity, strict backup, and full data lifecycle | TASK-0013–TASK-0014 |
 | Voice/system policy and KDE/XDG integration | TASK-0015–TASK-0016 |
 | Bounded specialist capabilities and management handoffs | TASK-0017–TASK-0018 |
 | Packaging, CI, live acceptance, and production gate | TASK-0019–TASK-0020 |
