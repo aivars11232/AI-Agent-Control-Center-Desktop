@@ -1,112 +1,74 @@
 # AI Agent Control Center
 
-A responsive Tauri desktop application for creating, configuring, monitoring,
-and routing work between AI agents.
+AI Agent Control Center is a local Tauri desktop application for defining AI
+agents, assigning work, reviewing results, and controlling access to local
+workspaces. The checked-in application is a functional **version 0.5.1
+development prototype**. It is not production-ready; production readiness is
+reserved for the TASK-0020 release gate.
 
-## Install on Arch Linux / KDE Plasma
+Start with [START_HERE.md](START_HERE.md). It identifies the authoritative
+project documents, their ownership, and the rule used to resolve conflicting
+claims.
 
-Install the Tauri system requirements, Rust, and the official Codex CLI first.
-Sign Codex in with the ChatGPT account that includes your Codex access:
+## Current implementation
 
-```bash
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
-codex login
-```
+The current checkout contains:
 
-Then install the desktop app:
+- a React 19 and TypeScript renderer built with Vite;
+- a Tauri 2 and Rust desktop backend;
+- execution paths for the installed Codex CLI and a local Ollama server;
+- local workspace, task, agent, approval, reminder, and model-management UI;
+- an included Python voice runtime and KDE-oriented install/remove scripts.
 
-```bash
-npm run desktop:install
-```
+Important limits are documented in [CURRENT_STATE.md](CURRENT_STATE.md) and
+[SECURITY_MODEL.md](SECURITY_MODEL.md). In particular, most product state and
+several orchestration and approval decisions are currently renderer-owned and
+stored in browser `localStorage`; the planned backend-authoritative design has
+not yet been implemented.
 
-The installer builds the release application and adds **AI Agent Control
-Center** to KDE's application menu with the included custom icon.
+The supported product direction is Arch Linux, KDE Plasma, and Wayland first.
+Other platforms are not current release targets.
 
-## Connect Codex and run an autonomous agent
+## Project authorities
 
-1. Open **Settings → Codex connection** and confirm the runtime is connected.
-2. In **Workspace manager**, add one or more existing project folders.
-3. Open **Agents**, select an agent, and choose its Codex model and capabilities.
-4. In the agent's **Tasks** tab, create a task, choose its workspace and routing
-   mode, then select **Run Codex agent**.
-
-The desktop app launches `codex exec` using the login already stored by the
-official CLI. It does not ask for, store, or use an OpenAI API key. ChatGPT plan
-usage limits still apply. Agent results are stored locally with the task so
-they remain visible after restarting the app.
-
-When upgrading from the API-based preview, the installer removes its obsolete
-stored API credential automatically.
-
-Web search is available only when the agent has internet access and its
-internet approval policy is set to **Allow**, or when a matching one-time
-authorization has been approved. Agents with write/full file access run in
-Codex's `workspace-write` sandbox; other agents run read-only. The app does not
-enable unrestricted system control or bypass Codex sandboxing.
-
-## Safety and one-time approvals
-
-Version 0.4 adds an execution gate between a task and Codex:
-
-- **Balanced** respects each agent's capability and approval policies while
-  forcing a review for destructive workspace actions.
-- **Strict** requests approval before every file, terminal, web, or clipboard
-  action.
-- **Locked** permits inspection but blocks changes and external actions.
-
-When a task needs permission, it is blocked before Codex starts and a record is
-added to **Approvals** with its risk level, requested scopes, workspace, and
-expiry time. An approval is valid for one matching task run, is consumed when
-that run starts, and cannot authorize another run. Denied and expired requests
-remain in the local audit history until cleared.
-
-Privileged commands, operating-system package management, power operations,
-and system control remain blocked in every mode. Destructive file work inside
-the selected workspace can run only after a matching one-time approval. The
-Codex sandbox remains the hard filesystem boundary; the approval screen is an
-additional application-level safety control.
-
-Version 0.4.1 also hides legacy workflow controls while an authorization is
-pending or approved-but-unused, leaving only the valid next safety action.
-
-## Multi-agent routing and senior review
-
-Version 0.5 turns the agent list into an actual orchestration layer:
-
-- **Automatic routing** assigns a new or pending task to the strongest active
-  specialist using category expertise, capabilities, availability, and current
-  workload. The task records why it was routed and which agent received it.
-- **Senior review** launches a different senior, team-leader, or supervisor
-  agent after the specialist finishes. The reviewer runs in Codex's read-only
-  sandbox with web search and elevated authorizations disabled.
-- A reviewer must return **Approved** or **Changes requested**. Requested
-  changes return the task to the specialist with the review feedback attached;
-  approval finishes the task.
-- Review can be disabled, started manually, or launched automatically after
-  each specialist run from **Settings → Routing and review**.
-
-Revision feedback is checked by the same backend safety rules as the original
-task. A reviewer can recommend changes, but it cannot grant permissions or
-bypass the one-time approval system.
-
-Version 0.5.1 keeps agent status and action controls on one stable row at
-desktop and split-screen widths, then wraps them together only on small mobile
-layouts.
-
-While a task runs, the app streams Codex progress and exposes a **Stop agent**
-control. Per-run timeouts are configured in Settings. Completed task cards list
-changed files, open existing workspace items through the desktop, and show the
-working-tree diff when the selected workspace is a Git repository.
+| Document | Purpose |
+| --- | --- |
+| [START_HERE.md](START_HERE.md) | Reading order, source precedence, and conflict resolution |
+| [AGENTS.md](AGENTS.md) | Binding development and verification workflow |
+| [CURRENT_STATE.md](CURRENT_STATE.md) | Evidence-backed snapshot of what exists now |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Current architecture and directional boundaries |
+| [SECURITY_MODEL.md](SECURITY_MODEL.md) | Current trust boundaries, known gaps, and target invariants |
+| [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) | Ordered roadmap, dependencies, milestones, and release gates |
+| [planning/TASK_STATUS.md](planning/TASK_STATUS.md) | Status and closure evidence for every roadmap task |
 
 ## Development
+
+Install JavaScript dependencies from the lockfile and start the Tauri
+development application:
 
 ```bash
 npm ci
 npm run desktop
 ```
 
-## Remove the local installation
+Build the frontend or desktop bundle with the checked-in scripts:
 
 ```bash
-bash ./uninstall-kde.sh
+npm run build
+npm run desktop:build
 ```
+
+The repository also contains `install-kde.sh` and `uninstall-kde.sh`. Those
+scripts mutate the local desktop installation and must only be run as an
+explicitly approved live action. No build, provider, microphone, portal,
+installer, uninstaller, or desktop-control action was run while establishing
+this documentation baseline.
+
+## Working on the project
+
+Every change starts from the current checkout and follows [AGENTS.md](AGENTS.md):
+one approved task at a time, Phase A planning before Phase B implementation,
+coherent multi-file slices, focused verification, and no automatic commit or
+push. Use [planning/TASK_TEMPLATE.md](planning/TASK_TEMPLATE.md) for new task
+records and record any deliberate change to a fixed project decision under
+[`planning/decisions/`](planning/decisions/0001-fixed-project-decisions.md).
