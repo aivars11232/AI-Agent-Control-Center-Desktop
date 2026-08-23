@@ -24,7 +24,7 @@ ready merely because its predecessor's code was edited.
 | TASK-0002 | TASK-0001 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Reproducible verification and characterization baseline |
 | TASK-0003 | TASK-0002 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Backend persistence and state-migration foundation |
 | TASK-0004 | TASK-0003 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Authoritative approvals, capability policy, IPC, and CSP boundary |
-| TASK-0005 | TASK-0004 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Single-run coordinator, task lifecycle, ledger, and bounded output |
+| TASK-0005 | TASK-0004 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Single-run coordinator, task lifecycle, ledger, and bounded output |
 | TASK-0006 | TASK-0005 | NOT STARTED | NO | NOT STARTED | — | — | Truthful provider registry and common runtime contract |
 | TASK-0007 | TASK-0006 | NOT STARTED | NO | NOT STARTED | — | — | Codex runtime isolation, cancellation, and evidence hardening |
 | TASK-0008 | TASK-0007 | NOT STARTED | NO | NOT STARTED | — | — | Ollama discovery, transport, cancellation, and safe workspace tools |
@@ -213,7 +213,11 @@ ready merely because its predecessor's code was edited.
   and desktop/system-control actions: not run
 - Provider-specific identity/readiness, Codex descendant-process cleanup, and
   Ollama transport cancellation remain with TASK-0006 through TASK-0008
-- Git closure: PENDING USER; Codex did not stage, commit, or push
+- Git closure: user implementation commit
+  <code>ceaf01deb55c7d3ef7304dea2f84f97aa85043d0</code>
+  (<code>task5</code>). At the TASK-0006 preflight, checked-out
+  <code>main</code> and <code>origin/main</code> both resolved to that commit,
+  with zero ahead/behind and a clean working tree on 2026-08-23.
 
 ## Closure rule
 

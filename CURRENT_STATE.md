@@ -3,9 +3,13 @@
 > **Classification: Current static and fresh non-live evidence.** This snapshot
 > was refreshed for TASK-0005 on 2026-08-23 from starting commit
 > <code>0d7ade46ee7407d5feb0f43e3d52b6fe56abcba7</code> on branch
-> <code>main</code>. TASK-0005 changes remain in the working tree pending user
-> review and Git closure. Reverify details that may drift before relying on
-> them in a later task.
+> <code>main</code>. TASK-0005 implementation was committed as
+> <code>ceaf01deb55c7d3ef7304dea2f84f97aa85043d0</code>
+> (<code>task5</code>). The TASK-0006 preflight confirmed that checked-out
+> <code>main</code> and <code>origin/main</code> both resolved to that
+> implementation commit, with zero ahead/behind and a clean working tree on
+> 2026-08-23. Reverify details that may drift before relying on them in a later
+> task.
 
 This document owns statements about what is implemented now. Planned behavior
 belongs in [ARCHITECTURE.md](ARCHITECTURE.md) and
