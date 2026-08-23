@@ -94,6 +94,8 @@ describe("provider registry model availability", () => {
         name: "qwen-fixture",
         capabilities: ["completion", "tools"],
         contextLength: 65_536,
+        availability: "ready",
+        message: "Model metadata ready.",
       },
     ]);
     const llmOnlyRegistry = readyRegistry([
@@ -101,6 +103,8 @@ describe("provider registry model availability", () => {
         name: "qwen-fixture",
         capabilities: ["completion"],
         contextLength: 65_536,
+        availability: "ready",
+        message: "Model metadata ready.",
       },
     ]);
 
@@ -129,6 +133,27 @@ describe("provider registry model availability", () => {
     ).toMatchObject({
       eligible: false,
       reason: "The Ollama model qwen-fixture is not installed.",
+    });
+
+    const unavailableRegistry = readyRegistry([
+      {
+        name: "qwen-fixture",
+        capabilities: [],
+        contextLength: null,
+        availability: "unavailable",
+        message: "Ollama returned no model metadata.",
+      },
+    ]);
+    expect(
+      resolveModelAvailability(
+        models,
+        "qwen-fixture",
+        unavailableRegistry,
+        "ollama",
+      ),
+    ).toMatchObject({
+      eligible: false,
+      reason: "Ollama returned no model metadata.",
     });
   });
 

@@ -28,8 +28,8 @@ ready merely because its predecessor's code was edited.
 | TASK-0004 | TASK-0003 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Authoritative approvals, capability policy, IPC, and CSP boundary |
 | TASK-0005 | TASK-0004 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Single-run coordinator, task lifecycle, ledger, and bounded output |
 | TASK-0006 | TASK-0005 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Truthful provider registry and common runtime contract |
-| TASK-0007 | TASK-0006 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Codex runtime isolation, cancellation, and evidence hardening |
-| TASK-0008 | TASK-0007 | NOT STARTED | NO | NOT STARTED | — | — | Ollama discovery, transport, cancellation, and safe workspace tools |
+| TASK-0007 | TASK-0006 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Codex runtime isolation, cancellation, and evidence hardening |
+| TASK-0008 | TASK-0007 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Ollama discovery, transport, cancellation, and safe workspace tools |
 | TASK-0009 | TASK-0008 | NOT STARTED | NO | NOT STARTED | — | — | Dynamic agent registry and valid organizational hierarchy |
 | TASK-0010 | TASK-0009 | NOT STARTED | NO | NOT STARTED | — | — | Deterministic routing, queueing, workload, and sequential scheduling |
 | TASK-0011 | TASK-0010 | NOT STARTED | NO | NOT STARTED | — | — | Structured multi-level review, revisions, and recovery |
@@ -345,8 +345,74 @@ ready merely because its predecessor's code was edited.
   lifecycle rather than filesystem isolation; current CLI capability levels
   collapse write/full and safe/user, reject file-none, cannot universally block
   an absolute alternate Codex executable, and are unsupported outside Linux.
-  Live and packaged-platform acceptance remains with TASK-0020; Ollama
-  transport/tool hardening remains with TASK-0008
+  Live and packaged-platform acceptance remains with TASK-0020
+- Git closure: implementation commit
+  <code>4e06935bc9b4a7350e5ebca9970527f2f55cf2bd</code>
+  (<code>task7</code>) was identified from actual Git history, was the checked-out
+  <code>main</code> HEAD, and was reachable from <code>origin/main</code> at the
+  TASK-0008 preflight. Checked-out <code>main</code> and
+  <code>origin/main</code> both resolved to that commit with zero ahead/behind
+  and a clean working tree on 2026-08-23. Its 12-file implementation scope
+  matched the retained TASK-0007 evidence with no unexplained intervening
+  state, so all seven successor-preflight closure conditions passed.
+
+## TASK-0008 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>4e06935bc9b4a7350e5ebca9970527f2f55cf2bd</code>
+  (<code>task7</code>)
+- Starting status: clean; <code>main</code> matched <code>origin/main</code> with
+  zero ahead/behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0007 as
+  recorded above; its actual implementation commit and scope were verified
+  rather than inferred from the stale tracker label
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0008 AS PLANNED.</code>
+- Added a fixed numeric-loopback Ollama client that disables ambient proxying,
+  redirects, retries, referers, and connection reuse; enforces bounded encoded
+  requests and decoded JSON responses; and shares one cancellable task deadline
+  across discovery and execution
+- Added <code>/api/tags</code> discovery plus bounded parallel
+  <code>/api/show</code> inspection for exact installed identity, normalized
+  tool capability, architecture-specific context length, and truthful
+  per-model availability/reasons
+- Added Linux descriptor-confined workspace tools for stable paginated lists,
+  bounded ranged UTF-8 reads with full SHA-256, create-only files/directories,
+  and ordered hash-preconditioned patches committed with synchronized
+  no-replace/exchange operations and conflict rollback
+- Integrated one current-thread Ollama session into the authoritative provider
+  loop, capped chat context and tool turns, removed the prior handwritten TCP
+  path and unsafe whole-file write surface, and exposed per-model availability
+  to renderer eligibility and model-management UI
+- Added exact direct dependency pins for <code>reqwest 0.12.28</code>,
+  <code>sha2 0.10.9</code>, <code>tokio 1.53.0</code>, and Linux-only
+  <code>rustix 1.1.4</code>; the Cargo lock changed, while application schema,
+  migrations, state seed, IPC command names, and npm package lock did not
+  change
+- Focused verification passed: 8 Ollama transport/discovery tests, 6 workspace
+  boundary tests, 2 integrated tool-loop tests, 6 provider-registry frontend
+  tests, TypeScript, rustfmt, and Clippy with warnings denied
+- Complete fast gate: <code>npm run verify:fast</code> passed with 5 frontend
+  files/33 tests and 87 locked/offline Rust tests
+- Full non-live gate: <code>npm run verify:full</code> passed on 2026-08-23 with
+  5 frontend files/33 tests, TypeScript, rustfmt, 87 locked/offline Rust tests,
+  a 37-module production build, Clippy with warnings denied,
+  shell/Python/strict-JSON checks, npm/Cargo dependency trees, and production
+  plus full npm audits reporting zero vulnerabilities
+- Rust advisory result: **indeterminate** because <code>cargo-audit</code> is
+  unavailable; the full route records the skip explicitly and this
+  environmental limitation is not a pass
+- Live Codex/Ollama generation, provider authentication, microphone/listener,
+  portal, install/remove, desktop package, and desktop/system-control actions:
+  not run
+- Remaining limits: live Ollama connectivity, installed-model behavior, and
+  packaged-platform acceptance remain with TASK-0020; descriptor-confined
+  workspace tools intentionally fail closed outside Linux; full-file hashing
+  and patching reject files above the explicit 8 MiB bound
 - Git closure: **PENDING USER** review, commit, push, and clean-tree evidence
 
 ## Successor-preflight closure rule

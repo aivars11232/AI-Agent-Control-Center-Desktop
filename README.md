@@ -23,7 +23,8 @@ The current checkout contains:
   and no silent fallback;
 - a Linux Codex execution path with capability checks, explicit configuration
   isolation, bounded JSONL evidence, cancellation, and descendant cleanup;
-- an execution path for a local Ollama server;
+- a bounded async local Ollama path with exact installed-model inspection,
+  cancellable HTTP requests, and conflict-safe Linux workspace tools;
 - local workspace, task, agent, approval, reminder, and model-management UI;
 - an included Python voice runtime and KDE-oriented install/remove scripts.
 
@@ -33,9 +34,9 @@ through typed Tauri commands and a schema-versioned backend database. Run
 admission, task/run lifecycle projection, cancellation state, recovery, and
 bounded evidence retention are backend-authoritative. Provider identity and
 dispatch use a common backend contract. Codex process/protocol hardening is
-implemented for the current Linux path; routing, Ollama transport/tool
-hardening, live provider acceptance, and multi-level review orchestration remain
-prototype boundaries.
+implemented for the current Linux path; bounded Ollama transport and workspace
+tools are implemented for the current Linux path; routing, live provider
+acceptance, and multi-level review orchestration remain prototype boundaries.
 Approval issuance, matching, expiry, trusted resolution, reservation, and
 single-use consumption are backend-authoritative; imported legacy approval
 rows remain non-authoritative history.
@@ -77,7 +78,7 @@ npm run verify:fast
 ```
 
 It runs 33 frontend characterization/persistence/coordinator/provider tests,
-the TypeScript check, the Rust format check, and 74 locked/offline Rust tests.
+the TypeScript check, the Rust format check, and 87 locked/offline Rust tests.
 The full gate adds the
 frontend build, Clippy, shell/Python/JSON checks, dependency-tree checks, and
 production plus development npm audits:

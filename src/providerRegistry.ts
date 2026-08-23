@@ -24,6 +24,8 @@ export type ProviderRuntimeModel = {
   name: string;
   capabilities: string[];
   contextLength: number | null;
+  availability: ProviderAvailability;
+  message: string;
 };
 
 export type ProviderRuntimeStatus = {
@@ -238,6 +240,9 @@ export function resolveModelAvailability(
   }
 
   const runtimeModel = runtimeMatches[0];
+  if (runtimeModel.availability !== "ready") {
+    return unavailable(runtimeModel.message, model, providerId);
+  }
   if (
     !runtimeModel.capabilities.some(
       (capability) => capability.toLowerCase() === "tools",

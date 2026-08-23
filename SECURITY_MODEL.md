@@ -8,8 +8,10 @@
 > lifecycle recovery, and bounded ledger evidence. TASK-0006 establishes exact
 > provider/model identity and no-fallback registry dispatch. TASK-0007 adds
 > capability-gated Codex isolation, bounded protocol handling, and deterministic
-> Linux descendant cleanup; later tasks still own Ollama hardening, voice
-> semantics, packaging, and live acceptance.
+> Linux descendant cleanup. TASK-0008 adds fixed-loopback Ollama transport,
+> bounded discovery and cancellation, and descriptor-confined conflict-safe
+> workspace tools; later tasks still own voice semantics, packaging, and live
+> acceptance.
 
 ## Security objective
 
@@ -90,8 +92,22 @@ Static inspection and deterministic tests found these implemented controls:
   messages as final output, derives response/usage evidence, curates progress,
   and assigns distinct protocol, output-limit, compatibility, and cleanup
   failures;
-- Ollama workspace-tool containment, including absolute path, parent traversal,
-  and <code>.git</code> rejection;
+- fixed numeric-loopback Ollama transport with proxies, redirects, retries,
+  referers, and connection reuse disabled; bounded request/decoded-response
+  bodies; strict JSON content checks; and one task deadline;
+- installed-model discovery through <code>/api/tags</code> plus bounded
+  <code>/api/show</code> inspection, with normalized per-model capability,
+  context-length, availability, and failure evidence;
+- cancellation that aborts and awaits the active Ollama HTTP task before
+  returning, preventing a detached request worker;
+- Linux workspace tools anchored to one opened root descriptor, with
+  <code>openat2</code> beneath/no-symlink/no-magic-link resolution and a
+  component-wise <code>openat</code> fallback only when that syscall is absent;
+- stable paginated listings, bounded ranged UTF-8 reads with full hashes,
+  create-only files/directories, and ordered hash-preconditioned patches;
+- same-directory synchronized temporary-file commits using no-replace or
+  exchange rename semantics, with displaced-inode/content revalidation and
+  rollback rather than silent overwrite on conflict;
 - per-run cancellation flags and bounded timeouts;
 - changed-file and Git diff capture where available;
 - typed, bounded backend validation for persisted application state;
@@ -123,9 +139,10 @@ Static inspection and deterministic tests found these implemented controls:
   listen/unlisten core permissions.
 
 These controls establish the TASK-0004 authorization boundary, TASK-0005
-run-coordination boundary, TASK-0006 provider-identity boundary, and TASK-0007
-Codex process/protocol boundary. They do not establish production readiness or
-the later provider/platform guarantees.
+run-coordination boundary, TASK-0006 provider-identity boundary, TASK-0007
+Codex process/protocol boundary, and TASK-0008 Ollama transport/workspace-tool
+boundary. They do not establish production readiness or the later live
+provider/platform guarantees.
 
 ## Known current gaps
 
@@ -172,28 +189,33 @@ bind-mounts the host tree and therefore supplies lifecycle containment rather
 than filesystem authority; the inner Codex sandbox supplies that authority.
 The inspected CLI cannot enforce a zero-file-access mode or separate safe from
 user terminal access, write/full file levels both use workspace-write, and an
-absolute alternate Codex executable cannot be universally excluded. Live
-Codex authentication/model behavior and non-Linux support remain unverified for
-TASK-0020. Ollama transport cancellation and workspace-tool hardening remain
-with TASK-0008.
+absolute alternate Codex executable cannot be universally excluded. Live Codex
+authentication/model behavior and non-Linux support remain unverified for
+TASK-0020. Deterministic numeric-loopback fake-server and temporary-workspace
+tests cover Ollama discovery, transport, cancellation, large/conflicting edits,
+path escape, and bounded tool turns. They do not establish live Ollama or
+packaged-platform behavior, which remains with TASK-0020. Descriptor-confined
+workspace tools fail closed outside Linux.
 
 ### Verification coverage
 
-The checked-in non-live suite contains 33 frontend tests and 74 Rust tests. It
+The checked-in non-live suite contains 33 frontend tests and 87 Rust tests. It
 covers frontend characterization plus backend policy, authorization, run
 coordination/recovery/bounds, provider identity/fake-adapter dispatch, Codex
 compatibility/command/protocol/descendant-process cases, strict IPC,
-CSP/capability, persistence validation, migration, corruption, concurrency,
-and rollback cases. These checks do not establish end-to-end, packaging,
-upgrade, or live acceptance. Rust advisory status remains indeterminate when
-<code>cargo-audit</code> is unavailable.
+CSP/capability, Ollama fake-server transport/discovery/cancellation, safe
+workspace operations, persistence validation, migration, corruption,
+concurrency, and rollback cases. These checks do not establish end-to-end,
+packaging, upgrade, or live acceptance. Rust advisory status remains
+indeterminate when <code>cargo-audit</code> is unavailable.
 
 ## Target security invariants
 
 The approval/action subset of invariants 2 through 5, the coordinator subset
-of invariant 6, and the provider-identity/no-substitution plus Codex-isolation
-subsets of invariant 8 are implemented for the current command surface. The
-full integrated invariants remain the release target:
+of invariant 6, the Ollama workspace subset of invariant 7, and the
+provider-identity/no-substitution plus Codex/Ollama adapter subsets of invariant
+8 are implemented for the current command surface. The full integrated
+invariants remain the release target:
 
 1. The backend is the sole authority for durable domain state and action
    authorization.
@@ -223,8 +245,8 @@ full integrated invariants remain the release target:
 
 | Action class | Default direction | Required boundary |
 | --- | --- | --- |
-| Read workspace file | Deny outside selected root | Canonical backend path check |
-| Write/delete workspace file | Explicit capability; approval when policy requires | Backend policy plus workspace containment |
+| Read workspace file | Deny outside selected root | Descriptor-confined backend path resolution on the current Linux path |
+| Write/delete workspace file | Explicit capability; approval when policy requires | Backend policy plus conflict-safe workspace containment; Ollama exposes no delete tool |
 | Web access | Off unless capability and task policy permit | Provider/tool-specific network gate |
 | Terminal command | Deny by default; never infer from prose | Normalized command policy and bounded process execution |
 | Clipboard | Deny by default | Backend action-specific grant |
@@ -270,6 +292,8 @@ least-privilege workarounds before any code change.
 - Do not report Codex cancellation, timeout, or success until bounded process
   and namespace cleanup is established; cleanup uncertainty is an interrupted
   outcome requiring review.
+- Abort and await an active Ollama request before reporting cancellation or
+  timeout; never detach the request worker from the authoritative run.
 - Never infer success from a missing process or UI state.
 - Preserve approval records and workspace evidence needed for audit while
   applying explicit retention and redaction rules.

@@ -1,14 +1,12 @@
 # Current State
 
 > **Classification: Current static and fresh non-live evidence.** This snapshot
-> was refreshed for TASK-0007 on 2026-08-23 from starting commit
-> <code>82b0035f3ec4e369dda40bb1f1fe12b450b5af52</code>
-> (<code>task7.1</code>) on branch <code>main</code>. That governance-only commit
-> records closure of the TASK-0006 implementation commit
-> <code>eb2421634b1e202a85fcd1890ba7f1073c137269</code>
-> (<code>task6</code>). At the TASK-0007 preflight, checked-out
-> <code>main</code> and <code>origin/main</code> both resolved to the former
-> commit, with zero ahead/behind and a clean working tree. Reverify later
+> was refreshed for TASK-0008 on 2026-08-23 from starting commit
+> <code>4e06935bc9b4a7350e5ebca9970527f2f55cf2bd</code>
+> (<code>task7</code>) on branch <code>main</code>. At the TASK-0008 preflight,
+> checked-out <code>main</code> and <code>origin/main</code> both resolved to that
+> commit, with zero ahead/behind and a clean working tree. Its actual scope
+> matched the retained TASK-0007 implementation evidence. Reverify later
 > implementation facts when they may have drifted.
 
 This document owns statements about what is implemented now. Planned behavior
@@ -27,16 +25,19 @@ restart reconciliation. TASK-0006 adds an explicit provider registry, a common
 runtime contract, exact active-provider/model resolution, and truthful renderer
 availability. TASK-0007 adds capability-gated Codex compatibility checks,
 explicit command isolation, Linux process-lifecycle containment, bounded JSONL
-evidence parsing, and deterministic descendant cleanup. Fresh deterministic
-checks establish the non-live verification baseline described below; they do
-not establish live runtime readiness.
+evidence parsing, and deterministic descendant cleanup. TASK-0008 adds
+contract-correct Ollama model inspection, bounded cancellable HTTP transport,
+per-model readiness, and descriptor-confined conflict-safe workspace tools.
+Fresh deterministic checks establish the non-live verification baseline
+described below; they do not establish live runtime readiness.
 
-TASK-0007 did **not** run a live Codex task, Ollama, or another model/provider.
+TASK-0008 did **not** run a live Codex task, Ollama, or another model/provider.
 It also did not capture microphone input; import or start the Python listener;
 authorize a KDE/XDG portal; execute install/remove scripts; build a desktop
-package; or perform a desktop/system-control action. Its Codex subprocess tests
-use an isolated fake CLI. Earlier audit observations remain historical unless
-this document identifies a fresh result.
+package; or perform a desktop/system-control action. Its Ollama tests use
+isolated numeric-loopback fake servers and temporary workspaces; TASK-0007's
+Codex subprocess tests use an isolated fake CLI. Earlier audit observations
+remain historical unless this document identifies a fresh result.
 
 ## Product and release identity
 
@@ -64,9 +65,11 @@ this document identifies a fresh result.
 | <code>src/persistence.ts</code> | Typed desktop bootstrap, one-time legacy cleanup, serialized writes, backup import, and reset adapter |
 | <code>src/App.css</code> | Main application styling and responsive behavior |
 | <code>src/voiceCommand.ts</code> | Renderer voice-command interpretation |
-| <code>src-tauri/src/lib.rs</code> | Tauri command/startup composition, provider execution, workspace operations, native desktop control, and voice process management |
+| <code>src-tauri/src/lib.rs</code> | Tauri command/startup composition, provider tool-loop orchestration, workspace evidence, native desktop control, and voice process management |
 | <code>src-tauri/src/provider_runtime.rs</code> | Provider-neutral identity, capability, request, event, cancellation, result, error, adapter, registry, and fake-test contracts |
 | <code>src-tauri/src/codex_runtime.rs</code> | Linux Codex compatibility probing, isolated command construction, bounded JSONL protocol handling, lifecycle containment, cancellation, timeout, and evidence capture |
+| <code>src-tauri/src/ollama_runtime.rs</code> | Fixed-loopback Ollama discovery, per-model metadata, bounded async HTTP, task-deadline cancellation, and chat transport |
+| <code>src-tauri/src/workspace_tools.rs</code> | Linux descriptor-confined listing, ranged reads, hashes, create-only writes, preconditioned patches, and atomic conflict handling |
 | <code>src-tauri/src/app_state.rs</code> | Backend application-state types, validation, canonical seed loading, and legacy normalization |
 | <code>src-tauri/src/policy.rs</code> / <code>src-tauri/src/authorization.rs</code> | Normalized action intents, capability evaluation, native confirmation, and approval IPC contracts |
 | <code>src-tauri/src/run_coordinator.rs</code> | Run states, legal transitions, ledger projections, and explicit evidence/retention bounds |
@@ -223,12 +226,35 @@ classes with bounded evidence.
 
 ### Ollama
 
-The Rust backend talks to a local Ollama endpoint, discovers installed models,
-requires tool capability for coding runs, supplies bounded workspace tools,
-limits tool turns, supports cancellation and timeouts, and captures workspace
-change evidence. Its tool path checks reject absolute and parent-traversal
-paths and prevent access to the selected workspace's <code>.git</code>
-directory.
+The Rust backend displays <code>http://localhost:11434</code> but connects only
+to the fixed numeric loopback endpoint <code>127.0.0.1:11434</code>. Its async
+HTTP client disables proxies, redirects, retries, referers, and connection
+reuse; uses HTTP/1.1; decodes supported compression; enforces 2 MiB serialized
+request and decoded-response bounds; checks declared lengths and JSON content;
+and aborts and awaits the active request task on cancellation or the one task
+deadline. No request worker thread is left detached.
+
+Discovery obtains installed names from <code>/api/tags</code>, then inspects
+bounded parallel <code>/api/show</code> responses for normalized capabilities
+and architecture-specific context length. A failed show response leaves that
+one model installed but explicitly unavailable with a reason. Coding runs
+repeat exact tags/show resolution, require the selected installed model to be
+tool-capable, use its bounded context metadata, and stop after at most 16 tool
+turns.
+
+On Linux, one opened workspace-root descriptor anchors tool access. Existing
+paths use <code>openat2</code> beneath/no-symlink/no-magic-link resolution with a
+component-by-component <code>openat</code> fallback when the syscall is absent.
+Absolute paths, parent traversal, symlinks, non-directories, and
+<code>.git</code> components fail closed. Listings are stable and paginated;
+reads return bounded UTF-8 byte ranges plus the full-file SHA-256; new files and
+directories are create-only; and ordered byte-range patches require the exact
+current hash. Same-directory temporary files are synchronized and committed
+with no-replace or exchange rename semantics. An exchange rechecks the
+displaced inode and content and rolls back a conflict instead of silently
+overwriting newer data. Ollama receives no terminal, web, delete, clipboard,
+or system-control tool. Descriptor-confined tools currently fail closed on
+non-Linux platforms.
 
 ### Registry, identity, and availability
 
@@ -248,13 +274,14 @@ catalog provider, runtime provider, and active provider under
 than authorizing a changed provider decision.
 
 <code>provider_registry_status</code> returns common provider descriptors,
-capabilities, readiness, versions, discovered runtime models, and all catalog
-bindings. The renderer uses that one snapshot for the provider selector,
+capabilities, readiness, versions, discovered runtime models with per-model
+availability/reasons, and all catalog bindings. The renderer uses that one snapshot for the provider selector,
 model catalog, assignments, defaults, automatic routing, and senior-review
 selection. Codex catalog models are eligible only when Codex reports ready and
 remain subject to CLI model validation at run start. Ollama models additionally
-must be discovered locally and report tool support. Existing unavailable
-catalog entries and assignments are preserved rather than rewritten.
+must be discovered locally, have readable show metadata, and report tool
+support. Existing unavailable catalog entries and assignments are preserved
+rather than rewritten.
 
 Both adapters implement the same typed request, progress, cancellation,
 result, evidence, and error contract. Orchestration dispatches through the
@@ -263,7 +290,7 @@ rows, and classifies terminal failures from typed error codes rather than
 provider-specific message text. Historical ledger rows are retained unchanged.
 
 No live provider connectivity, authentication, model execution, or model output
-was checked in TASK-0007.
+was checked in TASK-0008.
 
 ## Current run, routing, and review behavior
 
@@ -312,6 +339,12 @@ seconds; and changed-file evidence to 250 paths and 256 KiB. The ledger keeps
 original counts/sizes and explicit truncation flags, which the renderer
 surfaces instead of implying complete evidence.
 
+Ollama workspace listings expose at most 200 entries per page and reads expose
+at most 64 KiB per range. Full-file hashing and patches are limited to 8 MiB,
+new-file content and aggregate replacement text to 512 KiB, and a patch to 64
+ordered non-overlapping edits. Every partial list/read result includes an
+explicit continuation cursor/offset and truncation flag.
+
 ## Native desktop and voice behavior
 
 The Tauri invoke surface includes workspace selection/opening, application and
@@ -350,13 +383,14 @@ The backend currently:
   mount, permission, and system-control command patterns;
 - resolves the selected workspace and constrains Codex with an explicit Codex
   sandbox plus Linux process-lifecycle containment;
-- constrains Ollama tools to paths below the selected workspace.
+- anchors Ollama tools to a selected-workspace descriptor, refuses symlink and
+  <code>.git</code> traversal, and requires hash-preconditioned atomic edits.
 
 These controls include backend-issued exact approvals with native resolution,
 expiry, policy/workspace invalidation, and atomic one-use consumption. Imported
 or renderer-origin records cannot authorize actions. Heuristic task-text
-classification, the limits of the current Codex CLI sandbox projection, and
-Ollama-specific transport/tool cleanup remain prototype limits.
+classification and the limits of the current Codex CLI sandbox projection
+remain prototype limits.
 [SECURITY_MODEL.md](SECURITY_MODEL.md) owns the full boundary and gap list.
 
 Production CSP permits local application resources and Tauri IPC only, blocks
@@ -372,15 +406,16 @@ legacy migration, serialization, revision, fail-closed writer behavior,
 authoritative run projection, provider binding, readiness, and model
 eligibility.
 
-The Rust library contains 74 passing tests. They add Codex compatibility,
+The Rust library contains 87 passing tests. They add Codex compatibility,
 command-isolation, bounded protocol, fake-process descendant cleanup, provider
 registry, fake-adapter dispatch, exact identity, typed failure, run-state,
 concurrent admission, idempotency, approval-boundary, cancellation, timeout,
 crash/restart, stale completion/event, truncation, and retention coverage to
 the earlier provider, workspace, run-safety, voice, state-validation,
 persistence, authorization, corruption, concurrency, and rollback tests.
-The Ollama connection test uses an isolated loopback server; it does not contact
-a live provider.
+Sixteen TASK-0008 tests cover fake-server discovery/transport/cancellation,
+large and conflicting workspace edits, path escape, and bounded tool turns;
+they do not contact a live provider.
 
 The repository-root entry points are:
 
@@ -390,14 +425,14 @@ The repository-root entry points are:
   Clippy, shell/Python/strict-JSON syntax checks, npm/Cargo dependency trees,
   and production plus full npm audits.
 
-TASK-0007 focused checks passed on 2026-08-23: 12 task-specific Rust tests, 5
-provider-runtime tests, the complete 74-test locked/offline Rust suite, shell
-fixture syntax, rustfmt, and Clippy with warnings denied. The full repository
-<code>npm run verify:fast</code> and <code>npm run verify:full</code> routes
-passed with 33 frontend tests, 74 Rust tests, a 37-module production build,
-Clippy with warnings denied, shell/Python/JSON checks, dependency trees, and
-both npm audits reporting zero vulnerabilities. Exact task evidence is recorded
-in [planning/TASK_STATUS.md](planning/TASK_STATUS.md).
+TASK-0008 focused checks passed on 2026-08-23: 16 task-specific Rust tests, 6
+provider-registry frontend tests, TypeScript, rustfmt, and Clippy with warnings
+denied. The complete <code>npm run verify:fast</code> and
+<code>npm run verify:full</code> routes passed with 33 frontend tests, 87
+locked/offline Rust tests, a 37-module production build, Clippy with warnings
+denied, shell/Python/JSON checks, dependency trees, and both npm audits reporting
+zero vulnerabilities. Exact task evidence is recorded in
+[planning/TASK_STATUS.md](planning/TASK_STATUS.md).
 
 <code>cargo-audit</code> is not installed in the inspected environment. The
 full route therefore reports the Rust advisory result as **indeterminate** and
@@ -409,8 +444,8 @@ belongs to TASK-0019.
 | Gap | Owning task |
 | --- | --- |
 | Mandatory installed/CI Rust advisory tooling | TASK-0019 |
-| Ollama transport/tool hardening | TASK-0008 |
 | Live Codex compatibility, authentication, model, and packaged-platform acceptance | TASK-0020 |
+| Live Ollama connectivity, installed-model behavior, cancellation, and packaged-platform acceptance | TASK-0020 |
 | Dynamic hierarchy, routing, review, and workspace evidence | TASK-0009–TASK-0012 |
 | Frontend modularity, strict backup, and full data lifecycle | TASK-0013–TASK-0014 |
 | Voice/system policy and KDE/XDG integration | TASK-0015–TASK-0016 |

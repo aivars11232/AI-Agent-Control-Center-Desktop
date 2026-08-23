@@ -44,7 +44,8 @@ The binding decision record is
       |-- authoritative single-run coordinator + durable bounded ledger
       |-- provider registry/common contract (provider_runtime.rs)
       |     |-- isolated Codex CLI runtime (codex_runtime.rs)
-      |     |-- local Ollama HTTP + workspace-tools adapter
+      |     |-- bounded Ollama HTTP runtime (ollama_runtime.rs)
+      |     |-- descriptor-confined workspace tools (workspace_tools.rs)
       |-- filesystem/Git inspection
       |-- application/window/input control
       |-- Python voice listener process
@@ -75,13 +76,15 @@ processes/transports, workspace resolution and tool access, run cancellation,
 diff/change capture, desktop actions, and voice process management. It
 also composes <code>app_state.rs</code>, <code>policy.rs</code>,
 <code>authorization.rs</code>, <code>run_coordinator.rs</code>,
-<code>provider_runtime.rs</code>, <code>codex_runtime.rs</code>, and
+<code>provider_runtime.rs</code>, <code>codex_runtime.rs</code>,
+<code>ollama_runtime.rs</code>, <code>workspace_tools.rs</code>, and
 <code>persistence.rs</code>. Those modules
 own the versioned state contract, normalized action intents, fail-closed
 capability evaluation, authoritative approval lifecycle, legal run transitions
 and evidence bounds, provider identity/contracts/dispatch, isolated Codex
-compatibility/process/protocol handling, SQLite schema/repository, legacy
-migration, and typed state IPC. The registry exposes only Codex and Ollama
+compatibility/process/protocol handling, bounded fixed-loopback Ollama
+transport/discovery, descriptor-confined conflict-safe workspace edits, SQLite
+schema/repository, legacy migration, and typed state IPC. The registry exposes only Codex and Ollama
 adapters and rejects provider/model mismatch without fallback. Non-run
 privileged command handlers consume backend authorization before their first
 side effect; run approvals are reserved at admission and consumed at successful
@@ -161,10 +164,14 @@ behavior were not exercised in TASK-0001.
    input, runs in an outer lifecycle-only Bubblewrap namespace plus an explicit
    inner Codex sandbox, parses bounded JSONL incrementally, and refuses a
    terminal outcome until descendant cleanup is established.
-7. The backend persists bounded ordered events, cancellation state, terminal
+7. Ollama dispatch resolves names through <code>/api/tags</code> and metadata
+   through <code>/api/show</code>, holds one cancellable async session and task
+   deadline across its bounded tool loop, and exposes only descriptor-confined
+   paginated/read/hash/create/patch workspace operations.
+8. The backend persists bounded ordered events, cancellation state, terminal
    outcome, output summary, usage, and workspace evidence. Terminal attempts
    cannot be updated.
-8. The renderer displays authoritative snapshots/events and a global Stop
+9. The renderer displays authoritative snapshots/events and a global Stop
    control across navigation; generic state saves cannot overwrite run-owned
    task fields.
 
@@ -202,13 +209,15 @@ state.
 - **Provider registry** — provider identity, model capability, readiness, and
   truthful dispatch contracts. The common registry and contract are
   implemented by TASK-0006; TASK-0007 hardens the Codex adapter and TASK-0008
-  retains Ollama hardening.
+  hardens the Ollama adapter.
 - **Codex adapter** — capability-based compatibility checks, explicit CLI
   isolation, Linux descendant-lifecycle containment, bounded JSONL protocol,
   cancellation/timeout escalation, and evidence parsing. This boundary is
   implemented by TASK-0007; live acceptance remains with TASK-0020.
 - **Ollama adapter** — local discovery, transport, tool loop, and workspace
-  tools.
+  tools. Bounded transport/discovery, cancellable requests, per-model metadata,
+  and conflict-safe workspace tools are implemented by TASK-0008; live
+  acceptance remains with TASK-0020.
 - **Workspace service** — canonical roots, path containment, snapshots, diffs,
   and change evidence.
 - **Voice/system gateway** — intent normalization and policy-checked desktop
@@ -279,7 +288,7 @@ The planned system-wide execution flow is sequential:
 
 TASK-0003 through TASK-0005 establish backend state, policy, and coordination.
 TASK-0006 establishes provider identity and the common contract; TASK-0007
-hardens the Codex adapter and TASK-0008 retains Ollama adapter hardening.
+hardens the Codex adapter and TASK-0008 hardens the Ollama adapter.
 TASK-0009 through
 TASK-0012 establish hierarchy and orchestration. TASK-0013 and TASK-0014
 modularize UI/data lifecycle. TASK-0015 and TASK-0016 own system actions and

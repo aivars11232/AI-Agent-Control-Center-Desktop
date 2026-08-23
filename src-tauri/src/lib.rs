@@ -1,10 +1,12 @@
 mod app_state;
 mod authorization;
 mod codex_runtime;
+mod ollama_runtime;
 mod persistence;
 mod policy;
 mod provider_runtime;
 mod run_coordinator;
+mod workspace_tools;
 
 use app_state::{ApplicationState, LegacyRendererState};
 use ashpd::desktop::{
@@ -20,6 +22,10 @@ use authorization::{
 };
 use codex_runtime::CodexRunSpec;
 use keyring::Entry;
+use ollama_runtime::{
+    inspect_ollama_runtime, OllamaError, OllamaErrorKind, OllamaRuntimeStatus, OllamaSession,
+    OLLAMA_DISPLAY_ENDPOINT,
+};
 use persistence::{
     PersistenceError, PersistenceService, SaveReceipt, StateEnvelope, StateRepository,
 };
@@ -35,21 +41,19 @@ use provider_runtime::{
 use run_coordinator::{
     bound_diff, bound_paths, validate_request_id, BoundedText, RunAttemptProjection,
     RunAttemptStatus, RunCompletion, RunCoordinatorSnapshot, RunTruncationEvidence, RunUsage,
-    MAX_DIFF_BYTES, MAX_OLLAMA_CONVERSATION_BYTES, MAX_OLLAMA_RESPONSE_BYTES, MAX_SNAPSHOT_FILES,
-    MAX_SNAPSHOT_MILLIS,
+    MAX_DIFF_BYTES, MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_MILLIS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    io::{BufRead, BufReader, Read, Write},
-    net::TcpStream,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
@@ -59,17 +63,11 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, State, WindowEvent,
 };
+use workspace_tools::{ollama_workspace_tools, WorkspaceTools};
 
 const KEYRING_SERVICE: &str = "com.aivarsrocens.aiagentcontrolcenter";
 const OPENAI_KEY_ACCOUNT: &str = "openai-api-key";
-const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
-const OLLAMA_ADDRESS: &str = "127.0.0.1:11434";
-const OLLAMA_REQUEST_TIMEOUT_SECONDS: u64 = 90;
-const OLLAMA_CONTEXT_TOKENS: u64 = 8_192;
 const MAX_OLLAMA_TOOL_TURNS: usize = 16;
-const MAX_OLLAMA_LISTED_FILES: usize = 300;
-const MAX_OLLAMA_FILE_CHARS: usize = 16_000;
-const MAX_OLLAMA_WRITE_CHARS: usize = 120_000;
 const KEYSYM_ALT: i32 = 0xffe9;
 const KEYSYM_CONTROL: i32 = 0xffe3;
 const KEYSYM_SHIFT: i32 = 0xffe1;
@@ -123,24 +121,6 @@ struct CodexRuntimeStatus {
     version: Option<String>,
     binary_path: Option<String>,
     message: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OllamaRuntimeStatus {
-    connected: bool,
-    version: Option<String>,
-    endpoint: String,
-    models: Vec<OllamaModel>,
-    message: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OllamaModel {
-    name: String,
-    capabilities: Vec<String>,
-    context_length: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -592,170 +572,6 @@ fn inspect_codex_runtime() -> CodexRuntimeStatus {
         version: inspection.version,
         binary_path: inspection.binary_path,
         message: inspection.message,
-    }
-}
-
-fn ollama_request_at(
-    address: &str,
-    method: &str,
-    path: &str,
-    body: Option<&Value>,
-) -> Result<Value, String> {
-    let body_text = body
-        .map(serde_json::to_string)
-        .transpose()
-        .map_err(|error| format!("Could not prepare the Ollama request: {error}"))?
-        .unwrap_or_default();
-    if body_text.len() > MAX_OLLAMA_CONVERSATION_BYTES {
-        return Err(format!(
-            "The Ollama conversation exceeded the {}-byte request bound.",
-            MAX_OLLAMA_CONVERSATION_BYTES
-        ));
-    }
-    let mut stream = TcpStream::connect_timeout(
-        &address
-            .parse()
-            .map_err(|error| format!("Could not resolve the Ollama address: {error}"))?,
-        Duration::from_secs(5),
-    )
-    .map_err(|error| format!("Ollama is not reachable at {OLLAMA_ENDPOINT}: {error}"))?;
-    let timeout = Duration::from_secs(OLLAMA_REQUEST_TIMEOUT_SECONDS);
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|error| format!("Could not configure the Ollama connection: {error}"))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|error| format!("Could not configure the Ollama connection: {error}"))?;
-
-    let mut request = format!(
-    "{method} {path} HTTP/1.1\r\nHost: {address}\r\nAccept: application/json\r\nConnection: close\r\n"
-  );
-    if !body_text.is_empty() {
-        request.push_str(&format!(
-            "Content-Type: application/json\r\nContent-Length: {}\r\n",
-            body_text.len()
-        ));
-    }
-    request.push_str("\r\n");
-    stream
-        .write_all(request.as_bytes())
-        .and_then(|_| stream.write_all(body_text.as_bytes()))
-        .and_then(|_| stream.flush())
-        .map_err(|error| format!("Could not send a request to Ollama: {error}"))?;
-
-    let response = read_bounded_capture(stream, MAX_OLLAMA_RESPONSE_BYTES + 64 * 1024);
-    if response.truncated {
-        return Err(format!(
-            "Ollama's HTTP response exceeded the {}-byte response bound.",
-            MAX_OLLAMA_RESPONSE_BYTES
-        ));
-    }
-    let response = response.text;
-    let (headers, response_body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "Ollama returned an invalid HTTP response.".to_string())?;
-    if response_body.len() > MAX_OLLAMA_RESPONSE_BYTES {
-        return Err(format!(
-            "Ollama's response body exceeded the {}-byte response bound.",
-            MAX_OLLAMA_RESPONSE_BYTES
-        ));
-    }
-    let status = headers
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| "Ollama returned an invalid HTTP status.".to_string())?;
-    let payload: Value = serde_json::from_str(response_body)
-        .map_err(|error| format!("Ollama returned invalid JSON: {error}"))?;
-
-    if !(200..300).contains(&status) {
-        let detail = payload
-            .get("error")
-            .and_then(Value::as_str)
-            .filter(|message| !message.trim().is_empty())
-            .unwrap_or(response_body.trim());
-        return Err(format!("Ollama returned HTTP {status}: {detail}"));
-    }
-
-    Ok(payload)
-}
-
-fn ollama_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
-    ollama_request_at(OLLAMA_ADDRESS, method, path, body)
-}
-
-fn inspect_ollama_runtime() -> OllamaRuntimeStatus {
-    let version_response = match ollama_request("GET", "/api/version", None) {
-        Ok(response) => response,
-        Err(error) => {
-            return OllamaRuntimeStatus {
-                connected: false,
-                version: None,
-                endpoint: OLLAMA_ENDPOINT.to_string(),
-                models: Vec::new(),
-                message: error,
-            };
-        }
-    };
-    let version = version_response
-        .get("version")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-
-    match ollama_request("GET", "/api/tags", None) {
-        Ok(response) => {
-            let models: Vec<OllamaModel> = response
-                .get("models")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| {
-                            let name = item.get("name")?.as_str()?.trim();
-                            (!name.is_empty()).then(|| OllamaModel {
-                                name: name.to_string(),
-                                capabilities: item
-                                    .get("capabilities")
-                                    .and_then(Value::as_array)
-                                    .map(|capabilities| {
-                                        capabilities
-                                            .iter()
-                                            .filter_map(Value::as_str)
-                                            .map(str::to_string)
-                                            .collect()
-                                    })
-                                    .unwrap_or_default(),
-                                context_length: item
-                                    .get("details")
-                                    .and_then(|details| details.get("context_length"))
-                                    .and_then(Value::as_u64),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let model_count = models.len();
-            OllamaRuntimeStatus {
-                connected: true,
-                version,
-                endpoint: OLLAMA_ENDPOINT.to_string(),
-                models,
-                message: format!(
-                    "Ollama is running locally with {model_count} installed model{}.",
-                    if model_count == 1 { "" } else { "s" }
-                ),
-            }
-        }
-        Err(error) => OllamaRuntimeStatus {
-            connected: true,
-            version,
-            endpoint: OLLAMA_ENDPOINT.to_string(),
-            models: Vec::new(),
-            message: format!(
-                "Ollama is reachable, but its local model catalog could not be read: {error}"
-            ),
-        },
     }
 }
 
@@ -1375,269 +1191,6 @@ fn git_working_tree_diff(workspace: &Path) -> Option<CapturedText> {
     }
 }
 
-fn relative_workspace_path(input: &str) -> Result<PathBuf, String> {
-    let trimmed = input.trim();
-    let path = Path::new(if trimmed.is_empty() { "." } else { trimmed });
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir
-                    | std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
-    {
-        return Err(
-            "Workspace tool paths must be relative and stay inside the selected workspace."
-                .to_string(),
-        );
-    }
-    Ok(path.to_path_buf())
-}
-
-fn workspace_tool_path(
-    workspace: &Path,
-    input: &str,
-    allow_missing: bool,
-) -> Result<PathBuf, String> {
-    let relative = relative_workspace_path(input)?;
-    if relative
-        .components()
-        .any(|component| component.as_os_str() == ".git")
-    {
-        return Err(
-            "The local Ollama agent cannot access the workspace's .git directory.".to_string(),
-        );
-    }
-    let candidate = workspace.join(relative);
-
-    match fs::symlink_metadata(&candidate) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err("Workspace tools do not follow symbolic links.".to_string());
-            }
-            let resolved = fs::canonicalize(&candidate)
-                .map_err(|error| format!("Could not resolve the workspace path: {error}"))?;
-            if !resolved.starts_with(workspace) {
-                return Err("The requested path is outside the selected workspace.".to_string());
-            }
-            Ok(resolved)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && allow_missing => {
-            let parent = candidate
-                .parent()
-                .ok_or_else(|| "The workspace path has no parent directory.".to_string())?;
-            let resolved_parent = fs::canonicalize(parent).map_err(|_| {
-                "The target folder does not exist inside the selected workspace.".to_string()
-            })?;
-            if !resolved_parent.starts_with(workspace) {
-                return Err("The requested path is outside the selected workspace.".to_string());
-            }
-            Ok(candidate)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Err("The requested workspace item does not exist.".to_string())
-        }
-        Err(error) => Err(format!("Could not inspect the workspace path: {error}")),
-    }
-}
-
-fn workspace_display_path(workspace: &Path, path: &Path) -> String {
-    path.strip_prefix(workspace)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_string()
-}
-
-fn collect_workspace_files(
-    workspace: &Path,
-    directory: &Path,
-    depth: usize,
-    current_depth: usize,
-    entries: &mut Vec<String>,
-) {
-    if entries.len() >= MAX_OLLAMA_LISTED_FILES {
-        return;
-    }
-    let Ok(read_dir) = fs::read_dir(directory) else {
-        return;
-    };
-    let mut children: Vec<_> = read_dir.flatten().collect();
-    children.sort_by_key(|entry| entry.file_name());
-
-    for entry in children {
-        if entries.len() >= MAX_OLLAMA_LISTED_FILES {
-            return;
-        }
-        let path = entry.path();
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_symlink() {
-            continue;
-        }
-
-        let mut display = workspace_display_path(workspace, &path);
-        if file_type.is_dir() {
-            display.push('/');
-            entries.push(display);
-            if current_depth < depth && !should_skip_directory(&file_name) {
-                collect_workspace_files(workspace, &path, depth, current_depth + 1, entries);
-            }
-        } else if file_type.is_file() {
-            entries.push(display);
-        }
-    }
-}
-
-fn list_workspace_files(workspace: &Path, path: &str, max_depth: usize) -> Result<String, String> {
-    let root = workspace_tool_path(workspace, path, false)?;
-    let metadata = fs::metadata(&root)
-        .map_err(|error| format!("Could not read the workspace item: {error}"))?;
-    if metadata.is_file() {
-        return Ok(workspace_display_path(workspace, &root));
-    }
-    if !metadata.is_dir() {
-        return Err("The requested workspace item is not a file or directory.".to_string());
-    }
-
-    let mut entries = Vec::new();
-    collect_workspace_files(workspace, &root, max_depth.clamp(1, 5), 0, &mut entries);
-    if entries.is_empty() {
-        return Ok("The directory is empty.".to_string());
-    }
-    if entries.len() == MAX_OLLAMA_LISTED_FILES {
-        entries.push("… listing truncated at 300 entries".to_string());
-    }
-    Ok(entries.join("\n"))
-}
-
-fn read_workspace_file(workspace: &Path, path: &str) -> Result<String, String> {
-    let file = workspace_tool_path(workspace, path, false)?;
-    let metadata = fs::metadata(&file)
-        .map_err(|error| format!("Could not read the workspace file: {error}"))?;
-    if !metadata.is_file() {
-        return Err("The requested workspace item is not a regular file.".to_string());
-    }
-    let content = fs::read_to_string(&file)
-        .map_err(|_| "The requested workspace file is not readable text.".to_string())?;
-    let truncated = content.chars().count() > MAX_OLLAMA_FILE_CHARS;
-    let content = if truncated {
-        content
-            .chars()
-            .take(MAX_OLLAMA_FILE_CHARS)
-            .collect::<String>()
-    } else {
-        content
-    };
-    Ok(format!(
-        "{}{}\n{}",
-        workspace_display_path(workspace, &file),
-        if truncated { " (truncated)" } else { "" },
-        content
-    ))
-}
-
-fn write_workspace_file(workspace: &Path, path: &str, content: &str) -> Result<String, String> {
-    if content.contains('\0') {
-        return Err("Workspace files cannot contain null bytes.".to_string());
-    }
-    if content.chars().count() > MAX_OLLAMA_WRITE_CHARS {
-        return Err(
-            "The requested file write is too large for the local coding agent.".to_string(),
-        );
-    }
-    let file = workspace_tool_path(workspace, path, true)?;
-    if let Ok(metadata) = fs::metadata(&file) {
-        if !metadata.is_file() {
-            return Err("The requested workspace item is not a regular file.".to_string());
-        }
-    }
-    fs::write(&file, content)
-        .map_err(|error| format!("Could not write the workspace file: {error}"))?;
-    Ok(format!(
-        "Wrote {}",
-        workspace_display_path(workspace, &file)
-    ))
-}
-
-fn create_workspace_directory(workspace: &Path, path: &str) -> Result<String, String> {
-    let directory = workspace_tool_path(workspace, path, true)?;
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("Could not create the workspace directory: {error}"))?;
-    Ok(format!(
-        "Created {}",
-        workspace_display_path(workspace, &directory)
-    ))
-}
-
-fn ollama_workspace_tools(file_access: &str) -> Vec<Value> {
-    let mut tools = vec![
-        json!({
-          "type": "function",
-          "function": {
-            "name": "list_workspace_files",
-            "description": "List files and folders inside the selected workspace. Paths must be relative to the workspace.",
-            "parameters": {
-              "type": "object",
-              "properties": {
-                "path": { "type": "string", "description": "Optional relative directory path. Use . for the workspace root." },
-                "max_depth": { "type": "integer", "description": "Optional nesting depth from 1 through 5." }
-              }
-            }
-          }
-        }),
-        json!({
-          "type": "function",
-          "function": {
-            "name": "read_workspace_file",
-            "description": "Read a UTF-8 text file inside the selected workspace. Paths must be relative to the workspace.",
-            "parameters": {
-              "type": "object",
-              "properties": {
-                "path": { "type": "string", "description": "Relative file path." }
-              },
-              "required": ["path"]
-            }
-          }
-        }),
-    ];
-    if matches!(file_access, "write" | "full") {
-        tools.push(json!({
-      "type": "function",
-      "function": {
-        "name": "write_workspace_file",
-        "description": "Create or replace a UTF-8 text file inside the selected workspace. The parent directory must already exist.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "path": { "type": "string", "description": "Relative file path." },
-            "content": { "type": "string", "description": "Complete new text content for the file." }
-          },
-          "required": ["path", "content"]
-        }
-      }
-    }));
-        tools.push(json!({
-      "type": "function",
-      "function": {
-        "name": "create_workspace_directory",
-        "description": "Create a directory inside the selected workspace. Paths must be relative to the workspace.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "path": { "type": "string", "description": "Relative directory path." }
-          },
-          "required": ["path"]
-        }
-      }
-    }));
-    }
-    tools
-}
-
 struct OllamaToolCall {
     name: String,
     arguments: Value,
@@ -1684,133 +1237,34 @@ fn content_ollama_tool_call(content: &str) -> Option<OllamaToolCall> {
     })
 }
 
-fn tool_string_argument<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
-    arguments
-        .get(name)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("The `{name}` tool argument is required."))
-}
-
-fn execute_ollama_workspace_tool(
-    workspace: &Path,
-    request: &ProviderRunRequest,
-    tool_call: &OllamaToolCall,
-) -> Result<String, String> {
-    match tool_call.name.as_str() {
-        "list_workspace_files" => {
-            let path = tool_call
-                .arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or(".");
-            let depth = tool_call
-                .arguments
-                .get("max_depth")
-                .and_then(Value::as_u64)
-                .unwrap_or(2) as usize;
-            list_workspace_files(workspace, path, depth)
-        }
-        "read_workspace_file" => read_workspace_file(
-            workspace,
-            tool_string_argument(&tool_call.arguments, "path")?,
-        ),
-        "write_workspace_file" => {
-            if !matches!(request.file_access.as_str(), "write" | "full") {
-                return Err(
-                    "This agent does not have workspace-write access for this run.".to_string(),
-                );
-            }
-            write_workspace_file(
-                workspace,
-                tool_string_argument(&tool_call.arguments, "path")?,
-                tool_string_argument(&tool_call.arguments, "content")?,
-            )
-        }
-        "create_workspace_directory" => {
-            if !matches!(request.file_access.as_str(), "write" | "full") {
-                return Err(
-                    "This agent does not have workspace-write access for this run.".to_string(),
-                );
-            }
-            create_workspace_directory(
-                workspace,
-                tool_string_argument(&tool_call.arguments, "path")?,
-            )
-        }
-        _ => Err(format!(
-            "`{}` is not an available local workspace tool.",
-            tool_call.name
-        )),
-    }
-}
-
-fn ollama_chat_with_cancellation(
-    model: String,
-    messages: Vec<Value>,
-    tools: Vec<Value>,
-    cancellation: ProviderCancellation,
-    started: Instant,
-    timeout_seconds: u64,
-) -> Result<Value, ProviderError> {
-    let error_model = model.clone();
-    let request = json!({
-      "model": model,
-      "messages": messages,
-      "tools": tools,
-      "stream": false,
-      "options": { "num_ctx": OLLAMA_CONTEXT_TOKENS }
-    });
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = sender.send(ollama_request("POST", "/api/chat", Some(&request)));
-    });
-
-    loop {
-        if cancellation.is_cancelled() {
-            return Err(ProviderError::new(
-                ProviderErrorCode::Cancelled,
-                "Agent run cancelled by the user.",
-                true,
-            )
-            .with_provider(RuntimeProviderId::Ollama)
-            .with_model(error_model.clone()));
-        }
-        if started.elapsed() >= Duration::from_secs(timeout_seconds) {
-            return Err(ProviderError::new(
-                ProviderErrorCode::TimedOut,
-                format!("Agent run stopped after reaching the {timeout_seconds}-second timeout."),
-                true,
-            )
-            .with_provider(RuntimeProviderId::Ollama)
-            .with_model(error_model.clone()));
-        }
-        match receiver.recv_timeout(Duration::from_millis(120)) {
-            Ok(response) => {
-                return response.map_err(|message| {
-                    ProviderError::new(ProviderErrorCode::ProtocolError, message, true)
-                        .with_provider(RuntimeProviderId::Ollama)
-                        .with_model(error_model.clone())
-                })
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(ProviderError::new(
-                    ProviderErrorCode::ProtocolError,
-                    "The Ollama request worker stopped unexpectedly.",
-                    true,
-                )
-                .with_provider(RuntimeProviderId::Ollama)
-                .with_model(error_model.clone()));
-            }
-        }
-    }
+fn map_ollama_error(error: OllamaError, model: &str) -> ProviderError {
+    let (code, retryable) = match error.kind {
+        OllamaErrorKind::Unavailable => (ProviderErrorCode::ProviderUnavailable, true),
+        OllamaErrorKind::ModelUnavailable => (ProviderErrorCode::ModelUnavailable, true),
+        OllamaErrorKind::Cancelled => (ProviderErrorCode::Cancelled, true),
+        OllamaErrorKind::TimedOut => (ProviderErrorCode::TimedOut, true),
+        OllamaErrorKind::OutputLimit => (ProviderErrorCode::OutputLimitExceeded, false),
+        OllamaErrorKind::Protocol => (ProviderErrorCode::ProtocolError, true),
+    };
+    ProviderError::new(code, error.message, retryable)
+        .with_provider(RuntimeProviderId::Ollama)
+        .with_model(model)
 }
 
 fn run_ollama_task(
     context: ProviderRunContext,
     request: ProviderRunRequest,
+) -> Result<ProviderRunResult, ProviderError> {
+    let selected_model = request.model.runtime_model.clone();
+    let session =
+        OllamaSession::production().map_err(|error| map_ollama_error(error, &selected_model))?;
+    run_ollama_task_with_session(context, request, session)
+}
+
+fn run_ollama_task_with_session(
+    context: ProviderRunContext,
+    request: ProviderRunRequest,
+    session: OllamaSession,
 ) -> Result<ProviderRunResult, ProviderError> {
     let started = Instant::now();
     let provider_id = RuntimeProviderId::Ollama;
@@ -1852,35 +1306,19 @@ fn run_ollama_task(
             .with_provider(provider_id)
             .with_model(selected_model.clone())
     })?;
-    let model = resolve_model(&selected_model);
-    let runtime_status = inspect_ollama_runtime();
-    if !runtime_status.connected {
-        return Err(ProviderError::new(
-            ProviderErrorCode::ProviderUnavailable,
-            runtime_status.message,
-            true,
-        )
-        .with_provider(provider_id)
-        .with_model(model));
-    }
-    let installed_model = runtime_status
-        .models
-        .iter()
-        .find(|item| item.name.eq_ignore_ascii_case(&model))
-        .ok_or_else(|| {
-            ProviderError::new(
-                ProviderErrorCode::ModelUnavailable,
-                format!("The Ollama model `{model}` is not installed at {OLLAMA_ENDPOINT}."),
-                true,
-            )
+    let workspace_tools = WorkspaceTools::open(&workspace).map_err(|error| {
+        ProviderError::new(ProviderErrorCode::StartupFailed, error.message, false)
             .with_provider(provider_id)
-            .with_model(model.clone())
-        })?;
-    if !installed_model
-        .capabilities
-        .iter()
-        .any(|capability| capability.eq_ignore_ascii_case("tools"))
-    {
+            .with_model(selected_model.clone())
+    })?;
+    let requested_model = resolve_model(&selected_model);
+    let timeout_seconds = request.timeout_seconds.clamp(60, 7_200);
+    let deadline = started + Duration::from_secs(timeout_seconds);
+    let installed_model = session
+        .resolve_installed_model(&requested_model, context.cancellation(), deadline)
+        .map_err(|error| map_ollama_error(error, &requested_model))?;
+    let model = installed_model.name.clone();
+    if !installed_model.supports_tools() {
         return Err(ProviderError::new(
             ProviderErrorCode::CapabilityUnsupported,
             format!(
@@ -1892,7 +1330,6 @@ fn run_ollama_task(
         .with_model(model));
     }
 
-    let timeout_seconds = request.timeout_seconds.clamp(60, 7_200);
     let prompt = agent_prompt(&request, true);
     context.emit(
         ProviderEventKind::Status,
@@ -1907,14 +1344,16 @@ fn run_ollama_task(
     context.mark_started()?;
 
     for turn in 0..MAX_OLLAMA_TOOL_TURNS {
-        let response = ollama_chat_with_cancellation(
-            model.clone(),
-            messages.clone(),
-            tools.clone(),
-            context.cancellation(),
-            started,
-            timeout_seconds,
-        )?;
+        let response = session
+            .chat(
+                &model,
+                &messages,
+                &tools,
+                installed_model.context_length,
+                context.cancellation(),
+                deadline,
+            )
+            .map_err(|error| map_ollama_error(error, &model))?;
         let runtime_model = response
             .get("model")
             .and_then(Value::as_str)
@@ -2024,7 +1463,8 @@ fn run_ollama_task(
                 ProviderEventKind::Progress,
                 format!("Ollama requested {}…", tool_call.name),
             )?;
-            let tool_result = execute_ollama_workspace_tool(&workspace, &request, &tool_call)
+            let tool_result = workspace_tools
+                .execute(&request.file_access, &tool_call.name, &tool_call.arguments)
                 .unwrap_or_else(|error| format!("Tool error: {error}"));
             messages.push(json!({
               "role": "tool",
@@ -2210,7 +1650,7 @@ impl ProviderAdapter for OllamaProviderAdapter {
         let status = inspect_ollama_runtime();
         ProviderRuntimeStatus {
             provider: ollama_descriptor(),
-            availability: if status.connected {
+            availability: if status.connected && status.catalog_ready {
                 ProviderAvailability::Ready
             } else {
                 ProviderAvailability::Unavailable
@@ -2223,6 +1663,8 @@ impl ProviderAdapter for OllamaProviderAdapter {
                     name: model.name,
                     capabilities: model.capabilities,
                     context_length: model.context_length,
+                    availability: model.availability,
+                    message: model.message,
                 })
                 .collect(),
             message: status.message,
@@ -2301,9 +1743,10 @@ async fn ollama_runtime_status() -> OllamaRuntimeStatus {
         .unwrap_or_else(|_| OllamaRuntimeStatus {
             connected: false,
             version: None,
-            endpoint: OLLAMA_ENDPOINT.to_string(),
+            endpoint: OLLAMA_DISPLAY_ENDPOINT.to_string(),
             models: Vec::new(),
             message: "Could not inspect the local Ollama runtime.".to_string(),
+            catalog_ready: false,
         })
 }
 
@@ -4173,7 +3616,244 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::ErrorKind, net::TcpListener};
+    use std::{
+        io::Write,
+        net::{TcpListener, TcpStream},
+        sync::atomic::AtomicU64,
+    };
+
+    static NEXT_OLLAMA_RUN_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+    struct OllamaRunWorkspace {
+        path: PathBuf,
+    }
+
+    impl OllamaRunWorkspace {
+        fn new(label: &str) -> Self {
+            let id = NEXT_OLLAMA_RUN_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "aacc-task-0008-run-{label}-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("Ollama run fixture should be created");
+            Self { path }
+        }
+    }
+
+    impl Drop for OllamaRunWorkspace {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.path).expect("Ollama run fixture should be removed");
+        }
+    }
+
+    #[derive(Default)]
+    struct OllamaRunObserver {
+        started: AtomicBool,
+        events: Mutex<Vec<ProviderRunEvent>>,
+    }
+
+    impl ProviderRunObserver for OllamaRunObserver {
+        fn emit(&self, event: ProviderRunEvent) -> Result<(), ProviderError> {
+            self.events
+                .lock()
+                .expect("event log should lock")
+                .push(event);
+            Ok(())
+        }
+
+        fn mark_started(&self) -> Result<(), ProviderError> {
+            self.started.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum OllamaToolScenario {
+        CreateThenFinish,
+        ExhaustTurnLimit,
+    }
+
+    fn start_ollama_tool_server(
+        scenario: OllamaToolScenario,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test Ollama server should bind");
+        let endpoint = format!(
+            "http://{}/",
+            listener
+                .local_addr()
+                .expect("test Ollama server should have an address")
+        );
+        let worker = std::thread::spawn(move || {
+            let request_count = match scenario {
+                OllamaToolScenario::CreateThenFinish => 4,
+                OllamaToolScenario::ExhaustTurnLimit => 2 + MAX_OLLAMA_TOOL_TURNS,
+            };
+            let mut chat_turn = 0_usize;
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().expect("test Ollama server should accept");
+                let (method, path, body) = read_test_http_request(&stream);
+                let response = match path.as_str() {
+                    "/api/tags" => {
+                        assert_eq!(method, "GET");
+                        json!({ "models": [{ "name": "tool-fixture" }] })
+                    }
+                    "/api/show" => {
+                        assert_eq!(method, "POST");
+                        assert_eq!(body["model"], "tool-fixture");
+                        json!({
+                            "capabilities": ["completion", "tools"],
+                            "model_info": {
+                                "general.architecture": "fixture",
+                                "fixture.context_length": 16384
+                            }
+                        })
+                    }
+                    "/api/chat" => {
+                        assert_eq!(method, "POST");
+                        assert_eq!(body["model"], "tool-fixture");
+                        assert_eq!(body["options"]["num_ctx"], 8192);
+                        chat_turn += 1;
+                        match scenario {
+                            OllamaToolScenario::CreateThenFinish if chat_turn == 1 => {
+                                let tool_names = body["tools"]
+                                    .as_array()
+                                    .expect("tools should be an array")
+                                    .iter()
+                                    .filter_map(|tool| tool.pointer("/function/name"))
+                                    .filter_map(Value::as_str)
+                                    .collect::<Vec<_>>();
+                                assert!(tool_names.contains(&"apply_workspace_patch"));
+                                assert!(!tool_names.contains(&"write_workspace_file"));
+                                json!({
+                                    "model": "tool-fixture",
+                                    "prompt_eval_count": 7,
+                                    "eval_count": 3,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "",
+                                        "tool_calls": [{
+                                            "function": {
+                                                "name": "create_workspace_file",
+                                                "arguments": {
+                                                    "path": "created.txt",
+                                                    "content": "created safely\n"
+                                                }
+                                            }
+                                        }]
+                                    }
+                                })
+                            }
+                            OllamaToolScenario::CreateThenFinish => {
+                                let tool_message = body["messages"]
+                                    .as_array()
+                                    .expect("messages should be an array")
+                                    .last()
+                                    .expect("tool result should be present");
+                                assert_eq!(tool_message["role"], "tool");
+                                assert!(tool_message["content"]
+                                    .as_str()
+                                    .is_some_and(|content| content.contains("\"created\":true")));
+                                json!({
+                                    "model": "tool-fixture",
+                                    "prompt_eval_count": 5,
+                                    "eval_count": 4,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "Created and verified the requested file."
+                                    }
+                                })
+                            }
+                            OllamaToolScenario::ExhaustTurnLimit => json!({
+                                "model": "tool-fixture",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "",
+                                    "tool_calls": [{
+                                        "function": {
+                                            "name": "list_workspace_files",
+                                            "arguments": { "path": ".", "limit": 1 }
+                                        }
+                                    }]
+                                }
+                            }),
+                        }
+                    }
+                    path => panic!("unexpected test Ollama path: {path}"),
+                };
+                write_test_json_response(&mut stream, &response);
+            }
+        });
+        (endpoint, worker)
+    }
+
+    fn read_test_http_request(stream: &TcpStream) -> (String, String, Value) {
+        let mut reader =
+            BufReader::new(stream.try_clone().expect("test Ollama stream should clone"));
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .expect("test Ollama request line should read");
+        let mut parts = request_line.split_whitespace();
+        let method = parts
+            .next()
+            .expect("request should have method")
+            .to_string();
+        let path = parts.next().expect("request should have path").to_string();
+        let mut content_length = 0_usize;
+        loop {
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .expect("test Ollama header should read");
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().expect("content length should parse");
+                }
+            }
+        }
+        let mut body = vec![0_u8; content_length];
+        reader
+            .read_exact(&mut body)
+            .expect("test Ollama request body should read");
+        let body = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).expect("test Ollama request body should be JSON")
+        };
+        (method, path, body)
+    }
+
+    fn write_test_json_response(stream: &mut TcpStream, body: &Value) {
+        let body = serde_json::to_vec(body).expect("test Ollama response should encode");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .and_then(|_| stream.write_all(&body))
+        .and_then(|_| stream.flush())
+        .expect("test Ollama response should write");
+    }
+
+    fn ollama_run_context() -> ProviderRunContext {
+        ProviderRunContext::new(
+            Arc::new(OllamaRunObserver::default()),
+            ProviderCancellation::new(Arc::new(AtomicBool::new(false))),
+        )
+    }
+
+    fn ollama_run_request(workspace: &Path) -> ProviderRunRequest {
+        let mut request = agent_run_request_fixture();
+        request.model.provider_id = RuntimeProviderId::Ollama;
+        request.model.runtime_model = "tool-fixture".to_string();
+        request.task_title = "Create a bounded fixture file".to_string();
+        request.workspace_path = workspace.to_string_lossy().into_owned();
+        request.file_access = "write".to_string();
+        request
+    }
 
     #[test]
     fn tauri_webview_boundary_has_restrictive_csp_and_minimal_core_permissions() {
@@ -4563,108 +4243,48 @@ mod tests {
     }
 
     #[test]
-    fn ollama_request_keeps_its_write_half_open_until_the_response() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("the test server should bind");
-        let address = listener
-            .local_addr()
-            .expect("the test server should have an address")
-            .to_string();
-        let (sender, receiver) = std::sync::mpsc::channel();
+    fn task_0008_ollama_tool_turn_executes_safe_workspace_contract_and_finishes() {
+        let workspace = OllamaRunWorkspace::new("tool-success");
+        let (endpoint, server) = start_ollama_tool_server(OllamaToolScenario::CreateThenFinish);
+        let session = OllamaSession::for_test_endpoint(&endpoint)
+            .expect("test Ollama session should be created");
 
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("the test server should accept");
-            let mut reader = BufReader::new(stream.try_clone().expect("the stream should clone"));
-            let mut request = String::new();
-            loop {
-                let mut line = String::new();
-                reader
-                    .read_line(&mut line)
-                    .expect("the test server should read the request");
-                if line == "\r\n" {
-                    break;
-                }
-                request.push_str(&line);
-            }
-            assert!(request.starts_with("GET /api/tags HTTP/1.1\r\n"));
+        let result = run_ollama_task_with_session(
+            ollama_run_context(),
+            ollama_run_request(&workspace.path),
+            session,
+        )
+        .expect("bounded Ollama tool run should finish");
 
-            stream
-                .set_read_timeout(Some(Duration::from_millis(100)))
-                .expect("the test server should set a read timeout");
-            let mut probe = [0_u8; 1];
-            let write_half_closed = match stream.read(&mut probe) {
-                Ok(0) => true,
-                Ok(_) => false,
-                Err(error)
-                    if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
-                {
-                    false
-                }
-                Err(error) => panic!("the test server should only time out while probing: {error}"),
-            };
-            stream
-                .set_read_timeout(None)
-                .expect("the test server should clear the read timeout");
-
-            let body = r#"{"models":[]}"#;
-            let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-      );
-            stream
-                .write_all(response.as_bytes())
-                .and_then(|_| stream.flush())
-                .expect("the test server should return its response");
-            sender
-                .send(write_half_closed)
-                .expect("the test result should be delivered");
-        });
-
-        let response = ollama_request_at(&address, "GET", "/api/tags", None)
-            .expect("the client should parse the test server response");
-        assert_eq!(response["models"], json!([]));
-        assert!(
-            !receiver
-                .recv_timeout(Duration::from_secs(1))
-                .expect("the test server should report whether the client half-closed"),
-            "the client must not close its write half before receiving the response"
+        server.join().expect("test Ollama server should finish");
+        assert_eq!(result.output, "Created and verified the requested file.");
+        assert_eq!(result.model, "tool-fixture");
+        assert_eq!(result.usage.input_tokens, Some(12));
+        assert_eq!(result.usage.output_tokens, Some(7));
+        assert_eq!(result.usage.total_tokens, Some(19));
+        assert_eq!(result.changed_files, ["created.txt"]);
+        assert_eq!(
+            fs::read_to_string(workspace.path.join("created.txt"))
+                .expect("created fixture should read"),
+            "created safely\n"
         );
-        server.join().expect("the test server should finish");
     }
 
     #[test]
-    fn task_0005_ollama_response_body_bound_is_enforced() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("the test server should bind");
-        let address = listener
-            .local_addr()
-            .expect("the test server should have an address")
-            .to_string();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("the test server should accept");
-            let mut reader = BufReader::new(stream.try_clone().expect("the stream should clone"));
-            loop {
-                let mut line = String::new();
-                reader
-                    .read_line(&mut line)
-                    .expect("the test server should read the request");
-                if line == "\r\n" {
-                    break;
-                }
-            }
-            let body = "x".repeat(MAX_OLLAMA_RESPONSE_BYTES + 1);
-            let headers = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream
-                .write_all(headers.as_bytes())
-                .and_then(|_| stream.write_all(body.as_bytes()))
-                .and_then(|_| stream.flush())
-                .expect("the test server should return its oversized response");
-        });
+    fn task_0008_ollama_tool_turn_limit_fails_before_an_unbounded_loop() {
+        let workspace = OllamaRunWorkspace::new("tool-limit");
+        let (endpoint, server) = start_ollama_tool_server(OllamaToolScenario::ExhaustTurnLimit);
+        let session = OllamaSession::for_test_endpoint(&endpoint)
+            .expect("test Ollama session should be created");
+        let mut request = ollama_run_request(&workspace.path);
+        request.file_access = "read".to_string();
 
-        let error = ollama_request_at(&address, "GET", "/api/tags", None).unwrap_err();
-        assert!(error.contains("response body exceeded"));
-        server.join().expect("the test server should finish");
+        let error = run_ollama_task_with_session(ollama_run_context(), request, session)
+            .expect_err("unbounded tool loop should fail");
+
+        server.join().expect("test Ollama server should finish");
+        assert_eq!(error.code, ProviderErrorCode::ExecutionFailed);
+        assert!(error.message.contains("16-tool-turn limit"));
     }
 
     #[test]
@@ -4680,20 +4300,13 @@ mod tests {
     }
 
     #[test]
-    fn workspace_tools_reject_paths_outside_the_selected_workspace() {
-        assert!(relative_workspace_path("src/App.tsx").is_ok());
-        assert!(relative_workspace_path("../outside").is_err());
-        assert!(relative_workspace_path("/etc/passwd").is_err());
-    }
-
-    #[test]
     fn read_only_ollama_runs_do_not_receive_write_tools() {
         let read_only = ollama_workspace_tools("read");
         let writable = ollama_workspace_tools("write");
         let has_write_tool = |tools: &[Value]| {
             tools.iter().any(|tool| {
                 tool.pointer("/function/name").and_then(Value::as_str)
-                    == Some("write_workspace_file")
+                    == Some("apply_workspace_patch")
             })
         };
 

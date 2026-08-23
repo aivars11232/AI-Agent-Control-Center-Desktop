@@ -5792,16 +5792,23 @@ function ModelsPage({
               const alreadyRegistered = models.some(
                 (item) => item.name.toLowerCase() === model.name.toLowerCase(),
               );
-              const toolCapable = model.capabilities.some(
-                (capability) => capability.toLowerCase() === "tools",
-              );
+              const modelReady = model.availability === "ready";
+              const toolCapable =
+                modelReady &&
+                model.capabilities.some(
+                  (capability) => capability.toLowerCase() === "tools",
+                );
               return (
                 <article className="agent-card" key={model.name}>
                   <div>
                     <h3>{model.name}</h3>
                     <p>
                       Local Ollama model
-                      {toolCapable ? " · coding-agent ready" : " · LLM only"}
+                      {!modelReady
+                        ? " · metadata unavailable"
+                        : toolCapable
+                          ? " · coding-agent ready"
+                          : " · LLM only"}
                     </p>
                     <small>
                       {model.contextLength
@@ -5812,16 +5819,21 @@ function ModelsPage({
                         ? " · keep complex coding tasks focused"
                         : ""}
                     </small>
+                    <small>{model.message}</small>
                   </div>
 
                   <button
                     className={
                       alreadyRegistered ? "secondary-button" : "primary-button"
                     }
-                    disabled={alreadyRegistered}
+                    disabled={alreadyRegistered || !modelReady}
                     onClick={() => addDiscoveredOllamaModel(model.name)}
                   >
-                    {alreadyRegistered ? "In catalog" : "Add to catalog"}
+                    {alreadyRegistered
+                      ? "In catalog"
+                      : modelReady
+                        ? "Add to catalog"
+                        : "Unavailable"}
                   </button>
                 </article>
               );

@@ -143,6 +143,8 @@ pub(crate) struct ProviderRuntimeModel {
     pub(crate) name: String,
     pub(crate) capabilities: Vec<String>,
     pub(crate) context_length: Option<u64>,
+    pub(crate) availability: ProviderAvailability,
+    pub(crate) message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
