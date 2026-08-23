@@ -22,7 +22,7 @@ ready merely because its predecessor's code was edited.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | TASK-0001 | None | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Authoritative project baseline and development contract |
 | TASK-0002 | TASK-0001 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Reproducible verification and characterization baseline |
-| TASK-0003 | TASK-0002 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Backend persistence and state-migration foundation |
+| TASK-0003 | TASK-0002 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Backend persistence and state-migration foundation |
 | TASK-0004 | TASK-0003 | NOT STARTED | NO | NOT STARTED | — | — | Authoritative approvals, capability policy, IPC, and CSP boundary |
 | TASK-0005 | TASK-0004 | NOT STARTED | NO | NOT STARTED | — | — | Single-run coordinator, task lifecycle, ledger, and bounded output |
 | TASK-0006 | TASK-0005 | NOT STARTED | NO | NOT STARTED | — | — | Truthful provider registry and common runtime contract |
@@ -125,8 +125,11 @@ ready merely because its predecessor's code was edited.
   Rust advisory result are recorded in the TASK-0003 final report
 - Live provider, microphone, listener, portal, install/remove, desktop package,
   and desktop/system-control actions: not run
-- Git closure: pending user diff review, commit/push choice, and clean-tree
-  confirmation
+- Git closure: user commit
+  <code>a4b8cde0ca479ef09f2d5839a3cfcf8a572e0785</code> (<code>task3</code>) is
+  the checked-out <code>main</code> HEAD; <code>main</code> matches
+  <code>origin/main</code>. The TASK-0004 preflight confirmed zero ahead/behind
+  and a clean working tree on 2026-08-23.
 
 ## Closure rule
 
