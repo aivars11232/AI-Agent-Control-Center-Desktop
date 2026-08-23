@@ -96,6 +96,32 @@ run install/remove scripts, or perform desktop/system-control actions.
 - End Phase B with the exact changed files, verification results, remaining
   limitations, `git status --short`, diff statistics, and a recommended commit
   message.
-- The user performs final review, commit, and push. A task is not closed for
-  successor work until its required evidence and chosen manual Git closure are
-  recorded in [planning/TASK_STATUS.md](planning/TASK_STATUS.md).
+- The user performs final review, commit, and push. A successor Phase A may
+  treat its predecessor as Git-closed only when fresh preflight evidence
+  verifies all of the following:
+  1. the predecessor tracker/evidence records Phase A `COMPLETE`, approval
+     `YES`, Phase B `COMPLETE`, and verification `PASSED`;
+  2. the predecessor implementation commit is identified from actual Git
+     history rather than guessed from its message;
+  3. that commit is the checked-out `HEAD` or an ancestor of it;
+  4. that commit is reachable from `origin/main`;
+  5. the checked-out branch and `origin/main` have zero ahead/behind;
+  6. the working tree is clean; and
+  7. the commit scope matches the predecessor's reported scope, with no
+     unexplained intervening repository state that invalidates the evidence.
+- When all seven conditions pass, a stale `PENDING USER` tracker value alone
+  is not a Phase A blocker. The successor Phase A remains read-only and records
+  the exact implementation commit, origin reachability, ahead/behind result,
+  clean-tree result, and scope conclusion in its plan.
+- During the successor's approved Phase B, its normal task-status/document
+  update backfills the predecessor's Git closure to `COMPLETE` with the exact
+  verified historical evidence. Include that backfill in the successor's
+  normal implementation commit; do not require a separate closure-only commit.
+- If any preflight condition fails, stop Phase A without changing files and
+  report the exact dirty, divergent, unpushed, unverified, ambiguous-commit, or
+  scope-conflict evidence. Never skip predecessor implementation or
+  verification, guess a commit, overlap active tasks, or start Phase B without
+  the successor's approved Phase A plan.
+- TASK-0020 has no successor. Record its final Git and release closure through
+  the final release evidence and release commit rather than a successor
+  backfill.

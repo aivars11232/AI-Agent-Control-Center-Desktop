@@ -3,12 +3,15 @@
 > **Classification: Current static and fresh non-live evidence.** This snapshot
 > was refreshed for TASK-0006 on 2026-08-23 from starting commit
 > <code>2f55546e6ddf42d87d0985d7084018ef0604a630</code> on branch
-> <code>main</code>. That commit records TASK-0005 Git closure after its
-> implementation commit
-> <code>ceaf01deb55c7d3ef7304dea2f84f97aa85043d0</code>. At the TASK-0006
-> preflight, checked-out <code>main</code> and <code>origin/main</code> matched,
-> with zero ahead/behind and a clean working tree. Reverify details that may
-> drift before relying on them in a later task.
+> <code>main</code>; its implementation was recorded by user commit
+> <code>eb2421634b1e202a85fcd1890ba7f1073c137269</code>
+> (<code>task6</code>). At the TASK-0007 preflight, checked-out
+> <code>main</code> and <code>origin/main</code> both resolved to that commit,
+> with zero ahead/behind and a clean working tree on 2026-08-23. The bounded
+> workflow-governance correction that records this closure changes development
+> bookkeeping only, not application runtime behavior. This document does not
+> require a separate post-commit-only edit after every task merely to record Git
+> closure. Reverify later implementation facts when they may have drifted.
 
 This document owns statements about what is implemented now. Planned behavior
 belongs in [ARCHITECTURE.md](ARCHITECTURE.md) and

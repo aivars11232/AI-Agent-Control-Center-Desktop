@@ -13,8 +13,10 @@ ready merely because its predecessor's code was edited.
 - **COMPLETE** — the phase's required work and verification are complete.
 - **BLOCKED** — an exact unresolved blocker is recorded.
 - **DECISION REQUIRED** — implementation depends on a material user choice.
-- **PENDING USER** — Codex work is complete but review, commit, push, or
-  clean-tree closure remains with the user.
+- **PENDING USER** — the tracker has not yet recorded the user's Git closure.
+  The Git work may still be open, or it may already be complete and awaiting
+  fresh successor-preflight verification plus the successor Phase B backfill;
+  the label alone proves neither state.
 
 ## Roadmap tracker
 
@@ -25,7 +27,7 @@ ready merely because its predecessor's code was edited.
 | TASK-0003 | TASK-0002 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Backend persistence and state-migration foundation |
 | TASK-0004 | TASK-0003 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Authoritative approvals, capability policy, IPC, and CSP boundary |
 | TASK-0005 | TASK-0004 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Single-run coordinator, task lifecycle, ledger, and bounded output |
-| TASK-0006 | TASK-0005 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Truthful provider registry and common runtime contract |
+| TASK-0006 | TASK-0005 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Truthful provider registry and common runtime contract |
 | TASK-0007 | TASK-0006 | NOT STARTED | NO | NOT STARTED | — | — | Codex runtime isolation, cancellation, and evidence hardening |
 | TASK-0008 | TASK-0007 | NOT STARTED | NO | NOT STARTED | — | — | Ollama discovery, transport, cancellation, and safe workspace tools |
 | TASK-0009 | TASK-0008 | NOT STARTED | NO | NOT STARTED | — | — | Dynamic agent registry and valid organizational hierarchy |
@@ -272,16 +274,59 @@ ready merely because its predecessor's code was edited.
   not installed; this explicit environmental limitation is not a pass
 - Live Codex/Ollama generation, microphone/listener, portal, install/remove,
   desktop package, and desktop/system-control actions: not run
-- Git closure: **PENDING USER** review, commit, push, and clean-tree evidence
+- Git closure: user implementation commit
+  <code>eb2421634b1e202a85fcd1890ba7f1073c137269</code>
+  (<code>task6</code>). At the TASK-0007 preflight, checked-out
+  <code>main</code> and <code>origin/main</code> both resolved to that commit,
+  with zero ahead/behind and a clean working tree on 2026-08-23.
 
-## Closure rule
+## Successor-preflight closure rule
 
-TASK-0007 must not begin automatically. Before successor work, the user reviews
-the TASK-0006 diff and either:
+Effective from TASK-0007 onward, a successor Phase A may treat its predecessor
+as Git-closed and continue read-only planning only when fresh preflight evidence
+verifies every condition below:
 
-1. commits and pushes the approved task and records the commit plus clean
-   worktree; or
-2. explicitly selects and records another closure method.
+1. The predecessor tracker/evidence records Phase A `COMPLETE`, approval `YES`,
+   Phase B `COMPLETE`, and verification `PASSED`.
+2. The predecessor implementation commit is identified from actual Git history,
+   not guessed from its message alone.
+3. The implementation commit is the checked-out `HEAD` or an ancestor of it.
+4. The implementation commit is reachable from `origin/main`.
+5. The checked-out branch and `origin/main` are aligned with zero ahead/behind.
+6. The working tree is clean.
+7. The actual commit scope is consistent with the predecessor's reported task
+   scope, and no unexplained intervening repository state invalidates the
+   evidence.
+
+When all seven conditions pass, a stale `PENDING USER` tracker value alone is
+not a Phase A blocker. Phase A remains read-only and records the exact
+implementation commit, origin reachability, ahead/behind result, clean-tree
+result, and scope conclusion. Phase A may then continue with the successor task;
+no separate predecessor-closure-only commit is required.
+
+During the successor's approved Phase B, the ordinary task-status/documentation
+update backfills the predecessor's Git closure to `COMPLETE` and adds the exact
+verified historical evidence. That backfill is included in the successor's
+normal implementation commit, not a separate `taskN.1` closure-only commit.
+
+If any condition fails, Phase A stops without changing files and reports the
+exact dirty, divergent, unpushed, missing-verification, ambiguous-commit, or
+scope-conflict evidence. The rule does not permit skipping a predecessor
+implementation or verification, using an unpushed predecessor, proceeding from
+a dirty or divergent worktree, guessing an implementation commit, overlapping
+active tasks, or starting Phase B without the successor's approved Phase A plan.
+
+This rule supersedes the earlier routine closure-only process from TASK-0007
+onward. Historical TASK-0001 through TASK-0005 closure evidence remains
+unchanged. [planning/TASK_STATUS.md](TASK_STATUS.md) remains the historical
+tracker, but temporary `PENDING USER` lag after a verified user commit is not,
+by itself, a reason to block the next read-only Phase A.
+
+TASK-0020 has no successor. Its final Git and release closure is recorded
+through the final release evidence and release commit rather than a successor
+backfill. [CURRENT_STATE.md](../CURRENT_STATE.md) describes implemented
+application state and does not require a separate post-commit-only edit after
+every task merely to record Git closure.
 
 The absence of a Codex-created commit is expected. Codex does not commit or push
 by default.

@@ -16,7 +16,10 @@ Every task follows the development contract in [AGENTS.md](AGENTS.md):
 4. implement the approved coherent change set in logical slices;
 5. run focused verification after each slice and the full task gate;
 6. report the exact diff and evidence without committing or pushing;
-7. stop and let the user review, commit, push, and establish clean-tree closure.
+7. stop and let the user review, commit, push, and establish clean-tree closure;
+8. let the successor's read-only preflight verify that closure from actual Git
+   evidence and, during its approved Phase B, backfill any temporary tracker
+   lag in the successor's normal implementation commit.
 
 One foreground Codex workflow and one approved task are allowed at a time.
 Within an approved task, every related file in a logical slice may be changed
@@ -26,9 +29,36 @@ later explicit decision changes that requirement.
 ## Dependency rule
 
 The roadmap is a strict chain: each task after TASK-0001 depends on the
-immediately preceding task. A successor may enter Phase A only after the
-predecessor's required verification and chosen manual Git closure are recorded.
-Do not skip a dependency because code for a later feature already exists.
+immediately preceding task. Do not skip a dependency because code for a later
+feature already exists.
+
+A successor may enter read-only Phase A when fresh preflight evidence verifies
+every predecessor-closure condition below, even if the historical tracker still
+temporarily says `PENDING USER`:
+
+1. the predecessor tracker/evidence records Phase A `COMPLETE`, approval `YES`,
+   Phase B `COMPLETE`, and verification `PASSED`;
+2. the predecessor implementation commit is identified from actual Git history,
+   not guessed from a commit message;
+3. that commit is the checked-out `HEAD` or its ancestor;
+4. that commit is reachable from `origin/main`;
+5. the checked-out branch and `origin/main` have zero ahead/behind;
+6. the working tree is clean; and
+7. the commit scope matches the predecessor's reported task scope, with no
+   unexplained intervening state that invalidates the evidence.
+
+The successor Phase A records the exact commit and all fresh Git results but
+changes no files. If any condition fails, it stops and reports the exact dirty,
+divergent, unpushed, missing-verification, ambiguous-commit, or scope-conflict
+evidence. It may not bypass predecessor implementation or verification, guess a
+commit, overlap an active task, or authorize Phase B.
+
+During the successor's approved Phase B, the ordinary status/documentation
+slice backfills the predecessor's Git closure to `COMPLETE` and records the
+verified historical evidence. That backfill belongs in the successor's normal
+implementation commit; a separate closure-only commit is not normally required.
+TASK-0020 has no successor, so its final Git/release closure is recorded in the
+final release evidence and release commit.
 
 ## Ordered task index
 

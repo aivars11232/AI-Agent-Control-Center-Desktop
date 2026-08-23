@@ -23,13 +23,26 @@ task contract remains authoritative if it requires stricter wording or gates.
 - Resolved root:
 - Branch and exact HEAD:
 - Working-tree status:
-- Dependency completion and closure evidence:
+- Predecessor Phase A/approval/Phase B/verification status:
+- Exact predecessor implementation commit and how Git history identified it:
+- Implementation commit is `HEAD` or an ancestor:
+- Implementation commit is reachable from `origin/main`:
+- Checked-out branch versus `origin/main` ahead/behind:
+- Clean working-tree result:
+- Commit-scope consistency and unexplained intervening state:
+- Predecessor tracker closure value and successor Phase B backfill required:
 - Unexplained user changes:
 - Relevant repository authorities read:
 - Active task contract/package evidence read:
 
-Stop if the root is wrong, a dependency is open, the approved plan is stale, or
-an unexplained change overlaps the proposed work.
+For a successor task, record every predecessor-closure result above from fresh
+Git evidence. A stale `PENDING USER` tracker value alone is not a blocker when
+all seven closure conditions in [AGENTS.md](../AGENTS.md) pass. Stop without
+changing files if the root is wrong, predecessor implementation or verification
+is incomplete, the implementation commit is ambiguous or unpushed, branch and
+`origin/main` diverge, the tree is dirty, commit scope conflicts with the
+reported task, unexplained intervening state exists, the approved plan is
+stale, or an unexplained change overlaps proposed work.
 
 ## 2. Current implementation evidence
 
@@ -165,6 +178,10 @@ failure.
 ## Phase A outcome
 
 - Files changed: none
+- Exact predecessor implementation commit recorded:
+- Origin reachability and zero ahead/behind recorded:
+- Clean-tree and commit-scope conclusions recorded:
+- Temporary predecessor tracker lag requiring Phase B backfill:
 - Literal approval phrase:
   <code>APPROVED: IMPLEMENT TASK-[NNNN] AS PLANNED.</code>
 - Required final Phase A outcome line:
@@ -181,7 +198,8 @@ Complete only after the exact Phase A approval.
 
 - Approval matched:
 - Root/branch/HEAD/status:
-- Dependency still complete:
+- Predecessor closure evidence still satisfies all seven preflight conditions:
+- Predecessor tracker closure backfill included in the approved change set:
 - Approved boundary unchanged:
 
 ### Slice results
@@ -224,5 +242,15 @@ Complete only after the exact Phase A approval.
 - [ ] Required verification evidence is present.
 - [ ] User committed the approved task or recorded another explicit closure.
 - [ ] User pushed when required.
-- [ ] Final clean-tree evidence is recorded.
-- [ ] [planning/TASK_STATUS.md](TASK_STATUS.md) is updated before successor work.
+- [ ] Final clean-tree evidence is available for the successor's fresh
+      preflight.
+- [ ] If a successor exists, its read-only Phase A independently verifies and
+      records the exact implementation commit, ancestry, origin reachability,
+      zero ahead/behind, clean tree, and scope consistency.
+- [ ] During the successor's approved Phase B, any temporary predecessor
+      `PENDING USER` lag is backfilled to `COMPLETE` with exact historical
+      evidence in the successor's normal implementation commit.
+
+A separate closure-only commit is not normally required. TASK-0020 has no
+successor; its final Git and release closure belongs in the final release
+evidence and release commit.
