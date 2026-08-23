@@ -24,7 +24,7 @@ ready merely because its predecessor's code was edited.
 | TASK-0002 | TASK-0001 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Reproducible verification and characterization baseline |
 | TASK-0003 | TASK-0002 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Backend persistence and state-migration foundation |
 | TASK-0004 | TASK-0003 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Authoritative approvals, capability policy, IPC, and CSP boundary |
-| TASK-0005 | TASK-0004 | NOT STARTED | NO | NOT STARTED | — | — | Single-run coordinator, task lifecycle, ledger, and bounded output |
+| TASK-0005 | TASK-0004 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Single-run coordinator, task lifecycle, ledger, and bounded output |
 | TASK-0006 | TASK-0005 | NOT STARTED | NO | NOT STARTED | — | — | Truthful provider registry and common runtime contract |
 | TASK-0007 | TASK-0006 | NOT STARTED | NO | NOT STARTED | — | — | Codex runtime isolation, cancellation, and evidence hardening |
 | TASK-0008 | TASK-0007 | NOT STARTED | NO | NOT STARTED | — | — | Ollama discovery, transport, cancellation, and safe workspace tools |
@@ -173,10 +173,52 @@ ready merely because its predecessor's code was edited.
   <code>main</code> matches <code>origin/main</code>. The TASK-0005 preflight
   confirmed zero ahead/behind and a clean working tree on 2026-08-23.
 
+## TASK-0005 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>0d7ade46ee7407d5feb0f43e3d52b6fe56abcba7</code>
+  (<code>task4.1</code>)
+- Starting status: clean; <code>main</code> matched <code>origin/main</code> with
+  zero ahead/behind
+- Dependency: TASK-0004 implementation and Git-closure evidence were complete
+  in the authoritative tracker at starting HEAD
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0005 AS PLANNED.</code>
+- Added schema version 3 and migration 0003 for one authoritative active
+  attempt, immutable terminal attempts, approval reservations, bounded progress
+  events, retained-history accounting, and coordinator-specific revisions
+- Added legal execute/review lifecycle transitions, immediate-transaction
+  no-queue admission, exact-intent idempotency, delayed one-use approval
+  consumption, deterministic cancellation/timeout/failure completion, and
+  startup reconciliation with safe-to-retry or manual-review disposition
+- Made task lifecycle/results and the global active run backend-owned; generic
+  renderer saves preserve those fields, while ordered snapshots/events drive a
+  persistent navigation-level run banner and Stop control
+- Enforced explicit bounds and truncation evidence for request IDs, progress,
+  stdout, stderr, Ollama payloads, summaries, errors, diffs, workspace
+  snapshots, changed paths, recent projections, and retained ledger history
+- Focused verification passed: 14 TASK-0005 Rust tests, 4 frontend files/27
+  tests, TypeScript, rustfmt, and the corrected Clippy gate
+- Full non-live gate: <code>npm run verify:full</code> passed on 2026-08-23 with
+  27 frontend tests, 55 Rust tests, a 36-module production build, Clippy with
+  warnings denied, shell/Python/JSON checks, dependency trees, and two npm
+  audits reporting zero vulnerabilities
+- Rust advisory result: **indeterminate** because <code>cargo-audit</code> is
+  not installed; this explicit environmental limitation is not a pass
+- Live provider, microphone, listener, portal, install/remove, desktop package,
+  and desktop/system-control actions: not run
+- Provider-specific identity/readiness, Codex descendant-process cleanup, and
+  Ollama transport cancellation remain with TASK-0006 through TASK-0008
+- Git closure: PENDING USER; Codex did not stage, commit, or push
+
 ## Closure rule
 
-TASK-0005 must not begin automatically. Before successor work, the user reviews
-the TASK-0004 diff and either:
+TASK-0006 must not begin automatically. Before successor work, the user reviews
+the TASK-0005 diff and either:
 
 1. commits and pushes the approved task and records the commit plus clean
    worktree; or

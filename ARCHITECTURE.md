@@ -31,14 +31,16 @@ The binding decision record is
       v
     React renderer (src/App.tsx)
       |-- typed state/IPC adapter (src/applicationState.ts, src/persistence.ts)
+      |-- run snapshot/event projection (src/runCoordinator.ts)
       |-- browser-preview localStorage (non-authoritative compatibility only)
-      |-- renderer presentation: routing/review workflow and task view state
+      |-- renderer presentation: routing/reviewer selection and task view state
       |
       | Tauri invoke/events
       v
     Rust backend (src-tauri/src/lib.rs)
       |-- application state validation + SQLite repository/migrations
       |-- capability policy + authoritative one-use approvals
+      |-- authoritative single-run coordinator + durable bounded ledger
       |-- Codex CLI process
       |-- local Ollama HTTP + workspace tools
       |-- filesystem/Git inspection
@@ -57,7 +59,9 @@ Persisted renderer types and the canonical seed are separated into
 <code>src/application-state-seed.json</code>. The desktop renderer gates the UI
 on a typed backend load, serializes whole-state saves, and uses revision-based
 compare-and-swap. Browser preview persistence remains a non-authoritative
-compatibility path.
+compatibility path. <code>src/runCoordinator.ts</code> projects ordered backend
+snapshots/events, discards stale or cross-attempt events, and holds only
+transient progress/stop presentation state.
 
 ### Rust backend
 
@@ -65,17 +69,20 @@ compatibility path.
 processes/transports, workspace resolution and tool access, run cancellation,
 diff/change capture, desktop actions, and voice process management. It
 also composes <code>app_state.rs</code>, <code>policy.rs</code>,
-<code>authorization.rs</code>, and <code>persistence.rs</code>. Those modules own
-the versioned state contract, normalized action intents, fail-closed
-capability evaluation, authoritative approval lifecycle, SQLite
-schema/repository, legacy migration, and typed state IPC. Privileged command
-handlers consume backend authorization before their first side effect.
+<code>authorization.rs</code>, <code>run_coordinator.rs</code>, and
+<code>persistence.rs</code>. Those modules own the versioned state contract,
+normalized action intents, fail-closed capability evaluation, authoritative
+approval lifecycle, legal run transitions and evidence bounds, SQLite
+schema/repository, legacy migration, and typed state IPC. Non-run privileged
+command handlers consume backend authorization before their first side effect;
+run approvals are reserved at admission and consumed at successful provider
+startup.
 
 ### Persistence and migration
 
 The desktop database is <code>application-state.sqlite3</code> below Tauri's
-platform application-data directory. Migrations 0001 and 0002 establish schema
-version 2 plus a migration ledger. Repository writes replace one validated
+platform application-data directory. Migrations 0001 through 0003 establish
+schema version 3 plus a migration ledger. Repository writes replace one validated
 aggregate inside an immediate transaction and use a monotonically increasing
 revision to reject stale writers. Startup refuses corrupt or unsupported newer
 databases and retains the typed error for the renderer instead of silently
@@ -95,6 +102,14 @@ are deleted only after the transaction commits. Backend-issued records use a
 separate authoritative origin and cannot be manufactured by migration or a
 whole-state save. The current version 2 backup UI remains compatible through a bounded
 backend import; strict backup lifecycle design remains owned by TASK-0014.
+
+Schema v3 adds immutable-terminal run attempts, bounded progress events,
+approval reservations, and coordinator metadata. One active-attempt foreign
+key is acquired within an immediate transaction, while a coordinator-specific
+revision orders run projections independently from aggregate-state saves.
+Import/reset operations reject an active run; reset clears run-ledger data.
+Startup reconciliation distinguishes attempts that are safe to retry from
+ones that may have dispatched and require manual review.
 
 ### Voice runtime
 
@@ -118,21 +133,22 @@ behavior were not exercised in TASK-0001.
 2. The renderer sends a typed run intent containing only the run locator,
    agent, task owner, task, and run mode.
 3. The backend loads current state, rejects invalid or paused subjects, derives
-   scopes and policy, and either allows the intent or creates/returns an exact
-   pending approval.
-4. Approval requires a trusted native dialog that identifies the normalized
-   action, agent, task, workspace, scopes, risk, and expiry. A subsequent
-   matching run IPC atomically consumes the approved record before provider or
-   workspace side effects; stale, mismatched, expired, malformed, or replayed
-   records fail.
-5. The backend derives workspace, model/provider, capability limits, timeout,
-   prompt context, and sandbox from persisted state, then dispatches Ollama
-   only for the backend model's Ollama provider label; otherwise it dispatches
-   Codex.
-6. The backend streams events, handles cancellation/timeout, snapshots the
-   workspace, and returns output plus changed-file/diff evidence.
-7. The renderer updates its state projection; the persistence adapter queues a
-   typed backend save using the last committed revision.
+   policy, and atomically admits exactly one execute/review attempt or returns
+   a deterministic busy/pending-approval result. There is no run queue.
+4. An exact approved record is reserved by admission. It is consumed once only
+   after successful provider startup; cancellation or startup failure before
+   dispatch releases it, while uncertain post-dispatch recovery prevents
+   replay.
+5. The backend projects the task into its active lifecycle, derives workspace,
+   model/provider, capability limits, timeout, prompt, and sandbox from
+   persisted state, then dispatches Ollama only for an Ollama provider label;
+   otherwise it dispatches Codex.
+6. The backend persists bounded ordered events, cancellation state, terminal
+   outcome, output summary, usage, and workspace evidence. Terminal attempts
+   cannot be updated.
+7. The renderer displays authoritative snapshots/events and a global Stop
+   control across navigation; generic state saves cannot overwrite run-owned
+   task fields.
 
 ## Directional architecture
 
@@ -161,8 +177,10 @@ state.
   recovery, retention, and migration evidence.
 - **Policy/authorization** — normalized capabilities, approval matching,
   expiry, one-use consumption, replay resistance, and denial reasons.
-- **Run coordinator** — one active run, queueing, lifecycle transitions,
-  cancellation, timeout, recovery, and a durable ledger.
+- **Run coordinator** — one active run, deterministic no-queue admission,
+  lifecycle transitions, cancellation, timeout, recovery, and a durable
+  bounded ledger. This boundary is implemented by TASK-0005; later tasks may
+  extract adapters without moving authority back to the renderer.
 - **Provider registry** — provider identity, model capability, readiness, and
   truthful dispatch contracts.
 - **Codex adapter** — isolated CLI invocation and evidence parsing.
@@ -183,13 +201,13 @@ task must choose the smallest structure supported by the code at that time.
 | Data or decision | Current owner | Planned authoritative owner |
 | --- | --- | --- |
 | Agents and hierarchy | Backend SQLite aggregate; renderer manages semantics | Validated backend agent registry (TASK-0009) |
-| Tasks and results | Backend SQLite aggregate; renderer manages lifecycle | Backend domain store and run ledger |
+| Tasks and results | Backend SQLite aggregate plus run-ledger-owned lifecycle/results; renderer still manages broader task semantics | Backend domain store and run ledger |
 | Approval records | Backend SQLite; backend-issued rows are authoritative and imported rows are expired history | Backend policy/approval store |
 | Approval match/consume | Backend exact-match transaction | Backend exact-match transaction |
 | Routing and review | Renderer | Backend scheduler/orchestrator |
-| Active run | Renderer flag plus backend in-memory map | Backend system-wide coordinator |
+| Active run | Backend system-wide coordinator and SQLite ledger; only live cancellation handles are in memory | Backend system-wide coordinator |
 | Provider/model truth | Renderer labels plus backend branch | Backend provider registry |
-| Workspace evidence | Backend result returned to renderer | Backend durable evidence record |
+| Workspace evidence | Backend bounded evidence persisted per attempt | Backend durable evidence record |
 | Reminders | Backend SQLite; renderer manages behavior | Backend passive reminder service |
 | UI preferences | Backend SQLite for desktop; preview storage in browsers | Local settings store, with UI ownership where safe |
 
@@ -212,7 +230,8 @@ The planned system-wide execution flow is sequential:
 1. accept and persist intent;
 2. normalize and route it;
 3. assess policy and obtain any exact approval;
-4. atomically acquire the single-run lease;
+4. atomically acquire the single-run slot with deterministic no-queue
+   admission;
 5. execute through one provider adapter;
 6. capture output and workspace evidence;
 7. review or request bounded revision;

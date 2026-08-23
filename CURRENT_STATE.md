@@ -1,9 +1,9 @@
 # Current State
 
 > **Classification: Current static and fresh non-live evidence.** This snapshot
-> was refreshed for TASK-0004 on 2026-08-23 from starting commit
-> <code>980a5db42e78fa958ee49083cbe3f9ba7b99b4e2</code> on branch
-> <code>main</code>. TASK-0004 changes remain in the working tree pending user
+> was refreshed for TASK-0005 on 2026-08-23 from starting commit
+> <code>0d7ade46ee7407d5feb0f43e3d52b6fe56abcba7</code> on branch
+> <code>main</code>. TASK-0005 changes remain in the working tree pending user
 > review and Git closure. Reverify details that may drift before relying on
 > them in a later task.
 
@@ -17,10 +17,13 @@ TASK-0001 established the repository authority baseline, TASK-0002 added the
 reproducible verification routes, and TASK-0003 added backend persistence.
 TASK-0004 adds schema-v2 authoritative approvals, unified action policy,
 narrowed privileged IPC, protected security-setting changes, and WebView
-hardening. Fresh deterministic checks establish the non-live verification
-baseline described below; they do not establish live runtime readiness.
+hardening. TASK-0005 adds schema-v3 authoritative single-run coordination,
+task/run lifecycle projection, a durable bounded ledger, cancellation, and
+restart reconciliation. Fresh deterministic checks establish the non-live
+verification baseline described below; they do not establish live runtime
+readiness.
 
-TASK-0004 did **not** run Codex, Ollama, or another model/provider; capture
+TASK-0005 did **not** run Codex, Ollama, or another model/provider; capture
 microphone input; import or start the Python listener; authorize a KDE/XDG
 portal; execute install/remove scripts; build a desktop package; or perform a
 desktop/system-control action. Earlier audit observations remain historical
@@ -47,12 +50,14 @@ unless this document identifies a fresh TASK-0002 result.
 | --- | --- |
 | <code>src/App.tsx</code> | Main renderer UI, browser-preview compatibility, routing/review presentation, approval display, and typed intent IPC callers |
 | <code>src/applicationState.ts</code> / <code>src/application-state-seed.json</code> | Shared renderer state types and the canonical fresh-state seed |
+| <code>src/runCoordinator.ts</code> | Typed renderer projection of authoritative run snapshots/events, stale-event rejection, and global stop state |
 | <code>src/persistence.ts</code> | Typed desktop bootstrap, one-time legacy cleanup, serialized writes, backup import, and reset adapter |
 | <code>src/App.css</code> | Main application styling and responsive behavior |
 | <code>src/voiceCommand.ts</code> | Renderer voice-command interpretation |
 | <code>src-tauri/src/lib.rs</code> | Tauri command/startup composition, provider execution, workspace operations, native desktop control, and voice process management |
 | <code>src-tauri/src/app_state.rs</code> | Backend application-state types, validation, canonical seed loading, and legacy normalization |
 | <code>src-tauri/src/policy.rs</code> / <code>src-tauri/src/authorization.rs</code> | Normalized action intents, capability evaluation, native confirmation, and approval IPC contracts |
+| <code>src-tauri/src/run_coordinator.rs</code> | Run states, legal transitions, ledger projections, and explicit evidence/retention bounds |
 | <code>src-tauri/src/persistence.rs</code> / <code>src-tauri/migrations/</code> | SQLite repository/service, schema migration, crash-safe transactions, and persistence tests |
 | <code>src-tauri/src/main.rs</code> | Desktop entry point |
 | <code>src-tauri/tauri.conf.json</code> | Tauri window, security, bundle, and resource configuration |
@@ -86,22 +91,24 @@ backup through the UI; TASK-0014 still owns the strict long-term backup format.
 
 ### Persistence
 
-In the desktop runtime, core product state is stored in
+In the desktop runtime, core product state and the run ledger are stored in
 <code>application-state.sqlite3</code> below Tauri's operating-system-provided
-application data directory. Schema version 2 stores:
+application data directory. Schema version 3 stores:
 
 - agents and their nested tasks, activity, memory, roles, and policies;
 - approval requests;
 - models;
 - reminders;
 - application preferences and workspace definitions;
-- task/activity retention preferences and routing/review preferences.
+- task/activity retention preferences and routing/review preferences;
+- immutable terminal run attempts, bounded progress/evidence, approval
+  reservations, and coordinator metadata.
 
 The backend validates aggregate size, counts, identifiers, enums, numeric
 ranges, text bounds, and selected relationships before an atomic replacement.
 SQLite foreign keys, rollback-journal mode, full synchronous writes, integrity
 checks, transactional aggregate reads, a migration ledger,
-<code>PRAGMA user_version = 2</code>, and compare-and-swap revisions protect the
+<code>PRAGMA user_version = 3</code>, and compare-and-swap revisions protect the
 repository boundary. The database and its parent directory are restricted to
 the current user on Unix.
 
@@ -113,6 +120,15 @@ approval tables. A backend-issued approval must be pending, current, exact,
 natively confirmed, and unconsumed; consumption is atomic and one-use.
 Issuance fails closed at the state contract's 10,000-record approval-history
 limit; TASK-0014 retains ownership of automated retention and deletion policy.
+
+Migration 0003 adds run attempts, progress events, approval reservations, and
+single-row coordinator metadata. Admission uses an immediate SQLite
+transaction and a unique active-attempt reference, so concurrent connections
+cannot both acquire the system-wide run slot. A separate coordinator revision
+orders snapshots/events without creating false application-state revision
+conflicts. Terminal attempt rows are immutable by database trigger. The
+ledger retains at most 1,000 attempts and 256 MiB of counted evidence, prunes
+oldest terminal attempts, and exposes prune/truncation metadata.
 
 Privilege-increasing workspace-root, capability, approval-policy, review-role,
 safety-mode, approval-lifetime, and microphone changes require a trusted native
@@ -182,30 +198,52 @@ selects Ollama only when that stored provider is <code>Ollama</code>; every
 other label currently uses the Codex execution
 path. TASK-0006 owns a truthful provider registry and runtime contract.
 
-No live provider connectivity or model output was checked in TASK-0004.
+No live provider connectivity or model output was checked in TASK-0005.
 
 ## Current run, routing, and review behavior
 
-- The renderer still chooses routing and manages specialist/reviewer workflow
-  presentation, but it requests and displays backend approval decisions.
+- The renderer still chooses routing and reviewer selection, but task/run
+  lifecycle, progress, stop state, and terminal outcomes are projections of
+  authoritative backend snapshots and events.
 - The renderer sends an <code>AgentRunRequest</code> containing only a run ID,
   agent ID, task-owner ID, task ID, and run mode. Unknown legacy authorization
   or policy fields are rejected.
-- The backend derives the task, workspace, model/provider, access levels,
-  scopes, destructive classification, prompt context, and timeout from current
-  persisted state, then validates and atomically consumes authorization before
-  execution.
-- The backend maintains an in-memory active-run map for cancellation and
-  dispatches the request to Ollama or Codex.
+- The backend admits execute and review attempts through one immediate
+  transaction. There is no queue: the first valid attempt acquires the one
+  system-wide slot and another intent receives a deterministic busy result.
+  Reuse of a bounded request ID is idempotent only when its normalized intent
+  is identical.
+- Legal active states are <code>admitted</code>, <code>starting</code>,
+  <code>dispatching</code>, <code>running</code>, and
+  <code>cancel_requested</code>. Terminal states are
+  <code>succeeded</code>, <code>cancelled</code>, <code>timed_out</code>,
+  <code>startup_failed</code>, <code>failed</code>, and
+  <code>interrupted</code>.
+- The backend derives task, workspace, model/provider, capabilities, prompt,
+  and timeout from current state. An exact approval is reserved at admission,
+  consumed once only after the provider startup boundary succeeds, and
+  released when cancellation or failure occurs before dispatch. Once dispatch
+  may have occurred, recovery never restores that approval for replay.
+- The backend keeps only the live cancellation handle in memory. Admission,
+  cancellation requests, task projections, events, outcomes, usage, changed
+  paths, diffs, errors, and recovery disposition are durable in SQLite.
 - Review requests are backend-checked for read-only files, no terminal access,
   no elevated scopes, and no destructive approval.
-- Results, review outcomes, routing reasons, changed files, and diffs return to
-  renderer-managed state and are durably saved through the backend repository.
+- Startup reconciliation marks pre-dispatch attempts interrupted and safe to
+  retry; dispatching/running/cancel-requested attempts become interrupted and
+  require manual review. Legacy tasks found in a running/reviewing state get a
+  synthetic interrupted ledger record instead of being silently reset.
+- Global run/stop UI remains visible across navigation, stale or cross-attempt
+  events are ignored, and all execute/review controls observe the same active
+  attempt regardless of how the task was created.
 
-There is no durable backend run ledger or authoritative system-wide single-run
-coordinator yet. TASK-0005 owns those guarantees. The current approval/action
-policy is backend-authoritative, but renderer-managed run lifecycle is not a
-durable coordinator.
+Progress is limited to 256 events, 8 KiB per message, and 512 KiB per attempt.
+Codex stdout/stderr capture is limited to 1 MiB/512 KiB; Ollama response and
+conversation payloads to 2 MiB each; summaries to 128 KiB; errors to 64 KiB;
+diffs to 120,000 characters and 512 KiB; snapshots to 20,000 files or five
+seconds; and changed-file evidence to 250 paths and 256 KiB. The ledger keeps
+original counts/sizes and explicit truncation flags, which the renderer
+surfaces instead of implying complete evidence.
 
 ## Native desktop and voice behavior
 
@@ -215,14 +253,16 @@ Codex/Ollama execution and cancellation, and voice-runtime setup/listener
 commands. The Python voice runtime and its setup scripts are bundled as a
 resource.
 
-Every current privileged workspace-open, provider-run, application/window,
+Every current privileged workspace-open, application/window,
 keyboard/clipboard, pointer/text, voice-install, microphone-start, and portal
 command constructs a typed backend intent and consumes authorization before
-its first side effect. Voice listener configuration is derived from persisted
-backend preferences rather than a renderer-supplied config IPC. Safe stop and
-status commands remain directly available.
+its first side effect. Provider runs reserve authorization during atomic
+admission and consume it at the successful startup boundary described above.
+Voice listener configuration is derived from persisted backend preferences
+rather than a renderer-supplied config IPC. Safe stop and status commands
+remain directly available.
 
-These paths exist in source, but TASK-0004 did not exercise them. TASK-0015
+These paths exist in source, but TASK-0005 did not exercise them. TASK-0015
 retains structured voice-intent behavior and TASK-0016 retains offline voice
 and KDE/XDG live integration acceptance.
 
@@ -231,6 +271,8 @@ and KDE/XDG live integration acceptance.
 The backend currently:
 
 - validates typed action intents and rejects unknown run IPC fields;
+- admits at most one execute or review attempt system-wide and protects
+  backend-owned task lifecycle fields from renderer overwrites;
 - derives maximum capabilities and approval modes from backend state;
 - rejects paused, missing, wrong-task, and ineligible review agents;
 - rejects administrator terminal access and forces review runs to be
@@ -254,13 +296,15 @@ and WebSocket endpoints.
 
 ## Verification inventory
 
-Three Vitest files contain 24 deterministic frontend tests for renderer, voice,
-legacy migration, serialization, revision, and fail-closed writer behavior.
+Four Vitest files contain 27 deterministic frontend tests for renderer, voice,
+legacy migration, serialization, revision, fail-closed writer behavior, and
+authoritative run projection.
 
-The Rust library contains 41 passing tests. They add policy, authorization,
-migration, approval-lifecycle, protected-setting, strict IPC, and
-CSP/capability coverage to the earlier provider, workspace, run-safety, voice,
-state-validation, persistence, corruption, concurrency, and rollback tests.
+The Rust library contains 55 passing tests. They add run-state, concurrent
+admission, idempotency, approval-boundary, cancellation, timeout,
+crash/restart, stale completion/event, truncation, and retention coverage to
+the earlier provider, workspace, run-safety, voice, state-validation,
+persistence, authorization, corruption, concurrency, and rollback tests.
 The Ollama connection test uses an isolated loopback server; it does not contact
 a live provider.
 
@@ -272,12 +316,13 @@ The repository-root entry points are:
   Clippy, shell/Python/strict-JSON syntax checks, npm/Cargo dependency trees,
   and production plus full npm audits.
 
-The TASK-0004 focused gates and <code>npm run verify:full</code> passed on
-2026-08-23. The full route ran all 24 frontend tests, TypeScript, rustfmt, all
-41 Rust tests, a 35-module production build, Clippy with warnings denied,
-shell/Python/JSON checks, dependency trees, and both npm audits. Dependency-tree
-output exceeded the captured console view, but the command completed with exit
-status 0 and both npm audits reported zero vulnerabilities.
+TASK-0005 focused checks passed on 2026-08-23: 14 task-specific Rust tests,
+all 27 frontend tests, TypeScript, rustfmt, and Clippy. The complete
+<code>npm run verify:full</code> route passed with 27 frontend tests, 55 Rust
+tests, a 36-module production build, Clippy with warnings denied,
+shell/Python/JSON checks, dependency trees, and both npm audits reporting zero
+vulnerabilities. Dependency-tree output exceeded the captured console view,
+but the command completed with exit status 0.
 
 <code>cargo-audit</code> is not installed in the inspected environment. The
 full route therefore reports the Rust advisory result as **indeterminate** and
@@ -289,7 +334,6 @@ belongs to TASK-0019.
 | Gap | Owning task |
 | --- | --- |
 | Mandatory installed/CI Rust advisory tooling | TASK-0019 |
-| Single-run coordinator, lifecycle, ledger, and output contract | TASK-0005 |
 | Truthful provider registry and hardened Codex/Ollama paths | TASK-0006–TASK-0008 |
 | Dynamic hierarchy, routing, review, and workspace evidence | TASK-0009–TASK-0012 |
 | Frontend modularity, strict backup, and full data lifecycle | TASK-0013–TASK-0014 |

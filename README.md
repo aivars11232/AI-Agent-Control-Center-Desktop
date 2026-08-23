@@ -17,15 +17,19 @@ The current checkout contains:
 - a React 19 and TypeScript renderer built with Vite;
 - a Tauri 2 and Rust desktop backend;
 - a backend-owned, versioned SQLite store for desktop application state;
+- a backend-authoritative single-run coordinator with a durable, bounded run
+  ledger;
 - execution paths for the installed Codex CLI and a local Ollama server;
 - local workspace, task, agent, approval, reminder, and model-management UI;
 - an included Python voice runtime and KDE-oriented install/remove scripts.
 
 Important limits are documented in [CURRENT_STATE.md](CURRENT_STATE.md) and
 [SECURITY_MODEL.md](SECURITY_MODEL.md). Desktop product state is now persisted
-through typed Tauri commands and a schema-versioned backend database. Routing,
-review orchestration, and durable run coordination are still prototype
-boundaries. Approval issuance, matching, expiry, trusted resolution, and
+through typed Tauri commands and a schema-versioned backend database. Run
+admission, task/run lifecycle projection, cancellation state, recovery, and
+bounded evidence retention are backend-authoritative. Routing, provider
+contracts, and multi-level review orchestration remain prototype boundaries.
+Approval issuance, matching, expiry, trusted resolution, reservation, and
 single-use consumption are backend-authoritative; imported legacy approval
 rows remain non-authoritative history.
 Browser preview storage is retained only as a non-authoritative preview path.
@@ -63,8 +67,9 @@ Run the deterministic fast characterization gate from the repository root:
 npm run verify:fast
 ```
 
-It runs 24 frontend characterization/persistence tests, the TypeScript check,
-the Rust format check, and 41 locked/offline Rust tests. The full gate adds the
+It runs 27 frontend characterization/persistence/coordinator tests, the
+TypeScript check, the Rust format check, and 55 locked/offline Rust tests. The
+full gate adds the
 frontend build, Clippy, shell/Python/JSON checks, dependency-tree checks, and
 production plus development npm audits:
 

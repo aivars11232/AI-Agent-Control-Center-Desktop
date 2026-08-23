@@ -2,6 +2,7 @@ mod app_state;
 mod authorization;
 mod persistence;
 mod policy;
+mod run_coordinator;
 
 use app_state::{ApplicationState, LegacyRendererState};
 use ashpd::desktop::{
@@ -20,6 +21,12 @@ use persistence::{
     PersistenceError, PersistenceService, SaveReceipt, StateEnvelope, StateRepository,
 };
 use policy::{ActionIntent, RunMode};
+use run_coordinator::{
+    bound_diff, bound_paths, validate_request_id, BoundedText, RunAttemptProjection,
+    RunAttemptStatus, RunCompletion, RunCoordinatorSnapshot, RunTruncationEvidence, RunUsage,
+    MAX_DIFF_BYTES, MAX_OLLAMA_CONVERSATION_BYTES, MAX_OLLAMA_RESPONSE_BYTES, MAX_SNAPSHOT_FILES,
+    MAX_SNAPSHOT_MILLIS, MAX_STDERR_CAPTURE_BYTES, MAX_STDOUT_CAPTURE_BYTES,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -44,9 +51,6 @@ use tauri::{
 
 const KEYRING_SERVICE: &str = "com.aivarsrocens.aiagentcontrolcenter";
 const OPENAI_KEY_ACCOUNT: &str = "openai-api-key";
-const MAX_SNAPSHOT_FILES: usize = 20_000;
-const MAX_CHANGED_FILES: usize = 250;
-const MAX_DIFF_CHARS: usize = 120_000;
 const OLLAMA_ENDPOINT: &str = "http://localhost:11434";
 const OLLAMA_ADDRESS: &str = "127.0.0.1:11434";
 const OLLAMA_REQUEST_TIMEOUT_SECONDS: u64 = 90;
@@ -74,9 +78,15 @@ async fn consume_authorization(
         .map_err(authorization_error_message)
 }
 
+#[derive(Clone)]
+struct ActiveRunEntry {
+    attempt_id: i64,
+    cancel_flag: Arc<AtomicBool>,
+}
+
 #[derive(Default)]
 struct ActiveRuns {
-    runs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    runs: Arc<Mutex<HashMap<String, ActiveRunEntry>>>,
 }
 
 #[derive(Default)]
@@ -133,7 +143,6 @@ struct AgentRunRequest {
 }
 
 struct AuthorizedAgentRun {
-    run_id: String,
     run_mode: String,
     agent_name: String,
     description: String,
@@ -235,7 +244,7 @@ struct DesktopControlStatus {
     message: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentRunUsage {
     input_tokens: Option<u64>,
@@ -243,7 +252,7 @@ struct AgentRunUsage {
     total_tokens: Option<u64>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentRunResult {
     output: String,
@@ -253,6 +262,32 @@ struct AgentRunResult {
     changed_files: Vec<String>,
     diff: Option<String>,
     duration_seconds: u64,
+}
+
+#[derive(Clone)]
+struct RuntimeRunContext {
+    app: AppHandle,
+    persistence: PersistenceService,
+    attempt_id: i64,
+    request_id: String,
+    cancel_flag: Arc<AtomicBool>,
+}
+
+struct RuntimeRunResult {
+    result: AgentRunResult,
+    stderr_excerpt: Option<String>,
+    truncation: RunTruncationEvidence,
+}
+
+struct CapturedText {
+    text: String,
+    original_bytes: u64,
+    truncated: bool,
+}
+
+struct WorkspaceSnapshot {
+    files: HashMap<String, FileFingerprint>,
+    truncated: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -655,6 +690,12 @@ fn ollama_request_at(
         .transpose()
         .map_err(|error| format!("Could not prepare the Ollama request: {error}"))?
         .unwrap_or_default();
+    if body_text.len() > MAX_OLLAMA_CONVERSATION_BYTES {
+        return Err(format!(
+            "The Ollama conversation exceeded the {}-byte request bound.",
+            MAX_OLLAMA_CONVERSATION_BYTES
+        ));
+    }
     let mut stream = TcpStream::connect_timeout(
         &address
             .parse()
@@ -686,15 +727,23 @@ fn ollama_request_at(
         .and_then(|_| stream.flush())
         .map_err(|error| format!("Could not send a request to Ollama: {error}"))?;
 
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|error| format!("Could not read Ollama's response: {error}"))?;
-    let response = String::from_utf8(response)
-        .map_err(|_| "Ollama returned a non-text response.".to_string())?;
+    let response = read_bounded_capture(stream, MAX_OLLAMA_RESPONSE_BYTES + 64 * 1024);
+    if response.truncated {
+        return Err(format!(
+            "Ollama's HTTP response exceeded the {}-byte response bound.",
+            MAX_OLLAMA_RESPONSE_BYTES
+        ));
+    }
+    let response = response.text;
     let (headers, response_body) = response
         .split_once("\r\n\r\n")
         .ok_or_else(|| "Ollama returned an invalid HTTP response.".to_string())?;
+    if response_body.len() > MAX_OLLAMA_RESPONSE_BYTES {
+        return Err(format!(
+            "Ollama's response body exceeded the {}-byte response bound.",
+            MAX_OLLAMA_RESPONSE_BYTES
+        ));
+    }
     let status = headers
         .lines()
         .next()
@@ -816,12 +865,8 @@ fn resolve_workspace(input: &str) -> Result<PathBuf, String> {
         PathBuf::from(trimmed)
     };
 
-    let workspace = fs::canonicalize(&expanded).map_err(|_| {
-        format!(
-            "The selected workspace does not exist: {}",
-            expanded.to_string_lossy()
-        )
-    })?;
+    let workspace = fs::canonicalize(&expanded)
+        .map_err(|_| "The selected workspace does not exist or cannot be resolved.".to_string())?;
 
     if !workspace.is_dir() {
         return Err("The selected workspace must be a folder.".to_string());
@@ -1183,7 +1228,6 @@ fn build_authorized_agent_run(
         task.id, task.title, specialist_output, changed_files, diff_evidence
     );
     let execution = AuthorizedAgentRun {
-        run_id: request.run_id,
         run_mode: request.run_mode,
         agent_name: agent.name.clone(),
         description: agent.description.clone(),
@@ -1234,15 +1278,33 @@ fn build_authorized_agent_run(
     Ok(execution)
 }
 
-fn emit_run_event(app: &AppHandle, run_id: &str, kind: &str, message: impl Into<String>) {
-    let _ = app.emit(
-        "codex-run-event",
-        CodexRunEvent {
-            run_id: run_id.to_string(),
-            kind: kind.to_string(),
-            message: message.into(),
-        },
-    );
+impl RuntimeRunContext {
+    fn emit(&self, kind: &str, message: impl Into<String>) -> Result<(), String> {
+        let message = message.into();
+        let event = self
+            .persistence
+            .record_run_event_blocking(self.attempt_id, kind, &message)
+            .map_err(authorization_error_message)?;
+        let _ = self.app.emit("run-coordinator-event", event);
+        let _ = self.app.emit(
+            "codex-run-event",
+            CodexRunEvent {
+                run_id: self.request_id.clone(),
+                kind: kind.to_string(),
+                message,
+            },
+        );
+        Ok(())
+    }
+
+    fn mark_started(&self) -> Result<RunAttemptProjection, String> {
+        let attempt = self
+            .persistence
+            .mark_run_started_blocking(self.attempt_id)
+            .map_err(authorization_error_message)?;
+        emit_run_snapshot(&self.app, &self.persistence);
+        Ok(attempt)
+    }
 }
 
 fn should_skip_directory(name: &str) -> bool {
@@ -1253,8 +1315,13 @@ fn snapshot_directory(
     root: &Path,
     directory: &Path,
     snapshot: &mut HashMap<String, FileFingerprint>,
+    started: Instant,
+    truncated: &mut bool,
 ) {
-    if snapshot.len() >= MAX_SNAPSHOT_FILES {
+    if snapshot.len() >= MAX_SNAPSHOT_FILES
+        || started.elapsed() >= Duration::from_millis(MAX_SNAPSHOT_MILLIS)
+    {
+        *truncated = true;
         return;
     }
 
@@ -1263,7 +1330,10 @@ fn snapshot_directory(
     };
 
     for entry in entries.flatten() {
-        if snapshot.len() >= MAX_SNAPSHOT_FILES {
+        if snapshot.len() >= MAX_SNAPSHOT_FILES
+            || started.elapsed() >= Duration::from_millis(MAX_SNAPSHOT_MILLIS)
+        {
+            *truncated = true;
             return;
         }
 
@@ -1279,7 +1349,7 @@ fn snapshot_directory(
 
         if file_type.is_dir() {
             if !should_skip_directory(&file_name) {
-                snapshot_directory(root, &path, snapshot);
+                snapshot_directory(root, &path, snapshot, started, truncated);
             }
             continue;
         }
@@ -1313,30 +1383,85 @@ fn snapshot_directory(
     }
 }
 
-fn workspace_snapshot(workspace: &Path) -> HashMap<String, FileFingerprint> {
-    let mut snapshot = HashMap::new();
-    snapshot_directory(workspace, workspace, &mut snapshot);
-    snapshot
+fn workspace_snapshot(workspace: &Path) -> WorkspaceSnapshot {
+    let mut files = HashMap::new();
+    let mut truncated = false;
+    snapshot_directory(
+        workspace,
+        workspace,
+        &mut files,
+        Instant::now(),
+        &mut truncated,
+    );
+    WorkspaceSnapshot { files, truncated }
 }
 
-fn compare_snapshots(
-    before: &HashMap<String, FileFingerprint>,
-    after: &HashMap<String, FileFingerprint>,
-) -> Vec<String> {
-    let mut all_paths: HashSet<&String> = before.keys().collect();
-    all_paths.extend(after.keys());
+fn compare_snapshots(before: &WorkspaceSnapshot, after: &WorkspaceSnapshot) -> Vec<String> {
+    let mut all_paths: HashSet<&String> = before.files.keys().collect();
+    all_paths.extend(after.files.keys());
 
     let mut changed: Vec<String> = all_paths
         .into_iter()
-        .filter(|path| before.get(*path) != after.get(*path))
+        .filter(|path| before.files.get(*path) != after.files.get(*path))
         .map(|path| path.to_string())
         .collect();
     changed.sort();
-    changed.truncate(MAX_CHANGED_FILES);
     changed
 }
 
-fn git_working_tree_diff(workspace: &Path) -> Option<String> {
+fn read_bounded_capture(reader: impl Read, limit: usize) -> CapturedText {
+    let mut reader = reader;
+    let mut retained = Vec::with_capacity(limit.min(64 * 1024));
+    let mut original_bytes = 0_u64;
+    let mut buffer = [0_u8; 8 * 1024];
+    while let Ok(read) = reader.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+        original_bytes = original_bytes.saturating_add(read as u64);
+        let available = limit.saturating_sub(retained.len());
+        retained.extend_from_slice(&buffer[..read.min(available)]);
+    }
+    let decoded = String::from_utf8_lossy(&retained);
+    let bounded = BoundedText::from_text(&decoded, limit);
+    CapturedText {
+        text: bounded.as_str().to_string(),
+        original_bytes,
+        truncated: original_bytes > retained.len() as u64 || bounded.truncated(),
+    }
+}
+
+fn read_bounded_progress(
+    reader: impl Read,
+    limit: usize,
+    progress_sender: mpsc::SyncSender<String>,
+) -> CapturedText {
+    let mut reader = reader;
+    let mut retained = Vec::with_capacity(limit.min(64 * 1024));
+    let mut original_bytes = 0_u64;
+    let mut buffer = [0_u8; 8 * 1024];
+    while let Ok(read) = reader.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+        original_bytes = original_bytes.saturating_add(read as u64);
+        let available = limit.saturating_sub(retained.len());
+        retained.extend_from_slice(&buffer[..read.min(available)]);
+        let message = String::from_utf8_lossy(&buffer[..read]).trim().to_string();
+        if !message.is_empty() && progress_sender.send(message).is_err() {
+            break;
+        }
+    }
+    let decoded = String::from_utf8_lossy(&retained);
+    let bounded = BoundedText::from_text(&decoded, limit);
+    CapturedText {
+        text: bounded.as_str().trim().to_string(),
+        original_bytes,
+        truncated: original_bytes > retained.len() as u64 || bounded.truncated(),
+    }
+}
+
+fn git_working_tree_diff(workspace: &Path) -> Option<CapturedText> {
     let inside = Command::new("git")
         .current_dir(workspace)
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -1347,21 +1472,24 @@ fn git_working_tree_diff(workspace: &Path) -> Option<String> {
         return None;
     }
 
-    let output = Command::new("git")
+    let mut child = Command::new("git")
         .current_dir(workspace)
         .args(["diff", "--no-ext-diff", "--no-color", "--", "."])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-
-    if !output.status.success() {
+    let stdout = child.stdout.take()?;
+    let mut capture = read_bounded_capture(stdout, MAX_DIFF_BYTES);
+    let status = child.wait().ok()?;
+    if !status.success() {
         return None;
     }
-
-    let diff = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if diff.is_empty() {
+    capture.text = capture.text.trim().to_string();
+    if capture.text.is_empty() {
         None
     } else {
-        Some(diff.chars().take(MAX_DIFF_CHARS).collect())
+        Some(capture)
     }
 }
 
@@ -1776,22 +1904,15 @@ fn ollama_chat_with_cancellation(
 }
 
 fn run_ollama_task(
-    app: AppHandle,
-    active_runs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    context: RuntimeRunContext,
     request: AuthorizedAgentRun,
-) -> Result<AgentRunResult, String> {
+) -> Result<RuntimeRunResult, String> {
     let started = Instant::now();
-    let run_id = request.run_id.trim().to_string();
-    if run_id.is_empty() {
-        return Err("The agent run identifier is missing.".to_string());
+    let cancel_flag = context.cancel_flag.clone();
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Err("Agent run cancelled by the user.".to_string());
     }
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    active_runs
-        .lock()
-        .map_err(|_| "The active-run registry is unavailable.".to_string())?
-        .insert(run_id.clone(), cancel_flag.clone());
-
-    let result = (|| {
+    (|| {
         validate_run_safety(&request)?;
         if request.enable_web_search {
             return Err("The local Ollama coding agent has no web-search tool. Disable internet access for this run or choose a Codex model.".to_string());
@@ -1821,21 +1942,17 @@ fn run_ollama_task(
 
         let timeout_seconds = request.timeout_seconds.clamp(60, 7_200);
         let prompt = agent_prompt(&request, true);
-        emit_run_event(
-            &app,
-            &run_id,
+        context.emit(
             "status",
-            format!(
-                "Starting local Ollama model {model} in {}",
-                workspace.to_string_lossy()
-            ),
-        );
+            format!("Starting local Ollama model {model} in the selected workspace"),
+        )?;
         let before_snapshot = workspace_snapshot(&workspace);
         let tools = ollama_workspace_tools(&request.file_access);
         let mut messages = vec![json!({ "role": "system", "content": prompt })];
         let mut input_tokens = 0_u64;
         let mut output_tokens = 0_u64;
         let mut used_usage = false;
+        context.mark_started()?;
 
         for turn in 0..MAX_OLLAMA_TOOL_TURNS {
             let response = ollama_chat_with_cancellation(
@@ -1884,29 +2001,50 @@ fn run_ollama_task(
                 if content.is_empty() {
                     return Err("Ollama completed without returning a final response.".to_string());
                 }
-                emit_run_event(&app, &run_id, "status", "Checking workspace changes…");
+                context.emit("status", "Checking workspace changes…")?;
                 let after_snapshot = workspace_snapshot(&workspace);
-                let changed_files = compare_snapshots(&before_snapshot, &after_snapshot);
-                let diff = git_working_tree_diff(&workspace);
-                emit_run_event(
-                    &app,
-                    &run_id,
+                let bounded_paths =
+                    bound_paths(compare_snapshots(&before_snapshot, &after_snapshot));
+                let diff_capture = git_working_tree_diff(&workspace);
+                let (diff, original_diff_bytes, diff_truncated) =
+                    bound_diff(diff_capture.as_ref().map(|capture| capture.text.clone()));
+                context.emit(
                     "complete",
-                    format!("Completed with {} changed file(s).", changed_files.len()),
-                );
-                return Ok(AgentRunResult {
-                    output: content,
-                    response_id: None,
-                    model: runtime_model,
-                    usage: AgentRunUsage {
-                        input_tokens: used_usage.then_some(input_tokens),
-                        output_tokens: used_usage.then_some(output_tokens),
-                        total_tokens: used_usage
-                            .then_some(input_tokens.saturating_add(output_tokens)),
+                    format!(
+                        "Completed with {} changed file(s).",
+                        bounded_paths.original_count
+                    ),
+                )?;
+                return Ok(RuntimeRunResult {
+                    result: AgentRunResult {
+                        output: content,
+                        response_id: None,
+                        model: runtime_model,
+                        usage: AgentRunUsage {
+                            input_tokens: used_usage.then_some(input_tokens),
+                            output_tokens: used_usage.then_some(output_tokens),
+                            total_tokens: used_usage
+                                .then_some(input_tokens.saturating_add(output_tokens)),
+                        },
+                        changed_files: bounded_paths.paths,
+                        diff,
+                        duration_seconds: started.elapsed().as_secs(),
                     },
-                    changed_files,
-                    diff,
-                    duration_seconds: started.elapsed().as_secs(),
+                    stderr_excerpt: None,
+                    truncation: RunTruncationEvidence {
+                        diff_truncated: diff_truncated
+                            || diff_capture
+                                .as_ref()
+                                .is_some_and(|capture| capture.truncated),
+                        changed_files_truncated: bounded_paths.truncated,
+                        before_snapshot_truncated: before_snapshot.truncated,
+                        after_snapshot_truncated: after_snapshot.truncated,
+                        original_diff_bytes: diff_capture
+                            .as_ref()
+                            .map_or(original_diff_bytes as u64, |capture| capture.original_bytes),
+                        original_changed_file_count: bounded_paths.original_count as u64,
+                        ..RunTruncationEvidence::default()
+                    },
                 });
             }
 
@@ -1914,12 +2052,7 @@ fn run_ollama_task(
                 return Err("The local Ollama coding agent reached its 16-tool-turn limit before finishing.".to_string());
             }
             for tool_call in tool_calls {
-                emit_run_event(
-                    &app,
-                    &run_id,
-                    "progress",
-                    format!("Ollama requested {}…", tool_call.name),
-                );
+                context.emit("progress", format!("Ollama requested {}…", tool_call.name))?;
                 let tool_result = execute_ollama_workspace_tool(&workspace, &request, &tool_call)
                     .unwrap_or_else(|error| format!("Tool error: {error}"));
                 messages.push(json!({
@@ -1931,32 +2064,19 @@ fn run_ollama_task(
         }
 
         Err("The local Ollama coding agent stopped without a final response.".to_string())
-    })();
-
-    if let Ok(mut runs) = active_runs.lock() {
-        runs.remove(&run_id);
-    }
-    result
+    })()
 }
 
 fn run_codex_task(
-    app: AppHandle,
-    active_runs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    context: RuntimeRunContext,
     request: AuthorizedAgentRun,
-) -> Result<AgentRunResult, String> {
+) -> Result<RuntimeRunResult, String> {
     let started = Instant::now();
-    let run_id = request.run_id.trim().to_string();
-    if run_id.is_empty() {
-        return Err("The agent run identifier is missing.".to_string());
+    let cancel_flag = context.cancel_flag.clone();
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Err("Agent run cancelled by the user.".to_string());
     }
-
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    active_runs
-        .lock()
-        .map_err(|_| "The active-run registry is unavailable.".to_string())?
-        .insert(run_id.clone(), cancel_flag.clone());
-
-    let result = (|| {
+    (|| {
         let status = inspect_codex_runtime();
         if !status.installed || !status.authenticated {
             return Err(status.message);
@@ -1985,12 +2105,10 @@ fn run_codex_task(
         let timeout_seconds = request.timeout_seconds.clamp(60, 7_200);
         let prompt = agent_prompt(&request, false);
 
-        emit_run_event(
-            &app,
-            &run_id,
+        context.emit(
             "status",
-            format!("Starting {model} in {}", workspace.to_string_lossy()),
-        );
+            format!("Starting {model} in the selected workspace"),
+        )?;
         let before_snapshot = workspace_snapshot(&workspace);
 
         let mut command = Command::new(binary);
@@ -2013,9 +2131,17 @@ fn run_codex_task(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        if cancel_flag.load(Ordering::SeqCst) {
+            return Err("Agent run cancelled by the user.".to_string());
+        }
         let mut child = command
             .spawn()
             .map_err(|error| format!("Could not start Codex: {error}"))?;
+        if let Err(error) = context.mark_started() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
         let stdout = child
             .stdout
             .take()
@@ -2025,35 +2151,30 @@ fn run_codex_task(
             .take()
             .ok_or_else(|| "Could not capture Codex progress.".to_string())?;
 
-        let stdout_reader = thread::spawn(move || {
-            let mut text = String::new();
-            let mut reader = BufReader::new(stdout);
-            let _ = reader.read_to_string(&mut text);
-            text
-        });
-        let (progress_sender, progress_receiver) = mpsc::channel::<String>();
+        let stdout_reader =
+            thread::spawn(move || read_bounded_capture(stdout, MAX_STDOUT_CAPTURE_BYTES));
+        let (progress_sender, progress_receiver) = mpsc::sync_channel::<String>(64);
         let stderr_reader = thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            let mut full_text = String::new();
-            for line in reader.lines().map_while(Result::ok) {
-                if !line.trim().is_empty() {
-                    let _ = progress_sender.send(line.clone());
-                }
-                full_text.push_str(&line);
-                full_text.push('\n');
-            }
-            full_text
+            read_bounded_progress(stderr, MAX_STDERR_CAPTURE_BYTES, progress_sender)
         });
 
         let exit_status = loop {
             while let Ok(message) = progress_receiver.try_recv() {
-                emit_run_event(&app, &run_id, "progress", message);
+                if let Err(error) = context.emit("progress", message) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    drop(progress_receiver);
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(error);
+                }
             }
 
             if cancel_flag.load(Ordering::SeqCst) {
-                emit_run_event(&app, &run_id, "status", "Stopping the Codex process…");
+                let _ = context.emit("status", "Stopping the Codex process…");
                 let _ = child.kill();
                 let _ = child.wait();
+                drop(progress_receiver);
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 return Err("Agent run cancelled by the user.".to_string());
@@ -2062,6 +2183,7 @@ fn run_codex_task(
             if started.elapsed() >= Duration::from_secs(timeout_seconds) {
                 let _ = child.kill();
                 let _ = child.wait();
+                drop(progress_receiver);
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 return Err(format!(
@@ -2074,19 +2196,36 @@ fn run_codex_task(
                 Ok(None) => thread::sleep(Duration::from_millis(80)),
                 Err(error) => {
                     let _ = child.kill();
+                    let _ = child.wait();
+                    drop(progress_receiver);
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
                     return Err(format!("Could not monitor the Codex process: {error}"));
                 }
             }
         };
 
-        while let Ok(message) = progress_receiver.try_recv() {
-            emit_run_event(&app, &run_id, "progress", message);
+        while let Ok(message) = progress_receiver.recv() {
+            context.emit("progress", message)?;
         }
-        let stdout = stdout_reader.join().unwrap_or_default().trim().to_string();
-        let stderr = stderr_reader.join().unwrap_or_default().trim().to_string();
+        let mut stdout = stdout_reader.join().unwrap_or(CapturedText {
+            text: String::new(),
+            original_bytes: 0,
+            truncated: false,
+        });
+        let stderr = stderr_reader.join().unwrap_or(CapturedText {
+            text: String::new(),
+            original_bytes: 0,
+            truncated: false,
+        });
+        stdout.text = stdout.text.trim().to_string();
 
         if !exit_status.success() {
-            let detail = if !stderr.is_empty() { stderr } else { stdout };
+            let detail = if !stderr.text.is_empty() {
+                stderr.text
+            } else {
+                stdout.text
+            };
             return Err(if detail.is_empty() {
                 format!("Codex exited with status {exit_status}.")
             } else {
@@ -2094,40 +2233,59 @@ fn run_codex_task(
             });
         }
 
-        if stdout.is_empty() {
+        if stdout.text.is_empty() {
             return Err("Codex completed without returning a final response.".to_string());
         }
 
-        emit_run_event(&app, &run_id, "status", "Checking workspace changes…");
+        context.emit("status", "Checking workspace changes…")?;
         let after_snapshot = workspace_snapshot(&workspace);
-        let changed_files = compare_snapshots(&before_snapshot, &after_snapshot);
-        let diff = git_working_tree_diff(&workspace);
-        emit_run_event(
-            &app,
-            &run_id,
+        let bounded_paths = bound_paths(compare_snapshots(&before_snapshot, &after_snapshot));
+        let diff_capture = git_working_tree_diff(&workspace);
+        let (diff, original_diff_bytes, diff_truncated) =
+            bound_diff(diff_capture.as_ref().map(|capture| capture.text.clone()));
+        context.emit(
             "complete",
-            format!("Completed with {} changed file(s).", changed_files.len()),
-        );
+            format!(
+                "Completed with {} changed file(s).",
+                bounded_paths.original_count
+            ),
+        )?;
 
-        Ok(AgentRunResult {
-            output: stdout,
-            response_id: None,
-            model,
-            usage: AgentRunUsage {
-                input_tokens: None,
-                output_tokens: None,
-                total_tokens: None,
+        Ok(RuntimeRunResult {
+            result: AgentRunResult {
+                output: stdout.text,
+                response_id: None,
+                model,
+                usage: AgentRunUsage {
+                    input_tokens: None,
+                    output_tokens: None,
+                    total_tokens: None,
+                },
+                changed_files: bounded_paths.paths,
+                diff,
+                duration_seconds: started.elapsed().as_secs(),
             },
-            changed_files,
-            diff,
-            duration_seconds: started.elapsed().as_secs(),
+            stderr_excerpt: (!stderr.text.is_empty()).then_some(stderr.text),
+            truncation: RunTruncationEvidence {
+                stdout_truncated: stdout.truncated,
+                stderr_truncated: stderr.truncated,
+                diff_truncated: diff_truncated
+                    || diff_capture
+                        .as_ref()
+                        .is_some_and(|capture| capture.truncated),
+                changed_files_truncated: bounded_paths.truncated,
+                before_snapshot_truncated: before_snapshot.truncated,
+                after_snapshot_truncated: after_snapshot.truncated,
+                original_stdout_bytes: stdout.original_bytes,
+                original_stderr_bytes: stderr.original_bytes,
+                original_diff_bytes: diff_capture
+                    .as_ref()
+                    .map_or(original_diff_bytes as u64, |capture| capture.original_bytes),
+                original_changed_file_count: bounded_paths.original_count as u64,
+                ..RunTruncationEvidence::default()
+            },
         })
-    })();
-
-    if let Ok(mut runs) = active_runs.lock() {
-        runs.remove(&run_id);
-    }
-    result
+    })()
 }
 
 fn choose_workspace_folder_sync() -> Result<Option<String>, String> {
@@ -2189,17 +2347,55 @@ async fn choose_workspace_folder() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-fn cancel_agent_run(run_id: String, state: State<'_, ActiveRuns>) -> Result<bool, String> {
-    let runs = state
+async fn run_coordinator_snapshot(
+    persistence: State<'_, PersistenceService>,
+) -> Result<RunCoordinatorSnapshot, PersistenceError> {
+    persistence.inner().run_snapshot().await
+}
+
+fn emit_run_snapshot(app: &AppHandle, persistence: &PersistenceService) {
+    if let Ok(snapshot) = persistence.run_snapshot_blocking() {
+        let _ = app.emit("run-coordinator-snapshot", snapshot);
+    }
+}
+
+#[tauri::command]
+async fn cancel_agent_run(
+    app: AppHandle,
+    run_id: String,
+    state: State<'_, ActiveRuns>,
+    persistence: State<'_, PersistenceService>,
+) -> Result<bool, String> {
+    let run_id = run_id.trim();
+    validate_request_id(run_id).map_err(str::to_string)?;
+    let snapshot = persistence
+        .inner()
+        .run_snapshot()
+        .await
+        .map_err(authorization_error_message)?;
+    let Some(active) = snapshot.active_attempt else {
+        return Ok(false);
+    };
+    if active.request_id != run_id {
+        return Ok(false);
+    }
+    persistence
+        .inner()
+        .request_run_cancellation(active.id)
+        .await
+        .map_err(authorization_error_message)?;
+    if let Some(entry) = state
         .runs
         .lock()
-        .map_err(|_| "The active-run registry is unavailable.".to_string())?;
-    if let Some(flag) = runs.get(run_id.trim()) {
-        flag.store(true, Ordering::SeqCst);
-        Ok(true)
-    } else {
-        Ok(false)
+        .map_err(|_| "The active-run registry is unavailable.".to_string())?
+        .get(run_id)
+    {
+        if entry.attempt_id == active.id {
+            entry.cancel_flag.store(true, Ordering::SeqCst);
+        }
     }
+    emit_run_snapshot(&app, persistence.inner());
+    Ok(true)
 }
 
 #[tauri::command]
@@ -3547,6 +3743,55 @@ async fn resolve_approval(
         .await
 }
 
+fn run_result_from_attempt(attempt: &RunAttemptProjection) -> Result<AgentRunResult, String> {
+    if attempt.status != RunAttemptStatus::Succeeded {
+        return Err(format!(
+            "{}: {}",
+            attempt
+                .error_code
+                .as_deref()
+                .unwrap_or("RUN_NOT_SUCCESSFUL"),
+            attempt
+                .error_message
+                .as_deref()
+                .unwrap_or("The run did not complete successfully.")
+        ));
+    }
+    Ok(AgentRunResult {
+        output: attempt.output_summary.clone().unwrap_or_default(),
+        response_id: attempt.response_id.clone(),
+        model: attempt.model.clone().unwrap_or_default(),
+        usage: AgentRunUsage {
+            input_tokens: attempt.usage.input_tokens,
+            output_tokens: attempt.usage.output_tokens,
+            total_tokens: attempt.usage.total_tokens,
+        },
+        changed_files: attempt.changed_files.clone(),
+        diff: attempt.diff.clone(),
+        duration_seconds: attempt.duration_seconds.unwrap_or_default(),
+    })
+}
+
+fn terminal_status_for_runtime_error(
+    attempt: Option<&RunAttemptProjection>,
+    cancel_requested: bool,
+    message: &str,
+) -> RunAttemptStatus {
+    if cancel_requested
+        || attempt.is_some_and(|attempt| attempt.status == RunAttemptStatus::CancelRequested)
+    {
+        return RunAttemptStatus::Cancelled;
+    }
+    if attempt.map_or(true, |attempt| attempt.started_at_unix_ms.is_none()) {
+        return RunAttemptStatus::StartupFailed;
+    }
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("timeout") || normalized.contains("timed out") {
+        return RunAttemptStatus::TimedOut;
+    }
+    RunAttemptStatus::Failed
+}
+
 #[tauri::command]
 async fn run_agent_task(
     app: AppHandle,
@@ -3554,23 +3799,231 @@ async fn run_agent_task(
     persistence: State<'_, PersistenceService>,
     request: AgentRunRequest,
 ) -> Result<AgentRunResult, String> {
+    let started = Instant::now();
+    let request_id = request.run_id.trim().to_string();
     let intent = run_action_intent(&request)?;
-    let (grant, application_state) = persistence
-        .inner()
-        .authorize_intent_and_state(intent)
+    let persistence = persistence.inner().clone();
+    let admission = persistence
+        .admit_run(request_id.clone(), intent)
         .await
         .map_err(authorization_error_message)?;
-    let request = build_authorized_agent_run(request, &application_state, &grant)?;
-    let active_runs = state.runs.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        if is_ollama_provider(&request.model_provider) {
-            run_ollama_task(app, active_runs, request)
+    emit_run_snapshot(&app, &persistence);
+    if admission.duplicate {
+        return if admission.attempt.status.is_terminal() {
+            run_result_from_attempt(&admission.attempt)
         } else {
-            run_codex_task(app, active_runs, request)
+            Err("RUN_ALREADY_ACTIVE: This idempotent run request is already active.".to_string())
+        };
+    }
+    let attempt_id = admission.attempt.id;
+    let grant = admission
+        .authorization
+        .unwrap_or_else(AuthorizationGrant::policy_allowed);
+    let authorized = match build_authorized_agent_run(request, &admission.application_state, &grant)
+    {
+        Ok(authorized) => authorized,
+        Err(error) => {
+            let completion = RunCompletion::terminal_error(
+                RunAttemptStatus::StartupFailed,
+                "RUN_STARTUP_FAILED",
+                &error,
+                started.elapsed().as_secs(),
+            );
+            persistence
+                .complete_run(attempt_id, completion)
+                .await
+                .map_err(authorization_error_message)?;
+            emit_run_snapshot(&app, &persistence);
+            return Err(error);
+        }
+    };
+    if let Err(error) = persistence
+        .prepare_run_attempt(
+            attempt_id,
+            authorized.model_provider.clone(),
+            authorized.model.clone(),
+            admission.attempt.workspace_id.clone(),
+        )
+        .await
+    {
+        let message = authorization_error_message(error);
+        let completion = RunCompletion::terminal_error(
+            RunAttemptStatus::StartupFailed,
+            "RUN_STARTUP_FAILED",
+            &message,
+            started.elapsed().as_secs(),
+        );
+        persistence
+            .complete_run(attempt_id, completion)
+            .await
+            .map_err(authorization_error_message)?;
+        emit_run_snapshot(&app, &persistence);
+        return Err(message);
+    }
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let registry_conflict = {
+        let mut runs = state
+            .runs
+            .lock()
+            .map_err(|_| "The active-run registry is unavailable.".to_string())?;
+        runs.insert(
+            request_id.clone(),
+            ActiveRunEntry {
+                attempt_id,
+                cancel_flag: cancel_flag.clone(),
+            },
+        )
+        .is_some()
+    };
+    if registry_conflict {
+        let completion = RunCompletion::terminal_error(
+            RunAttemptStatus::Interrupted,
+            "RUN_REGISTRY_CONFLICT",
+            "The in-memory run registry already contained this request.",
+            started.elapsed().as_secs(),
+        );
+        persistence
+            .complete_run(attempt_id, completion)
+            .await
+            .map_err(authorization_error_message)?;
+        return Err("RUN_REGISTRY_CONFLICT: The run registry rejected the request.".to_string());
+    }
+
+    let context = RuntimeRunContext {
+        app: app.clone(),
+        persistence: persistence.clone(),
+        attempt_id,
+        request_id: request_id.clone(),
+        cancel_flag: cancel_flag.clone(),
+    };
+    let provider = authorized.model_provider.clone();
+    let worker = tauri::async_runtime::spawn_blocking(move || {
+        let dispatching = context
+            .persistence
+            .mark_run_dispatching_blocking(context.attempt_id)
+            .map_err(authorization_error_message)?;
+        if dispatching.status == RunAttemptStatus::CancelRequested
+            || context.cancel_flag.load(Ordering::SeqCst)
+        {
+            return Err("Agent run cancelled by the user.".to_string());
+        }
+        if is_ollama_provider(&provider) {
+            run_ollama_task(context, authorized)
+        } else {
+            run_codex_task(context, authorized)
         }
     })
-    .await
-    .map_err(|_| "The agent task worker stopped unexpectedly.".to_string())?
+    .await;
+
+    if let Ok(mut runs) = state.runs.lock() {
+        if runs
+            .get(&request_id)
+            .is_some_and(|entry| entry.attempt_id == attempt_id)
+        {
+            runs.remove(&request_id);
+        }
+    }
+
+    match worker {
+        Ok(Ok(runtime)) => {
+            let completion = RunCompletion {
+                status: RunAttemptStatus::Succeeded,
+                output_summary: Some(runtime.result.output.clone()),
+                stderr_excerpt: runtime.stderr_excerpt,
+                response_id: runtime.result.response_id.clone(),
+                runtime_model: Some(runtime.result.model.clone()),
+                usage: RunUsage {
+                    input_tokens: runtime.result.usage.input_tokens,
+                    output_tokens: runtime.result.usage.output_tokens,
+                    total_tokens: runtime.result.usage.total_tokens,
+                },
+                changed_files: runtime.result.changed_files.clone(),
+                diff: runtime.result.diff.clone(),
+                duration_seconds: runtime.result.duration_seconds,
+                error_code: None,
+                error_message: None,
+                truncation: runtime.truncation,
+                recovery_disposition: None,
+            };
+            let completed = persistence
+                .complete_run(attempt_id, completion)
+                .await
+                .map_err(authorization_error_message)?;
+            emit_run_snapshot(&app, &persistence);
+            if completed.status == RunAttemptStatus::Succeeded {
+                Ok(runtime.result)
+            } else {
+                run_result_from_attempt(&completed)
+            }
+        }
+        Ok(Err(message)) => {
+            let snapshot = persistence
+                .run_snapshot()
+                .await
+                .map_err(authorization_error_message)?;
+            let active = snapshot
+                .active_attempt
+                .as_ref()
+                .filter(|attempt| attempt.id == attempt_id);
+            let terminal_status = terminal_status_for_runtime_error(
+                active,
+                cancel_flag.load(Ordering::SeqCst),
+                &message,
+            );
+            let code = match terminal_status {
+                RunAttemptStatus::Cancelled => "RUN_CANCELLED",
+                RunAttemptStatus::TimedOut => "RUN_TIMED_OUT",
+                RunAttemptStatus::StartupFailed => "RUN_STARTUP_FAILED",
+                _ => "RUN_FAILED",
+            };
+            let completion = RunCompletion::terminal_error(
+                terminal_status,
+                code,
+                &message,
+                started.elapsed().as_secs(),
+            );
+            persistence
+                .complete_run(attempt_id, completion)
+                .await
+                .map_err(authorization_error_message)?;
+            emit_run_snapshot(&app, &persistence);
+            Err(format!("{code}: {message}"))
+        }
+        Err(_) => {
+            let snapshot = persistence
+                .run_snapshot()
+                .await
+                .map_err(authorization_error_message)?;
+            let active = snapshot
+                .active_attempt
+                .as_ref()
+                .filter(|attempt| attempt.id == attempt_id);
+            let safe_to_retry = active.is_some_and(|attempt| {
+                matches!(
+                    attempt.status,
+                    RunAttemptStatus::Admitted | RunAttemptStatus::Starting
+                )
+            });
+            let mut completion = RunCompletion::terminal_error(
+                RunAttemptStatus::Interrupted,
+                "RUN_WORKER_STOPPED",
+                "The agent task worker stopped unexpectedly.",
+                started.elapsed().as_secs(),
+            );
+            completion.recovery_disposition = Some(if safe_to_retry {
+                "safe_to_retry".to_string()
+            } else {
+                "manual_review_required".to_string()
+            });
+            persistence
+                .complete_run(attempt_id, completion)
+                .await
+                .map_err(authorization_error_message)?;
+            emit_run_snapshot(&app, &persistence);
+            Err("RUN_WORKER_STOPPED: The agent task worker stopped unexpectedly.".to_string())
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3652,6 +4105,7 @@ pub fn run() {
             resolve_approval,
             codex_runtime_status,
             ollama_runtime_status,
+            run_coordinator_snapshot,
             choose_workspace_folder,
             cancel_agent_run,
             open_workspace_item,
@@ -3820,12 +4274,13 @@ mod tests {
         let run_end = run_remaining.find("\n#[cfg_attr").unwrap();
         let run_body = &run_remaining[..run_end];
         assert!(run_body.contains("run_action_intent"));
-        assert!(run_body.contains("authorize_intent_and_state"));
+        assert!(run_body.contains("admit_run"));
+        assert!(run_body.contains("prepare_run_attempt"));
+        assert!(run_body.contains("complete_run"));
     }
 
     fn agent_run_request_fixture() -> AuthorizedAgentRun {
         AuthorizedAgentRun {
-            run_id: "run-1".to_string(),
             run_mode: "execute".to_string(),
             agent_name: "Fixture Agent".to_string(),
             description: "Deterministic characterization fixture".to_string(),
@@ -3879,6 +4334,77 @@ mod tests {
         let mut request = agent_run_request_fixture();
         request.authorized_scopes = vec!["network".to_string()];
         assert_safety_error(&request, "The run contains an unknown authorization scope.");
+    }
+
+    fn run_attempt_fixture(
+        status: RunAttemptStatus,
+        started_at_unix_ms: Option<i64>,
+    ) -> RunAttemptProjection {
+        RunAttemptProjection {
+            id: 1,
+            request_id: "fixture-run".to_string(),
+            agent_id: 2,
+            task_owner_agent_id: 2,
+            task_id: 41,
+            task_title: "Fixture task".to_string(),
+            run_mode: crate::run_coordinator::RunAttemptMode::Execute,
+            status,
+            provider: Some("Fake".to_string()),
+            model: Some("fake-model".to_string()),
+            workspace_id: Some("fixture-workspace".to_string()),
+            approval_id: None,
+            admitted_at_unix_ms: 1,
+            started_at_unix_ms,
+            cancel_requested_at_unix_ms: None,
+            completed_at_unix_ms: None,
+            duration_seconds: None,
+            output_summary: None,
+            stderr_excerpt: None,
+            response_id: None,
+            usage: RunUsage {
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+            },
+            changed_files: Vec::new(),
+            diff: None,
+            error_code: None,
+            error_message: None,
+            progress_event_count: 0,
+            recovery_disposition: None,
+            truncation: RunTruncationEvidence::default(),
+        }
+    }
+
+    #[test]
+    fn task_0005_non_live_runtime_failure_classification_is_deterministic() {
+        let starting = run_attempt_fixture(RunAttemptStatus::Dispatching, None);
+        assert_eq!(
+            terminal_status_for_runtime_error(Some(&starting), false, "spawn failed"),
+            RunAttemptStatus::StartupFailed
+        );
+        let running = run_attempt_fixture(RunAttemptStatus::Running, Some(2));
+        assert_eq!(
+            terminal_status_for_runtime_error(Some(&running), false, "request timed out"),
+            RunAttemptStatus::TimedOut
+        );
+        assert_eq!(
+            terminal_status_for_runtime_error(Some(&running), false, "provider failed"),
+            RunAttemptStatus::Failed
+        );
+        assert_eq!(
+            terminal_status_for_runtime_error(Some(&running), true, "provider failed"),
+            RunAttemptStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn task_0005_stream_capture_is_bounded_without_losing_original_size() {
+        let input = vec![b'x'; 64];
+        let capture = read_bounded_capture(std::io::Cursor::new(input), 17);
+        assert_eq!(capture.text.len(), 17);
+        assert_eq!(capture.original_bytes, 64);
+        assert!(capture.truncated);
     }
 
     #[test]
@@ -4015,6 +4541,42 @@ mod tests {
                 .expect("the test server should report whether the client half-closed"),
             "the client must not close its write half before receiving the response"
         );
+        server.join().expect("the test server should finish");
+    }
+
+    #[test]
+    fn task_0005_ollama_response_body_bound_is_enforced() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("the test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("the test server should have an address")
+            .to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the test server should accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("the stream should clone"));
+            loop {
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("the test server should read the request");
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let body = "x".repeat(MAX_OLLAMA_RESPONSE_BYTES + 1);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .and_then(|_| stream.write_all(body.as_bytes()))
+                .and_then(|_| stream.flush())
+                .expect("the test server should return its oversized response");
+        });
+
+        let error = ollama_request_at(&address, "GET", "/api/tags", None).unwrap_err();
+        assert!(error.contains("response body exceeded"));
         server.join().expect("the test server should finish");
     }
 

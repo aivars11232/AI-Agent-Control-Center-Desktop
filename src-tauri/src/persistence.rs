@@ -10,10 +10,17 @@ use crate::authorization::{
     ApprovalResolution, AuthorizationGrant, AuthorizationOutcome,
 };
 use crate::policy::{evaluate_policy, ActionIntent, PolicyDisposition, PolicyEvaluation};
+use crate::run_coordinator::{
+    bound_diff, bound_paths, validate_request_id, BoundedText, RunAttemptMode,
+    RunAttemptProjection, RunAttemptStatus, RunCompletion, RunCoordinatorSnapshot,
+    RunEventProjection, RunTruncationEvidence, RunUsage, MAX_ERROR_BYTES, MAX_PROGRESS_BYTES,
+    MAX_PROGRESS_EVENTS, MAX_PROGRESS_MESSAGE_BYTES, MAX_RECENT_ATTEMPTS, MAX_RETAINED_ATTEMPTS,
+    MAX_RETAINED_PAYLOAD_BYTES, MAX_STDERR_CAPTURE_BYTES, MAX_SUMMARY_BYTES,
+};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::Path,
     sync::{Arc, Mutex},
@@ -23,7 +30,16 @@ use std::{
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_application_state.sql");
 const AUTHORIZATION_MIGRATION: &str =
     include_str!("../migrations/0002_authoritative_approvals.sql");
+const RUN_COORDINATION_MIGRATION: &str = include_str!("../migrations/0003_run_coordination.sql");
 const MAX_AUTHORIZATION_RECORDS: i64 = 10_000;
+
+#[derive(Debug, Clone)]
+pub struct RunAdmission {
+    pub attempt: RunAttemptProjection,
+    pub authorization: Option<AuthorizationGrant>,
+    pub application_state: ApplicationState,
+    pub duplicate: bool,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -238,6 +254,76 @@ impl PersistenceService {
             .await
     }
 
+    pub async fn run_snapshot(&self) -> PersistenceResult<RunCoordinatorSnapshot> {
+        self.run(StateRepository::run_snapshot).await
+    }
+
+    pub async fn admit_run(
+        &self,
+        request_id: String,
+        intent: ActionIntent,
+    ) -> PersistenceResult<RunAdmission> {
+        self.run(move |repository| repository.admit_run(&request_id, &intent))
+            .await
+    }
+
+    pub async fn prepare_run_attempt(
+        &self,
+        attempt_id: i64,
+        provider: String,
+        model: String,
+        workspace_id: Option<String>,
+    ) -> PersistenceResult<RunAttemptProjection> {
+        self.run(move |repository| {
+            repository.prepare_run_attempt(attempt_id, &provider, &model, workspace_id.as_deref())
+        })
+        .await
+    }
+
+    pub async fn request_run_cancellation(
+        &self,
+        attempt_id: i64,
+    ) -> PersistenceResult<RunAttemptProjection> {
+        self.run(move |repository| repository.request_run_cancellation(attempt_id))
+            .await
+    }
+
+    pub async fn complete_run(
+        &self,
+        attempt_id: i64,
+        completion: RunCompletion,
+    ) -> PersistenceResult<RunAttemptProjection> {
+        self.run(move |repository| repository.complete_run(attempt_id, &completion))
+            .await
+    }
+
+    pub(crate) fn run_snapshot_blocking(&self) -> PersistenceResult<RunCoordinatorSnapshot> {
+        self.with_repository(StateRepository::run_snapshot)
+    }
+
+    pub(crate) fn mark_run_dispatching_blocking(
+        &self,
+        attempt_id: i64,
+    ) -> PersistenceResult<RunAttemptProjection> {
+        self.with_repository(|repository| repository.mark_run_dispatching(attempt_id))
+    }
+
+    pub(crate) fn mark_run_started_blocking(
+        &self,
+        attempt_id: i64,
+    ) -> PersistenceResult<RunAttemptProjection> {
+        self.with_repository(|repository| repository.mark_run_started(attempt_id))
+    }
+
+    pub(crate) fn record_run_event_blocking(
+        &self,
+        attempt_id: i64,
+        kind: &str,
+        message: &str,
+    ) -> PersistenceResult<RunEventProjection> {
+        self.with_repository(|repository| repository.record_run_event(attempt_id, kind, message))
+    }
+
     async fn run<T, F>(&self, operation: F) -> PersistenceResult<T>
     where
         T: Send + 'static,
@@ -283,6 +369,7 @@ impl StateRepository {
         repository.verify_supported_schema_version()?;
         repository.configure_write_durability(false)?;
         repository.apply_migrations()?;
+        repository.reconcile_interrupted_runs()?;
         Ok(repository)
     }
 
@@ -295,6 +382,7 @@ impl StateRepository {
         repository.verify_supported_schema_version()?;
         repository.configure_write_durability(true)?;
         repository.apply_migrations()?;
+        repository.reconcile_interrupted_runs()?;
         Ok(repository)
     }
 
@@ -462,6 +550,7 @@ impl StateRepository {
             .map_err(PersistenceError::database)?;
         let meta = application_meta_from(&transaction)?;
         ensure_expected_revision(&meta, expected_revision)?;
+        ensure_run_mutation_idle(&transaction)?;
         let current = read_application_state(&transaction)?;
         let state = application_state_from_legacy_backup(backup_json, &current)
             .map_err(PersistenceError::validation)?;
@@ -504,15 +593,18 @@ impl StateRepository {
         state: &ApplicationState,
         security_change_confirmed: bool,
     ) -> PersistenceResult<SaveReceipt> {
-        validate_application_state(state).map_err(PersistenceError::validation)?;
+        let timestamp = now_unix_ms()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(PersistenceError::database)?;
         let meta = application_meta_from(&transaction)?;
         ensure_expected_revision(&meta, expected_revision)?;
+        expire_authoritative_approvals(&transaction, timestamp)?;
         let current = read_application_state(&transaction)?;
-        if let Some(summary) = protected_security_change_summary(&current, state) {
+        let protected_state = protect_run_owned_state(&transaction, &current, state, timestamp)?;
+        validate_application_state(&protected_state).map_err(PersistenceError::validation)?;
+        if let Some(summary) = protected_security_change_summary(&current, &protected_state) {
             if !security_change_confirmed {
                 return Err(PersistenceError::new(
                     "NATIVE_CONFIRMATION_REQUIRED",
@@ -525,7 +617,7 @@ impl StateRepository {
         }
         write_application_state(
             &transaction,
-            state,
+            &protected_state,
             "renderer_prototype",
             &HashMap::new(),
             false,
@@ -582,6 +674,8 @@ impl StateRepository {
             .map_err(PersistenceError::database)?;
         let meta = application_meta_from(&transaction)?;
         ensure_expected_revision(&meta, expected_revision)?;
+        ensure_run_mutation_idle(&transaction)?;
+        clear_run_coordination(&transaction)?;
         write_application_state(&transaction, &state, "fresh", &HashMap::new(), true)?;
         let revision = next_revision(meta.state_revision)?;
         transaction
@@ -808,6 +902,691 @@ impl StateRepository {
         Ok((AuthorizationGrant::consumed(approval), state))
     }
 
+    pub fn run_snapshot(&mut self) -> PersistenceResult<RunCoordinatorSnapshot> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(PersistenceError::database)?;
+        let (
+            revision,
+            active_attempt_id,
+            retained_attempt_count,
+            retained_payload_bytes,
+            pruned_attempt_count,
+            last_pruned_at_unix_ms,
+        ) = transaction
+            .query_row(
+                "SELECT revision, active_attempt_id, retained_attempt_count,
+                        retained_payload_bytes, pruned_attempt_count, last_pruned_at_unix_ms
+                 FROM run_coordinator_meta WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .map_err(PersistenceError::database)?;
+        let active_attempt = active_attempt_id
+            .map(|attempt_id| read_run_attempt(&transaction, attempt_id))
+            .transpose()?;
+        let recent_ids = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id FROM run_attempts
+                     WHERE status IN ('succeeded', 'cancelled', 'timed_out', 'startup_failed',
+                                      'failed', 'interrupted')
+                     ORDER BY id DESC LIMIT ?1",
+                )
+                .map_err(PersistenceError::database)?;
+            collect_rows(statement.query_map([MAX_RECENT_ATTEMPTS], |row| row.get(0)))?
+        };
+        let recent_attempts = recent_ids
+            .into_iter()
+            .map(|attempt_id| read_run_attempt(&transaction, attempt_id))
+            .collect::<PersistenceResult<Vec<_>>>()?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(RunCoordinatorSnapshot {
+            revision,
+            active_attempt,
+            recent_attempts,
+            retained_attempt_count: nonnegative_u64(retained_attempt_count)?,
+            retained_payload_bytes: nonnegative_u64(retained_payload_bytes)?,
+            pruned_attempt_count: nonnegative_u64(pruned_attempt_count)?,
+            last_pruned_at_unix_ms,
+        })
+    }
+
+    pub fn admit_run(
+        &mut self,
+        request_id: &str,
+        intent: &ActionIntent,
+    ) -> PersistenceResult<RunAdmission> {
+        validate_request_id(request_id)
+            .map_err(|message| PersistenceError::new("INVALID_RUN_REQUEST_ID", message, true))?;
+        let (agent_id, task_owner_agent_id, task_id, run_mode) = run_intent_parts(intent)?;
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_state_initialized(&transaction)?;
+        expire_authoritative_approvals(&transaction, timestamp)?;
+        let state = read_application_state(&transaction)?;
+        let intent_json = serde_json::to_string(intent).map_err(|_| {
+            PersistenceError::new(
+                "INVALID_INTENT",
+                "The run intent could not be normalized for admission.",
+                true,
+            )
+        })?;
+
+        let duplicate: Option<(i64, String)> = transaction
+            .query_row(
+                "SELECT id, intent_json FROM run_attempts WHERE request_id = ?1",
+                [request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(PersistenceError::database)?;
+        if let Some((attempt_id, stored_intent)) = duplicate {
+            if stored_intent != intent_json {
+                return Err(PersistenceError::new(
+                    "RUN_IDEMPOTENCY_CONFLICT",
+                    "The run request identifier is already bound to a different action.",
+                    false,
+                ));
+            }
+            let attempt = read_run_attempt(&transaction, attempt_id)?;
+            let authorization = attempt
+                .approval_id
+                .map(|approval_id| read_approval_request(&transaction, approval_id))
+                .transpose()?
+                .map(|approval| AuthorizationGrant {
+                    approval: Some(approval),
+                });
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(RunAdmission {
+                attempt,
+                authorization,
+                application_state: state,
+                duplicate: true,
+            });
+        }
+
+        let active_attempt_id: Option<i64> = transaction
+            .query_row(
+                "SELECT active_attempt_id FROM run_coordinator_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        let orphan_nonterminal: Option<i64> = transaction
+            .query_row(
+                "SELECT id FROM run_attempts
+                 WHERE status IN ('admitted', 'starting', 'dispatching', 'running',
+                                  'cancel_requested')
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(PersistenceError::database)?;
+        if active_attempt_id.is_some() || orphan_nonterminal.is_some() {
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Err(PersistenceError::new(
+                "RUN_BUSY",
+                "Another AI run is active. Stop it or wait for it to finish before retrying.",
+                true,
+            ));
+        }
+
+        let evaluation = evaluate_policy(&state, intent).map_err(policy_denial)?;
+        let approval_id = if evaluation.disposition == PolicyDisposition::ApprovalRequired {
+            let Some(approval_id) =
+                find_matching_approved_approval(&transaction, &evaluation, timestamp)?
+            else {
+                let error = missing_approval_error(&transaction, &evaluation, timestamp)?;
+                transaction.commit().map_err(PersistenceError::database)?;
+                return Err(error);
+            };
+            Some(approval_id)
+        } else {
+            None
+        };
+        let task = state
+            .agents
+            .iter()
+            .find(|agent| agent.id == task_owner_agent_id)
+            .and_then(|owner| owner.tasks.iter().find(|task| task.id == task_id))
+            .ok_or_else(|| {
+                PersistenceError::new(
+                    "TASK_NOT_FOUND",
+                    "The selected task no longer exists.",
+                    true,
+                )
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO run_attempts
+                 (request_id, intent_json, intent_fingerprint, policy_fingerprint,
+                  workspace_fingerprint, agent_id, task_owner_agent_id, task_id, task_title,
+                  run_mode, status, workspace_id, approval_id, task_status_before,
+                  task_phase_before, review_status_before, admitted_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'admitted',
+                         ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    request_id,
+                    intent_json,
+                    evaluation.intent_fingerprint,
+                    evaluation.policy_fingerprint,
+                    evaluation.workspace_fingerprint,
+                    agent_id,
+                    task_owner_agent_id,
+                    task_id,
+                    task.title,
+                    run_mode.as_str(),
+                    evaluation.workspace_id,
+                    approval_id,
+                    task.status,
+                    task.phase,
+                    task.review_status,
+                    timestamp
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        let attempt_id = transaction.last_insert_rowid();
+        if let Some(approval_id) = approval_id {
+            transaction
+                .execute(
+                    "INSERT INTO run_approval_reservations
+                     (attempt_id, approval_id, created_at_unix_ms) VALUES (?1, ?2, ?3)",
+                    params![attempt_id, approval_id, timestamp],
+                )
+                .map_err(PersistenceError::database)?;
+        }
+        transaction
+            .execute(
+                "UPDATE run_coordinator_meta
+                 SET active_attempt_id = ?1, revision = revision + 1
+                 WHERE singleton = 1 AND active_attempt_id IS NULL",
+                [attempt_id],
+            )
+            .map_err(PersistenceError::database)?;
+        refresh_run_retention_meta(&transaction)?;
+        let attempt = read_run_attempt(&transaction, attempt_id)?;
+        let authorization = approval_id
+            .map(|id| read_approval_request(&transaction, id))
+            .transpose()?
+            .map(|approval| AuthorizationGrant {
+                approval: Some(approval),
+            });
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(RunAdmission {
+            attempt,
+            authorization,
+            application_state: state,
+            duplicate: false,
+        })
+    }
+
+    pub fn prepare_run_attempt(
+        &mut self,
+        attempt_id: i64,
+        provider: &str,
+        model: &str,
+        workspace_id: Option<&str>,
+    ) -> PersistenceResult<RunAttemptProjection> {
+        validate_run_label("provider", provider)?;
+        validate_run_label("model", model)?;
+        if let Some(workspace_id) = workspace_id {
+            validate_run_label("workspace identifier", workspace_id)?;
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let current = read_run_attempt(&transaction, attempt_id)?;
+        if current.status == RunAttemptStatus::Starting
+            && current.provider.as_deref() == Some(provider)
+            && current.model.as_deref() == Some(model)
+            && current.workspace_id.as_deref() == workspace_id
+        {
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(current);
+        }
+        ensure_active_attempt(&transaction, attempt_id)?;
+        ensure_run_transition(current.status, RunAttemptStatus::Starting)?;
+        transaction
+            .execute(
+                "UPDATE run_attempts
+                 SET status = 'starting', provider = ?1, model = ?2, workspace_id = ?3
+                 WHERE id = ?4 AND status = 'admitted'",
+                params![provider, model, workspace_id, attempt_id],
+            )
+            .map_err(PersistenceError::database)?;
+        advance_run_revision(&transaction)?;
+        let attempt = read_run_attempt(&transaction, attempt_id)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(attempt)
+    }
+
+    pub fn mark_run_dispatching(
+        &mut self,
+        attempt_id: i64,
+    ) -> PersistenceResult<RunAttemptProjection> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let current = read_run_attempt(&transaction, attempt_id)?;
+        if matches!(
+            current.status,
+            RunAttemptStatus::Dispatching
+                | RunAttemptStatus::Running
+                | RunAttemptStatus::CancelRequested
+        ) {
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(current);
+        }
+        ensure_active_attempt(&transaction, attempt_id)?;
+        ensure_run_transition(current.status, RunAttemptStatus::Dispatching)?;
+        transaction
+            .execute(
+                "UPDATE run_attempts SET status = 'dispatching'
+                 WHERE id = ?1 AND status = 'starting'",
+                [attempt_id],
+            )
+            .map_err(PersistenceError::database)?;
+        advance_run_revision(&transaction)?;
+        let attempt = read_run_attempt(&transaction, attempt_id)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(attempt)
+    }
+
+    pub fn mark_run_started(&mut self, attempt_id: i64) -> PersistenceResult<RunAttemptProjection> {
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_active_attempt(&transaction, attempt_id)?;
+        let current = read_run_attempt(&transaction, attempt_id)?;
+        if current.started_at_unix_ms.is_some() {
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(current);
+        }
+        if !matches!(
+            current.status,
+            RunAttemptStatus::Dispatching | RunAttemptStatus::CancelRequested
+        ) {
+            ensure_run_transition(current.status, RunAttemptStatus::Running)?;
+        }
+        consume_reserved_run_approval(&transaction, attempt_id, timestamp)?;
+        let next_status = if current.status == RunAttemptStatus::CancelRequested {
+            RunAttemptStatus::CancelRequested
+        } else {
+            RunAttemptStatus::Running
+        };
+        transaction
+            .execute(
+                "UPDATE run_attempts SET status = ?1, started_at_unix_ms = ?2
+                 WHERE id = ?3 AND started_at_unix_ms IS NULL",
+                params![next_status.as_str(), timestamp, attempt_id],
+            )
+            .map_err(PersistenceError::database)?;
+        project_run_started_to_task(&transaction, &current)?;
+        advance_run_revision(&transaction)?;
+        let attempt = read_run_attempt(&transaction, attempt_id)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(attempt)
+    }
+
+    pub fn request_run_cancellation(
+        &mut self,
+        attempt_id: i64,
+    ) -> PersistenceResult<RunAttemptProjection> {
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let current = read_run_attempt(&transaction, attempt_id)?;
+        if current.status.is_terminal() || current.status == RunAttemptStatus::CancelRequested {
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(current);
+        }
+        ensure_active_attempt(&transaction, attempt_id)?;
+        ensure_run_transition(current.status, RunAttemptStatus::CancelRequested)?;
+        transaction
+            .execute(
+                "UPDATE run_attempts
+                 SET status = 'cancel_requested', cancel_requested_at_unix_ms = ?1
+                 WHERE id = ?2 AND status = ?3",
+                params![timestamp, attempt_id, current.status.as_str()],
+            )
+            .map_err(PersistenceError::database)?;
+        advance_run_revision(&transaction)?;
+        let attempt = read_run_attempt(&transaction, attempt_id)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(attempt)
+    }
+
+    pub fn record_run_event(
+        &mut self,
+        attempt_id: i64,
+        kind: &str,
+        message: &str,
+    ) -> PersistenceResult<RunEventProjection> {
+        if !matches!(kind, "status" | "progress" | "complete" | "error") {
+            return Err(PersistenceError::new(
+                "INVALID_RUN_EVENT",
+                "The run event kind is invalid.",
+                true,
+            ));
+        }
+        let timestamp = now_unix_ms()?;
+        let bounded = BoundedText::from_text(message, MAX_PROGRESS_MESSAGE_BYTES);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let attempt = read_run_attempt(&transaction, attempt_id)?;
+        if attempt.status.is_terminal() {
+            return Err(PersistenceError::new(
+                "RUN_EVENT_STALE",
+                "A completed run cannot accept additional events.",
+                true,
+            ));
+        }
+        ensure_active_attempt(&transaction, attempt_id)?;
+        let (event_count, progress_bytes, omitted_count, next_sequence): (i64, i64, i64, i64) =
+            transaction
+                .query_row(
+                    "SELECT progress_event_count, progress_bytes,
+                            omitted_progress_event_count,
+                            COALESCE((SELECT MAX(sequence) FROM run_events
+                                      WHERE attempt_id = run_attempts.id), 0) + 1
+                     FROM run_attempts WHERE id = ?1",
+                    [attempt_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(PersistenceError::database)?;
+        let bounded_bytes = i64::try_from(bounded.as_str().len()).unwrap_or(i64::MAX);
+        let omitted = event_count >= MAX_PROGRESS_EVENTS
+            || progress_bytes.saturating_add(bounded_bytes) > MAX_PROGRESS_BYTES;
+        let (sequence, projected_message, projected_truncated) = if omitted {
+            transaction
+                .execute(
+                    "UPDATE run_attempts
+                     SET progress_truncated = 1,
+                         omitted_progress_event_count = omitted_progress_event_count + 1
+                     WHERE id = ?1",
+                    [attempt_id],
+                )
+                .map_err(PersistenceError::database)?;
+            (
+                next_sequence.saturating_add(omitted_count),
+                "Additional run progress was omitted after reaching the storage bound.".to_string(),
+                true,
+            )
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO run_events
+                     (attempt_id, sequence, kind, message, message_truncated,
+                      created_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        attempt_id,
+                        next_sequence,
+                        kind,
+                        bounded.as_str(),
+                        bounded.truncated() as i64,
+                        timestamp
+                    ],
+                )
+                .map_err(PersistenceError::database)?;
+            transaction
+                .execute(
+                    "UPDATE run_attempts
+                     SET progress_event_count = progress_event_count + 1,
+                         progress_bytes = progress_bytes + ?1,
+                         payload_bytes = payload_bytes + ?1,
+                         progress_truncated = MAX(progress_truncated, ?2)
+                     WHERE id = ?3",
+                    params![bounded_bytes, bounded.truncated() as i64, attempt_id],
+                )
+                .map_err(PersistenceError::database)?;
+            (
+                next_sequence,
+                bounded.as_str().to_string(),
+                bounded.truncated(),
+            )
+        };
+        let revision = advance_run_revision(&transaction)?;
+        refresh_run_retention_meta(&transaction)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(RunEventProjection {
+            coordinator_revision: revision,
+            attempt_id,
+            request_id: attempt.request_id,
+            sequence,
+            kind: kind.to_string(),
+            status: attempt.status,
+            message: projected_message,
+            message_truncated: projected_truncated,
+            created_at_unix_ms: timestamp,
+        })
+    }
+
+    pub fn complete_run(
+        &mut self,
+        attempt_id: i64,
+        completion: &RunCompletion,
+    ) -> PersistenceResult<RunAttemptProjection> {
+        if !completion.status.is_terminal() {
+            return Err(PersistenceError::new(
+                "INVALID_RUN_COMPLETION",
+                "Run completion requires a terminal status.",
+                false,
+            ));
+        }
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let current = read_run_attempt(&transaction, attempt_id)?;
+        if current.status.is_terminal() {
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(current);
+        }
+        ensure_active_attempt(&transaction, attempt_id)?;
+        let terminal_status = if current.status == RunAttemptStatus::CancelRequested {
+            RunAttemptStatus::Cancelled
+        } else {
+            completion.status
+        };
+        ensure_run_transition(current.status, terminal_status)?;
+
+        let summary = completion
+            .output_summary
+            .as_deref()
+            .map(|value| BoundedText::from_text(value, MAX_SUMMARY_BYTES));
+        let stderr = completion
+            .stderr_excerpt
+            .as_deref()
+            .map(|value| BoundedText::from_text(value, MAX_STDERR_CAPTURE_BYTES));
+        let error_message = completion
+            .error_message
+            .as_deref()
+            .map(|value| BoundedText::from_text(value, MAX_ERROR_BYTES));
+        let bounded_paths = bound_paths(completion.changed_files.clone());
+        let (diff, original_diff_bytes, diff_truncated) = bound_diff(completion.diff.clone());
+        let changed_files_json = serde_json::to_string(&bounded_paths.paths).map_err(|_| {
+            PersistenceError::new(
+                "INVALID_RUN_COMPLETION",
+                "Changed-file evidence could not be normalized.",
+                false,
+            )
+        })?;
+        let mut truncation = completion.truncation.clone();
+        if let Some(summary) = &summary {
+            truncation.summary_truncated |= summary.truncated();
+            truncation.original_summary_bytes = truncation
+                .original_summary_bytes
+                .max(summary.original_bytes() as u64);
+        }
+        if let Some(stderr) = &stderr {
+            truncation.stderr_truncated |= stderr.truncated();
+            truncation.original_stderr_bytes = truncation
+                .original_stderr_bytes
+                .max(stderr.original_bytes() as u64);
+        }
+        if let Some(error) = &error_message {
+            truncation.summary_truncated |= error.truncated();
+            truncation.original_summary_bytes = truncation
+                .original_summary_bytes
+                .max(error.original_bytes() as u64);
+        }
+        truncation.diff_truncated |= diff_truncated;
+        truncation.original_diff_bytes = truncation
+            .original_diff_bytes
+            .max(original_diff_bytes as u64);
+        truncation.changed_files_truncated |= bounded_paths.truncated;
+        truncation.original_changed_file_count = truncation
+            .original_changed_file_count
+            .max(bounded_paths.original_count as u64);
+        let progress_evidence: (i64, i64, i64) = transaction
+            .query_row(
+                "SELECT progress_truncated, omitted_progress_event_count, progress_bytes
+                 FROM run_attempts WHERE id = ?1",
+                [attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(PersistenceError::database)?;
+        truncation.progress_truncated |= progress_evidence.0 != 0;
+        truncation.omitted_progress_event_count = truncation
+            .omitted_progress_event_count
+            .max(nonnegative_u64(progress_evidence.1)?);
+
+        let summary_text = summary.as_ref().map(|value| value.as_str());
+        let stderr_text = stderr.as_ref().map(|value| value.as_str());
+        let error_text = error_message.as_ref().map(|value| value.as_str());
+        let payload_bytes = run_payload_bytes(
+            summary_text,
+            stderr_text,
+            completion.response_id.as_deref(),
+            &changed_files_json,
+            diff.as_deref(),
+            completion.error_code.as_deref(),
+            error_text,
+        )?
+        .checked_add(progress_evidence.2)
+        .ok_or_else(|| {
+            PersistenceError::new(
+                "RUN_OUTPUT_TOO_LARGE",
+                "Run output size could not be represented safely.",
+                false,
+            )
+        })?;
+        transaction
+            .execute(
+                "UPDATE run_attempts
+                 SET status = ?1, completed_at_unix_ms = ?2, duration_seconds = ?3,
+                     output_summary = ?4, stderr_excerpt = ?5, response_id = ?6,
+                     model = COALESCE(?7, model), input_tokens = ?8, output_tokens = ?9,
+                     total_tokens = ?10, changed_files_json = ?11, diff = ?12,
+                     error_code = ?13, error_message = ?14, payload_bytes = ?15,
+                     stdout_truncated = ?16, stderr_truncated = ?17,
+                     summary_truncated = ?18, diff_truncated = ?19,
+                     changed_files_truncated = ?20, progress_truncated = ?21,
+                     before_snapshot_truncated = ?22, after_snapshot_truncated = ?23,
+                     original_stdout_bytes = ?24, original_stderr_bytes = ?25,
+                     original_summary_bytes = ?26, original_diff_bytes = ?27,
+                     original_changed_file_count = ?28,
+                     omitted_progress_event_count = ?29, recovery_disposition = ?30
+                 WHERE id = ?31 AND status = ?32",
+                params![
+                    terminal_status.as_str(),
+                    timestamp,
+                    bounded_i64(completion.duration_seconds),
+                    summary_text,
+                    stderr_text,
+                    completion.response_id,
+                    completion.runtime_model,
+                    optional_bounded_i64(completion.usage.input_tokens),
+                    optional_bounded_i64(completion.usage.output_tokens),
+                    optional_bounded_i64(completion.usage.total_tokens),
+                    changed_files_json,
+                    diff,
+                    completion.error_code,
+                    error_text,
+                    payload_bytes,
+                    truncation.stdout_truncated as i64,
+                    truncation.stderr_truncated as i64,
+                    truncation.summary_truncated as i64,
+                    truncation.diff_truncated as i64,
+                    truncation.changed_files_truncated as i64,
+                    truncation.progress_truncated as i64,
+                    truncation.before_snapshot_truncated as i64,
+                    truncation.after_snapshot_truncated as i64,
+                    bounded_i64(truncation.original_stdout_bytes),
+                    bounded_i64(truncation.original_stderr_bytes),
+                    bounded_i64(truncation.original_summary_bytes),
+                    bounded_i64(truncation.original_diff_bytes),
+                    bounded_i64(truncation.original_changed_file_count),
+                    bounded_i64(truncation.omitted_progress_event_count),
+                    completion.recovery_disposition,
+                    attempt_id,
+                    current.status.as_str()
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        project_run_completion_to_task(
+            &transaction,
+            &current,
+            terminal_status,
+            summary_text,
+            completion.response_id.as_deref(),
+            completion
+                .runtime_model
+                .as_deref()
+                .or(current.model.as_deref()),
+            completion.usage.total_tokens,
+            &bounded_paths.paths,
+            diff.as_deref(),
+            completion.duration_seconds,
+            timestamp,
+            completion.recovery_disposition.as_deref(),
+        )?;
+        transaction
+            .execute(
+                "DELETE FROM run_approval_reservations WHERE attempt_id = ?1",
+                [attempt_id],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction
+            .execute(
+                "UPDATE run_coordinator_meta
+                 SET active_attempt_id = NULL, revision = revision + 1
+                 WHERE singleton = 1 AND active_attempt_id = ?1",
+                [attempt_id],
+            )
+            .map_err(PersistenceError::database)?;
+        prune_run_history(&transaction, timestamp)?;
+        refresh_run_retention_meta(&transaction)?;
+        let attempt = read_run_attempt(&transaction, attempt_id)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(attempt)
+    }
+
     fn configure_connection_preflight(&self) -> PersistenceResult<()> {
         self.connection
             .busy_timeout(Duration::from_secs(5))
@@ -890,6 +1669,11 @@ impl StateRepository {
                     2,
                     "authoritative_approval_lifecycle",
                     AUTHORIZATION_MIGRATION,
+                )?,
+                2 => self.apply_migration(
+                    3,
+                    "authoritative_run_coordination",
+                    RUN_COORDINATION_MIGRATION,
                 )?,
                 version => {
                     return Err(PersistenceError::new(
@@ -1031,6 +1815,1143 @@ impl StateRepository {
             true,
         ))
     }
+
+    fn reconcile_interrupted_runs(&mut self) -> PersistenceResult<()> {
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let meta = application_meta_from(&transaction)?;
+        if !meta.initialized {
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(());
+        }
+
+        let interrupted_ids = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id FROM run_attempts
+                     WHERE status IN ('admitted', 'starting', 'dispatching', 'running',
+                                      'cancel_requested')
+                     ORDER BY id",
+                )
+                .map_err(PersistenceError::database)?;
+            collect_rows(statement.query_map([], |row| row.get(0)))?
+        };
+        let mut changed = false;
+        let mut reconciled_tasks = HashSet::new();
+        for attempt_id in interrupted_ids {
+            let attempt = read_run_attempt(&transaction, attempt_id)?;
+            reconciled_tasks.insert((
+                attempt.task_owner_agent_id,
+                attempt.task_id,
+                attempt.run_mode.as_str().to_string(),
+            ));
+            let safe_to_retry = matches!(
+                attempt.status,
+                RunAttemptStatus::Admitted | RunAttemptStatus::Starting
+            );
+            if !safe_to_retry {
+                invalidate_reserved_run_approval(&transaction, attempt_id, timestamp)?;
+            }
+            let recovery_disposition = if safe_to_retry {
+                "safe_to_retry"
+            } else {
+                "manual_review_required"
+            };
+            let message = if safe_to_retry {
+                "The application restarted before provider dispatch. The task is safe to retry."
+            } else {
+                "The application restarted after dispatch could have begun. Inspect the workspace before retrying."
+            };
+            transaction
+                .execute(
+                    "UPDATE run_attempts
+                     SET status = 'interrupted', completed_at_unix_ms = ?1,
+                         error_code = 'RUN_INTERRUPTED', error_message = ?2,
+                         recovery_disposition = ?3, payload_bytes = ?4
+                     WHERE id = ?5 AND status = ?6",
+                    params![
+                        timestamp,
+                        message,
+                        recovery_disposition,
+                        message.len() as i64,
+                        attempt_id,
+                        attempt.status.as_str()
+                    ],
+                )
+                .map_err(PersistenceError::database)?;
+            project_recovered_attempt_to_task(&transaction, &attempt, safe_to_retry)?;
+            transaction
+                .execute(
+                    "DELETE FROM run_approval_reservations WHERE attempt_id = ?1",
+                    [attempt_id],
+                )
+                .map_err(PersistenceError::database)?;
+            changed = true;
+        }
+
+        let legacy_running_tasks = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT owner_agent_id, id, title, assigned_agent_id, status, phase,
+                            review_agent_id, review_status
+                     FROM agent_tasks
+                     WHERE status = 'Running' OR review_status = 'Running'",
+                )
+                .map_err(PersistenceError::database)?;
+            collect_rows(statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            }))?
+        };
+        for (
+            owner_id,
+            task_id,
+            title,
+            assigned_id,
+            status,
+            phase,
+            review_agent_id,
+            review_status,
+        ) in legacy_running_tasks
+        {
+            let mode = if review_status == "Running" {
+                RunAttemptMode::Review
+            } else {
+                RunAttemptMode::Execute
+            };
+            if reconciled_tasks.contains(&(owner_id, task_id, mode.as_str().to_string())) {
+                continue;
+            }
+            let request_id = format!(
+                "recovery:{owner_id}:{task_id}:{}:{timestamp}",
+                mode.as_str()
+            );
+            let agent_id = if mode == RunAttemptMode::Review {
+                review_agent_id.unwrap_or(assigned_id)
+            } else {
+                assigned_id
+            };
+            let message = "A legacy in-progress task had no durable attempt record. Inspect the workspace before retrying.";
+            transaction
+                .execute(
+                    "INSERT INTO run_attempts
+                     (request_id, intent_json, intent_fingerprint, policy_fingerprint,
+                      workspace_fingerprint, agent_id, task_owner_agent_id, task_id,
+                      task_title, run_mode, status, task_status_before, task_phase_before,
+                      review_status_before, admitted_at_unix_ms, completed_at_unix_ms,
+                      error_code, error_message, payload_bytes, recovery_disposition)
+                     VALUES (?1, '{}', 'legacy-reconciliation', 'legacy-reconciliation',
+                             'legacy-reconciliation', ?2, ?3, ?4, ?5, ?6, 'interrupted',
+                             ?7, ?8, ?9, ?10, ?10, 'RUN_INTERRUPTED', ?11, ?12,
+                             'manual_review_required')",
+                    params![
+                        request_id,
+                        agent_id,
+                        owner_id,
+                        task_id,
+                        title,
+                        mode.as_str(),
+                        status,
+                        phase,
+                        review_status,
+                        timestamp,
+                        message,
+                        message.len() as i64
+                    ],
+                )
+                .map_err(PersistenceError::database)?;
+            let synthetic = read_run_attempt(&transaction, transaction.last_insert_rowid())?;
+            project_recovered_attempt_to_task(&transaction, &synthetic, false)?;
+            changed = true;
+        }
+
+        transaction
+            .execute(
+                "DELETE FROM run_approval_reservations
+                 WHERE attempt_id NOT IN (
+                     SELECT id FROM run_attempts
+                     WHERE status IN ('admitted', 'starting', 'dispatching', 'running',
+                                      'cancel_requested')
+                 )",
+                [],
+            )
+            .map_err(PersistenceError::database)?;
+        if changed {
+            transaction
+                .execute(
+                    "UPDATE run_coordinator_meta
+                     SET active_attempt_id = NULL, revision = revision + 1
+                     WHERE singleton = 1",
+                    [],
+                )
+                .map_err(PersistenceError::database)?;
+            prune_run_history(&transaction, timestamp)?;
+            refresh_run_retention_meta(&transaction)?;
+        }
+        transaction.commit().map_err(PersistenceError::database)
+    }
+}
+
+#[derive(Debug)]
+struct StoredRunAttempt {
+    id: i64,
+    request_id: String,
+    agent_id: i64,
+    task_owner_agent_id: i64,
+    task_id: i64,
+    task_title: String,
+    run_mode: String,
+    status: String,
+    provider: Option<String>,
+    model: Option<String>,
+    workspace_id: Option<String>,
+    approval_id: Option<i64>,
+    admitted_at_unix_ms: i64,
+    started_at_unix_ms: Option<i64>,
+    cancel_requested_at_unix_ms: Option<i64>,
+    completed_at_unix_ms: Option<i64>,
+    duration_seconds: Option<i64>,
+    output_summary: Option<String>,
+    stderr_excerpt: Option<String>,
+    response_id: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    changed_files_json: String,
+    diff: Option<String>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    progress_event_count: i64,
+    recovery_disposition: Option<String>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    summary_truncated: bool,
+    diff_truncated: bool,
+    changed_files_truncated: bool,
+    progress_truncated: bool,
+    before_snapshot_truncated: bool,
+    after_snapshot_truncated: bool,
+    original_stdout_bytes: i64,
+    original_stderr_bytes: i64,
+    original_summary_bytes: i64,
+    original_diff_bytes: i64,
+    original_changed_file_count: i64,
+    omitted_progress_event_count: i64,
+}
+
+fn map_stored_run_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRunAttempt> {
+    Ok(StoredRunAttempt {
+        id: row.get(0)?,
+        request_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        task_owner_agent_id: row.get(3)?,
+        task_id: row.get(4)?,
+        task_title: row.get(5)?,
+        run_mode: row.get(6)?,
+        status: row.get(7)?,
+        provider: row.get(8)?,
+        model: row.get(9)?,
+        workspace_id: row.get(10)?,
+        approval_id: row.get(11)?,
+        admitted_at_unix_ms: row.get(12)?,
+        started_at_unix_ms: row.get(13)?,
+        cancel_requested_at_unix_ms: row.get(14)?,
+        completed_at_unix_ms: row.get(15)?,
+        duration_seconds: row.get(16)?,
+        output_summary: row.get(17)?,
+        stderr_excerpt: row.get(18)?,
+        response_id: row.get(19)?,
+        input_tokens: row.get(20)?,
+        output_tokens: row.get(21)?,
+        total_tokens: row.get(22)?,
+        changed_files_json: row.get(23)?,
+        diff: row.get(24)?,
+        error_code: row.get(25)?,
+        error_message: row.get(26)?,
+        progress_event_count: row.get(27)?,
+        recovery_disposition: row.get(28)?,
+        stdout_truncated: row.get::<_, i64>(29)? != 0,
+        stderr_truncated: row.get::<_, i64>(30)? != 0,
+        summary_truncated: row.get::<_, i64>(31)? != 0,
+        diff_truncated: row.get::<_, i64>(32)? != 0,
+        changed_files_truncated: row.get::<_, i64>(33)? != 0,
+        progress_truncated: row.get::<_, i64>(34)? != 0,
+        before_snapshot_truncated: row.get::<_, i64>(35)? != 0,
+        after_snapshot_truncated: row.get::<_, i64>(36)? != 0,
+        original_stdout_bytes: row.get(37)?,
+        original_stderr_bytes: row.get(38)?,
+        original_summary_bytes: row.get(39)?,
+        original_diff_bytes: row.get(40)?,
+        original_changed_file_count: row.get(41)?,
+        omitted_progress_event_count: row.get(42)?,
+    })
+}
+
+const RUN_ATTEMPT_PROJECTION_QUERY: &str =
+    "SELECT id, request_id, agent_id, task_owner_agent_id, task_id, task_title,
+            run_mode, status, provider, model, workspace_id, approval_id,
+            admitted_at_unix_ms, started_at_unix_ms, cancel_requested_at_unix_ms,
+            completed_at_unix_ms, duration_seconds, output_summary, stderr_excerpt,
+            response_id, input_tokens, output_tokens, total_tokens, changed_files_json,
+            diff, error_code, error_message, progress_event_count, recovery_disposition,
+            stdout_truncated, stderr_truncated, summary_truncated, diff_truncated,
+            changed_files_truncated, progress_truncated, before_snapshot_truncated,
+            after_snapshot_truncated, original_stdout_bytes, original_stderr_bytes,
+            original_summary_bytes, original_diff_bytes, original_changed_file_count,
+            omitted_progress_event_count
+     FROM run_attempts WHERE id = ?1";
+
+fn read_run_attempt(
+    connection: &Connection,
+    attempt_id: i64,
+) -> PersistenceResult<RunAttemptProjection> {
+    let stored = connection
+        .query_row(
+            RUN_ATTEMPT_PROJECTION_QUERY,
+            [attempt_id],
+            map_stored_run_attempt,
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => PersistenceError::new(
+                "RUN_NOT_FOUND",
+                "The requested run attempt does not exist.",
+                true,
+            ),
+            other => PersistenceError::database(other),
+        })?;
+    let run_mode = RunAttemptMode::from_storage(&stored.run_mode)
+        .map_err(|message| PersistenceError::new("RUN_LEDGER_INVALID", message, false))?;
+    let status = RunAttemptStatus::from_storage(&stored.status)
+        .map_err(|message| PersistenceError::new("RUN_LEDGER_INVALID", message, false))?;
+    let changed_files =
+        serde_json::from_str::<Vec<String>>(&stored.changed_files_json).map_err(|_| {
+            PersistenceError::new(
+                "RUN_LEDGER_INVALID",
+                "Stored changed-file evidence is invalid.",
+                false,
+            )
+        })?;
+    Ok(RunAttemptProjection {
+        id: stored.id,
+        request_id: stored.request_id,
+        agent_id: stored.agent_id,
+        task_owner_agent_id: stored.task_owner_agent_id,
+        task_id: stored.task_id,
+        task_title: stored.task_title,
+        run_mode,
+        status,
+        provider: stored.provider,
+        model: stored.model,
+        workspace_id: stored.workspace_id,
+        approval_id: stored.approval_id,
+        admitted_at_unix_ms: stored.admitted_at_unix_ms,
+        started_at_unix_ms: stored.started_at_unix_ms,
+        cancel_requested_at_unix_ms: stored.cancel_requested_at_unix_ms,
+        completed_at_unix_ms: stored.completed_at_unix_ms,
+        duration_seconds: stored.duration_seconds.map(nonnegative_u64).transpose()?,
+        output_summary: stored.output_summary,
+        stderr_excerpt: stored.stderr_excerpt,
+        response_id: stored.response_id,
+        usage: RunUsage {
+            input_tokens: stored.input_tokens.map(nonnegative_u64).transpose()?,
+            output_tokens: stored.output_tokens.map(nonnegative_u64).transpose()?,
+            total_tokens: stored.total_tokens.map(nonnegative_u64).transpose()?,
+        },
+        changed_files,
+        diff: stored.diff,
+        error_code: stored.error_code,
+        error_message: stored.error_message,
+        progress_event_count: nonnegative_u64(stored.progress_event_count)?,
+        recovery_disposition: stored.recovery_disposition,
+        truncation: RunTruncationEvidence {
+            stdout_truncated: stored.stdout_truncated,
+            stderr_truncated: stored.stderr_truncated,
+            summary_truncated: stored.summary_truncated,
+            diff_truncated: stored.diff_truncated,
+            changed_files_truncated: stored.changed_files_truncated,
+            progress_truncated: stored.progress_truncated,
+            before_snapshot_truncated: stored.before_snapshot_truncated,
+            after_snapshot_truncated: stored.after_snapshot_truncated,
+            original_stdout_bytes: nonnegative_u64(stored.original_stdout_bytes)?,
+            original_stderr_bytes: nonnegative_u64(stored.original_stderr_bytes)?,
+            original_summary_bytes: nonnegative_u64(stored.original_summary_bytes)?,
+            original_diff_bytes: nonnegative_u64(stored.original_diff_bytes)?,
+            original_changed_file_count: nonnegative_u64(stored.original_changed_file_count)?,
+            omitted_progress_event_count: nonnegative_u64(stored.omitted_progress_event_count)?,
+        },
+    })
+}
+
+fn nonnegative_u64(value: i64) -> PersistenceResult<u64> {
+    u64::try_from(value).map_err(|_| {
+        PersistenceError::new(
+            "RUN_LEDGER_INVALID",
+            "Stored run metadata contains a negative value.",
+            false,
+        )
+    })
+}
+
+fn bounded_i64(value: u64) -> i64 {
+    value.min(MAX_SAFE_INTEGER as u64) as i64
+}
+
+fn optional_bounded_i64(value: Option<u64>) -> Option<i64> {
+    value.map(bounded_i64)
+}
+
+fn run_intent_parts(intent: &ActionIntent) -> PersistenceResult<(i64, i64, i64, RunAttemptMode)> {
+    match intent {
+        ActionIntent::RunTask {
+            agent_id,
+            task_owner_agent_id,
+            task_id,
+            run_mode,
+        } => Ok((
+            *agent_id,
+            *task_owner_agent_id,
+            *task_id,
+            match run_mode {
+                crate::policy::RunMode::Execute => RunAttemptMode::Execute,
+                crate::policy::RunMode::Review => RunAttemptMode::Review,
+            },
+        )),
+        _ => Err(PersistenceError::new(
+            "INVALID_RUN_INTENT",
+            "Only a task execution or review can be admitted as an AI run.",
+            true,
+        )),
+    }
+}
+
+fn validate_run_label(label: &str, value: &str) -> PersistenceResult<()> {
+    if value.trim().is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+        return Err(PersistenceError::new(
+            "INVALID_RUN_METADATA",
+            format!("The run {label} is invalid."),
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_run_transition(
+    current: RunAttemptStatus,
+    next: RunAttemptStatus,
+) -> PersistenceResult<()> {
+    if !current.may_transition_to(next) {
+        return Err(PersistenceError::new(
+            "RUN_STATE_CONFLICT",
+            format!(
+                "The run cannot transition from {} to {}.",
+                current.as_str(),
+                next.as_str()
+            ),
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_active_attempt(transaction: &Transaction<'_>, attempt_id: i64) -> PersistenceResult<()> {
+    let active_attempt_id: Option<i64> = transaction
+        .query_row(
+            "SELECT active_attempt_id FROM run_coordinator_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    if active_attempt_id != Some(attempt_id) {
+        return Err(PersistenceError::new(
+            "RUN_NOT_ACTIVE",
+            "The requested run is not the authoritative active attempt.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn advance_run_revision(transaction: &Transaction<'_>) -> PersistenceResult<i64> {
+    let current: i64 = transaction
+        .query_row(
+            "SELECT revision FROM run_coordinator_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let revision = next_revision(current)?;
+    transaction
+        .execute(
+            "UPDATE run_coordinator_meta SET revision = ?1 WHERE singleton = 1",
+            [revision],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(revision)
+}
+
+fn consume_reserved_run_approval(
+    transaction: &Transaction<'_>,
+    attempt_id: i64,
+    timestamp: i64,
+) -> PersistenceResult<()> {
+    let approval_id: Option<i64> = transaction
+        .query_row(
+            "SELECT approval_id FROM run_approval_reservations WHERE attempt_id = ?1",
+            [attempt_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(PersistenceError::database)?;
+    let Some(approval_id) = approval_id else {
+        return Ok(());
+    };
+    expire_authoritative_approvals(transaction, timestamp)?;
+    let consumed_at = format_unix_ms(timestamp);
+    let changed = transaction
+        .execute(
+            "UPDATE approval_requests
+             SET consumed_at = ?1, consumed_at_unix_ms = ?2
+             WHERE id = ?3 AND authoritative = 1 AND status = 'Approved'
+               AND consumed_at_unix_ms IS NULL AND expires_at_unix_ms > ?2
+               AND intent_fingerprint = (
+                   SELECT intent_fingerprint FROM run_attempts WHERE id = ?4)
+               AND policy_fingerprint = (
+                   SELECT policy_fingerprint FROM run_attempts WHERE id = ?4)
+               AND workspace_fingerprint = (
+                   SELECT workspace_fingerprint FROM run_attempts WHERE id = ?4)",
+            params![consumed_at, timestamp, approval_id, attempt_id],
+        )
+        .map_err(PersistenceError::database)?;
+    if changed != 1 {
+        return Err(PersistenceError::new(
+            "APPROVAL_STATE_CHANGED",
+            "The reserved approval changed before provider startup and was not consumed.",
+            true,
+        ));
+    }
+    transaction
+        .execute(
+            "DELETE FROM run_approval_reservations WHERE attempt_id = ?1",
+            [attempt_id],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+fn invalidate_reserved_run_approval(
+    transaction: &Transaction<'_>,
+    attempt_id: i64,
+    timestamp: i64,
+) -> PersistenceResult<()> {
+    let resolved_at = format_unix_ms(timestamp);
+    transaction
+        .execute(
+            "UPDATE approval_requests
+             SET status = 'Expired', resolved_at = COALESCE(resolved_at, ?1),
+                 resolved_at_unix_ms = COALESCE(resolved_at_unix_ms, ?2)
+             WHERE id = (SELECT approval_id FROM run_approval_reservations
+                         WHERE attempt_id = ?3)
+               AND authoritative = 1 AND status IN ('Pending', 'Approved')
+               AND consumed_at_unix_ms IS NULL",
+            params![resolved_at, timestamp, attempt_id],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+fn project_run_started_to_task(
+    transaction: &Transaction<'_>,
+    attempt: &RunAttemptProjection,
+) -> PersistenceResult<()> {
+    let changed = match attempt.run_mode {
+        RunAttemptMode::Execute => transaction.execute(
+            "UPDATE agent_tasks
+             SET status = 'Running', phase = 'Specialist Work', completed_at = NULL
+             WHERE owner_agent_id = ?1 AND id = ?2",
+            params![attempt.task_owner_agent_id, attempt.task_id],
+        ),
+        RunAttemptMode::Review => transaction.execute(
+            "UPDATE agent_tasks
+             SET status = 'Under Review', phase = 'Senior Review',
+                 review_agent_id = ?1, review_status = 'Running'
+             WHERE owner_agent_id = ?2 AND id = ?3",
+            params![
+                attempt.agent_id,
+                attempt.task_owner_agent_id,
+                attempt.task_id
+            ],
+        ),
+    }
+    .map_err(PersistenceError::database)?;
+    if changed != 1 {
+        return Err(PersistenceError::new(
+            "TASK_STATE_CONFLICT",
+            "The run task disappeared before startup could be recorded.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_run_completion_to_task(
+    transaction: &Transaction<'_>,
+    attempt: &RunAttemptProjection,
+    status: RunAttemptStatus,
+    summary: Option<&str>,
+    response_id: Option<&str>,
+    runtime_model: Option<&str>,
+    total_tokens: Option<u64>,
+    changed_files: &[String],
+    diff: Option<&str>,
+    duration_seconds: u64,
+    timestamp: i64,
+    recovery_disposition: Option<&str>,
+) -> PersistenceResult<()> {
+    let completed_at = format_unix_ms(timestamp);
+    match attempt.run_mode {
+        RunAttemptMode::Execute => match status {
+            RunAttemptStatus::Succeeded => {
+                let review_mode: String = transaction
+                    .query_row(
+                        "SELECT review_mode FROM preferences WHERE singleton = 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(PersistenceError::database)?;
+                let review_required = review_mode != "off";
+                transaction
+                    .execute(
+                        "UPDATE agent_tasks
+                         SET status = ?1, phase = ?2, completed_at = ?3, result = ?4,
+                             response_id = ?5, runtime_model = ?6, total_tokens = ?7,
+                             diff = ?8, duration_seconds = ?9, review_agent_id = NULL,
+                             review_status = ?10, review_model = NULL,
+                             review_duration_seconds = NULL, reviewed_at = NULL
+                         WHERE owner_agent_id = ?11 AND id = ?12",
+                        params![
+                            if review_required {
+                                "Under Review"
+                            } else {
+                                "Completed"
+                            },
+                            if review_required {
+                                "Senior Review"
+                            } else {
+                                "Finished"
+                            },
+                            if review_required {
+                                None::<String>
+                            } else {
+                                Some(completed_at.clone())
+                            },
+                            summary,
+                            response_id,
+                            runtime_model,
+                            optional_bounded_i64(total_tokens),
+                            diff,
+                            duration_seconds as f64,
+                            if review_required {
+                                "Pending"
+                            } else {
+                                "Not Requested"
+                            },
+                            attempt.task_owner_agent_id,
+                            attempt.task_id
+                        ],
+                    )
+                    .map_err(PersistenceError::database)?;
+                transaction
+                    .execute(
+                        "DELETE FROM task_changed_files
+                         WHERE owner_agent_id = ?1 AND task_id = ?2",
+                        params![attempt.task_owner_agent_id, attempt.task_id],
+                    )
+                    .map_err(PersistenceError::database)?;
+                for (position, path) in changed_files.iter().enumerate() {
+                    transaction
+                        .execute(
+                            "INSERT INTO task_changed_files
+                             (owner_agent_id, task_id, position, path)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            params![
+                                attempt.task_owner_agent_id,
+                                attempt.task_id,
+                                position as i64,
+                                path
+                            ],
+                        )
+                        .map_err(PersistenceError::database)?;
+                }
+            }
+            RunAttemptStatus::Cancelled | RunAttemptStatus::StartupFailed => {
+                transaction
+                    .execute(
+                        "UPDATE agent_tasks
+                         SET status = 'Pending', phase = 'Assigned', completed_at = NULL
+                         WHERE owner_agent_id = ?1 AND id = ?2",
+                        params![attempt.task_owner_agent_id, attempt.task_id],
+                    )
+                    .map_err(PersistenceError::database)?;
+            }
+            RunAttemptStatus::Interrupted => {
+                let safe = recovery_disposition == Some("safe_to_retry");
+                transaction
+                    .execute(
+                        "UPDATE agent_tasks SET status = ?1, phase = ?2, completed_at = NULL
+                         WHERE owner_agent_id = ?3 AND id = ?4",
+                        params![
+                            if safe { "Pending" } else { "Blocked" },
+                            if safe {
+                                "Assigned"
+                            } else {
+                                "Supervisor Approval"
+                            },
+                            attempt.task_owner_agent_id,
+                            attempt.task_id
+                        ],
+                    )
+                    .map_err(PersistenceError::database)?;
+            }
+            RunAttemptStatus::TimedOut | RunAttemptStatus::Failed => {
+                transaction
+                    .execute(
+                        "UPDATE agent_tasks
+                         SET status = 'Failed', phase = 'Failed', completed_at = ?1
+                         WHERE owner_agent_id = ?2 AND id = ?3",
+                        params![completed_at, attempt.task_owner_agent_id, attempt.task_id],
+                    )
+                    .map_err(PersistenceError::database)?;
+            }
+            _ => {
+                return Err(PersistenceError::new(
+                    "INVALID_RUN_COMPLETION",
+                    "The execution completion status is not terminal.",
+                    false,
+                ));
+            }
+        },
+        RunAttemptMode::Review => {
+            let normalized = summary.unwrap_or_default().to_ascii_lowercase();
+            let (task_status, task_phase, review_status, completed) = match status {
+                RunAttemptStatus::Succeeded if normalized.contains("verdict: approved") => {
+                    ("Completed", "Finished", "Approved", true)
+                }
+                RunAttemptStatus::Succeeded
+                    if normalized.contains("verdict: changes requested") =>
+                {
+                    ("Pending", "Assigned", "Changes Requested", false)
+                }
+                RunAttemptStatus::Cancelled | RunAttemptStatus::StartupFailed => {
+                    ("Under Review", "Senior Review", "Pending", false)
+                }
+                RunAttemptStatus::Interrupted if recovery_disposition == Some("safe_to_retry") => {
+                    ("Under Review", "Senior Review", "Pending", false)
+                }
+                _ => ("Under Review", "Senior Review", "Failed", false),
+            };
+            transaction
+                .execute(
+                    "UPDATE agent_tasks
+                     SET status = ?1, phase = ?2, completed_at = ?3,
+                         review_agent_id = ?4, review_status = ?5, review_result = ?6,
+                         review_model = ?7, review_duration_seconds = ?8, reviewed_at = ?9
+                     WHERE owner_agent_id = ?10 AND id = ?11",
+                    params![
+                        task_status,
+                        task_phase,
+                        if completed {
+                            Some(completed_at.clone())
+                        } else {
+                            None::<String>
+                        },
+                        attempt.agent_id,
+                        review_status,
+                        summary,
+                        runtime_model,
+                        duration_seconds as f64,
+                        completed_at,
+                        attempt.task_owner_agent_id,
+                        attempt.task_id
+                    ],
+                )
+                .map_err(PersistenceError::database)?;
+        }
+    }
+    Ok(())
+}
+
+fn project_recovered_attempt_to_task(
+    transaction: &Transaction<'_>,
+    attempt: &RunAttemptProjection,
+    safe_to_retry: bool,
+) -> PersistenceResult<()> {
+    match attempt.run_mode {
+        RunAttemptMode::Execute => {
+            transaction
+                .execute(
+                    "UPDATE agent_tasks SET status = ?1, phase = ?2, completed_at = NULL
+                     WHERE owner_agent_id = ?3 AND id = ?4",
+                    params![
+                        if safe_to_retry { "Pending" } else { "Blocked" },
+                        if safe_to_retry {
+                            "Assigned"
+                        } else {
+                            "Supervisor Approval"
+                        },
+                        attempt.task_owner_agent_id,
+                        attempt.task_id
+                    ],
+                )
+                .map_err(PersistenceError::database)?;
+        }
+        RunAttemptMode::Review => {
+            transaction
+                .execute(
+                    "UPDATE agent_tasks
+                     SET status = 'Under Review', phase = 'Senior Review',
+                         review_status = ?1
+                     WHERE owner_agent_id = ?2 AND id = ?3",
+                    params![
+                        if safe_to_retry { "Pending" } else { "Failed" },
+                        attempt.task_owner_agent_id,
+                        attempt.task_id
+                    ],
+                )
+                .map_err(PersistenceError::database)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_payload_bytes(
+    summary: Option<&str>,
+    stderr: Option<&str>,
+    response_id: Option<&str>,
+    changed_files_json: &str,
+    diff: Option<&str>,
+    error_code: Option<&str>,
+    error_message: Option<&str>,
+) -> PersistenceResult<i64> {
+    let total = [
+        summary,
+        stderr,
+        response_id,
+        diff,
+        error_code,
+        error_message,
+    ]
+    .into_iter()
+    .flatten()
+    .try_fold(changed_files_json.len(), |total, value| {
+        total.checked_add(value.len())
+    })
+    .ok_or_else(|| {
+        PersistenceError::new(
+            "RUN_OUTPUT_TOO_LARGE",
+            "Run output size could not be represented safely.",
+            false,
+        )
+    })?;
+    i64::try_from(total).map_err(|_| {
+        PersistenceError::new(
+            "RUN_OUTPUT_TOO_LARGE",
+            "Run output size exceeds the supported range.",
+            false,
+        )
+    })
+}
+
+fn refresh_run_retention_meta(transaction: &Transaction<'_>) -> PersistenceResult<()> {
+    let (count, payload): (i64, i64) = transaction
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM run_attempts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(PersistenceError::database)?;
+    transaction
+        .execute(
+            "UPDATE run_coordinator_meta
+             SET retained_attempt_count = ?1, retained_payload_bytes = ?2
+             WHERE singleton = 1",
+            params![count, payload],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+fn prune_run_history(transaction: &Transaction<'_>, timestamp: i64) -> PersistenceResult<()> {
+    let mut pruned = 0_i64;
+    loop {
+        let (count, payload): (i64, i64) = transaction
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM run_attempts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(PersistenceError::database)?;
+        if count <= MAX_RETAINED_ATTEMPTS && payload <= MAX_RETAINED_PAYLOAD_BYTES {
+            break;
+        }
+        let oldest_terminal: Option<i64> = transaction
+            .query_row(
+                "SELECT id FROM run_attempts
+                 WHERE status IN ('succeeded', 'cancelled', 'timed_out', 'startup_failed',
+                                  'failed', 'interrupted')
+                 ORDER BY completed_at_unix_ms, id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(PersistenceError::database)?;
+        let Some(attempt_id) = oldest_terminal else {
+            return Err(PersistenceError::new(
+                "RUN_HISTORY_LIMIT",
+                "Active run data alone exceeds the durable ledger bound.",
+                false,
+            ));
+        };
+        transaction
+            .execute("DELETE FROM run_attempts WHERE id = ?1", [attempt_id])
+            .map_err(PersistenceError::database)?;
+        pruned = pruned.saturating_add(1);
+    }
+    if pruned > 0 {
+        transaction
+            .execute(
+                "UPDATE run_coordinator_meta
+                 SET pruned_attempt_count = pruned_attempt_count + ?1,
+                     last_pruned_at_unix_ms = ?2
+                 WHERE singleton = 1",
+                params![pruned, timestamp],
+            )
+            .map_err(PersistenceError::database)?;
+    }
+    Ok(())
+}
+
+fn ensure_run_mutation_idle(transaction: &Transaction<'_>) -> PersistenceResult<()> {
+    let busy: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM run_coordinator_meta WHERE active_attempt_id IS NOT NULL
+                 UNION ALL SELECT 1 FROM run_approval_reservations
+                 UNION ALL SELECT 1 FROM run_attempts
+                           WHERE status IN ('admitted', 'starting', 'dispatching', 'running',
+                                            'cancel_requested')
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    if busy {
+        return Err(PersistenceError::new(
+            "RUN_ACTIVE",
+            "Application state cannot be replaced while an AI run is active or reserved.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn clear_run_coordination(transaction: &Transaction<'_>) -> PersistenceResult<()> {
+    transaction
+        .execute_batch(
+            "DELETE FROM run_approval_reservations;
+             DELETE FROM run_events;
+             DELETE FROM run_attempts;
+             UPDATE run_coordinator_meta
+             SET revision = 0, active_attempt_id = NULL, retained_attempt_count = 0,
+                 retained_payload_bytes = 0, pruned_attempt_count = 0,
+                 last_pruned_at_unix_ms = NULL
+             WHERE singleton = 1;",
+        )
+        .map_err(PersistenceError::database)
+}
+
+fn protect_run_owned_state(
+    transaction: &Transaction<'_>,
+    current: &ApplicationState,
+    requested: &ApplicationState,
+    timestamp: i64,
+) -> PersistenceResult<ApplicationState> {
+    let run_owned_tasks = {
+        let mut statement = transaction
+            .prepare("SELECT DISTINCT task_owner_agent_id, task_id FROM run_attempts")
+            .map_err(PersistenceError::database)?;
+        collect_rows(
+            statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))),
+        )?
+        .into_iter()
+        .collect::<HashSet<_>>()
+    };
+    let mut locked_tasks = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT DISTINCT task_owner_agent_id, task_id FROM run_attempts
+                 WHERE status IN ('admitted', 'starting', 'dispatching', 'running',
+                                  'cancel_requested')",
+            )
+            .map_err(PersistenceError::database)?;
+        collect_rows(
+            statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))),
+        )?
+        .into_iter()
+        .collect::<HashSet<_>>()
+    };
+    let pending_run_intents = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT intent_json FROM approval_requests
+                 WHERE authoritative = 1 AND intent_kind = 'runTask'
+                   AND status IN ('Pending', 'Approved')
+                   AND consumed_at_unix_ms IS NULL AND expires_at_unix_ms > ?1",
+            )
+            .map_err(PersistenceError::database)?;
+        collect_rows(statement.query_map([timestamp], |row| row.get::<_, String>(0)))?
+    };
+    for intent_json in pending_run_intents {
+        let intent: ActionIntent = serde_json::from_str(&intent_json).map_err(|_| {
+            PersistenceError::new(
+                "MALFORMED_APPROVAL",
+                "A stored run approval intent is malformed; task state was not changed.",
+                false,
+            )
+        })?;
+        if let ActionIntent::RunTask {
+            task_owner_agent_id,
+            task_id,
+            ..
+        } = intent
+        {
+            locked_tasks.insert((task_owner_agent_id, task_id));
+        }
+    }
+
+    let current_tasks = current
+        .agents
+        .iter()
+        .flat_map(|owner| {
+            owner
+                .tasks
+                .iter()
+                .map(move |task| ((owner.id, task.id), task))
+        })
+        .collect::<HashMap<_, _>>();
+    let requested_tasks = requested
+        .agents
+        .iter()
+        .flat_map(|owner| {
+            owner
+                .tasks
+                .iter()
+                .map(move |task| ((owner.id, task.id), task))
+        })
+        .collect::<HashMap<_, _>>();
+    for key in &locked_tasks {
+        let Some(current_task) = current_tasks.get(key) else {
+            continue;
+        };
+        let Some(requested_task) = requested_tasks.get(key) else {
+            return Err(run_task_locked_error());
+        };
+        if task_run_inputs_changed(current_task, requested_task) {
+            return Err(run_task_locked_error());
+        }
+    }
+
+    let mut protected = requested.clone();
+    for owner in &mut protected.agents {
+        for task in &mut owner.tasks {
+            let key = (owner.id, task.id);
+            if let Some(current_task) = current_tasks.get(&key) {
+                if run_owned_tasks.contains(&key) || locked_tasks.contains(&key) {
+                    copy_run_owned_task_fields(task, current_task);
+                }
+            } else {
+                validate_new_task_lifecycle(task)?;
+            }
+        }
+    }
+    Ok(protected)
+}
+
+fn run_task_locked_error() -> PersistenceError {
+    PersistenceError::new(
+        "RUN_TASK_LOCKED",
+        "The task is locked by a pending approval or active run. Refresh backend state before editing it.",
+        true,
+    )
+}
+
+fn task_run_inputs_changed(current: &AgentTask, requested: &AgentTask) -> bool {
+    current.title != requested.title
+        || current.category != requested.category
+        || current.priority != requested.priority
+        || current.assigned_agent_id != requested.assigned_agent_id
+        || current.created_at != requested.created_at
+        || current.workspace_id != requested.workspace_id
+        || current.routing_mode != requested.routing_mode
+        || current.routed_from_agent_id != requested.routed_from_agent_id
+        || current.routing_reason != requested.routing_reason
+}
+
+fn copy_run_owned_task_fields(target: &mut AgentTask, source: &AgentTask) {
+    target.status.clone_from(&source.status);
+    target.phase.clone_from(&source.phase);
+    target.completed_at.clone_from(&source.completed_at);
+    target.result.clone_from(&source.result);
+    target.response_id.clone_from(&source.response_id);
+    target.runtime_model.clone_from(&source.runtime_model);
+    target.total_tokens = source.total_tokens;
+    target.changed_files.clone_from(&source.changed_files);
+    target.diff.clone_from(&source.diff);
+    target.duration_seconds = source.duration_seconds;
+    target.review_agent_id = source.review_agent_id;
+    target.review_status.clone_from(&source.review_status);
+    target.review_result.clone_from(&source.review_result);
+    target.review_model.clone_from(&source.review_model);
+    target.review_duration_seconds = source.review_duration_seconds;
+    target.reviewed_at.clone_from(&source.reviewed_at);
+}
+
+fn validate_new_task_lifecycle(task: &AgentTask) -> PersistenceResult<()> {
+    let clean = task.status == "Pending"
+        && task.phase == "Assigned"
+        && task.completed_at.is_none()
+        && task.result.is_none()
+        && task.response_id.is_none()
+        && task.runtime_model.is_none()
+        && task.total_tokens.is_none()
+        && task.changed_files.is_empty()
+        && task.diff.is_none()
+        && task.duration_seconds.is_none()
+        && task.review_agent_id.is_none()
+        && task.review_status == "Not Requested"
+        && task.review_result.is_none()
+        && task.review_model.is_none()
+        && task.review_duration_seconds.is_none()
+        && task.reviewed_at.is_none();
+    if !clean {
+        return Err(PersistenceError::new(
+            "RUN_TASK_STATE_FORGED",
+            "New tasks must begin in the pending assigned state without run or review results.",
+            true,
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_private_database_file(path: &Path) -> PersistenceResult<()> {
@@ -2630,7 +4551,8 @@ mod tests {
                 migrations,
                 vec![
                     (1, "initial_application_state".to_string()),
-                    (2, "authoritative_approval_lifecycle".to_string())
+                    (2, "authoritative_approval_lifecycle".to_string()),
+                    (3, "authoritative_run_coordination".to_string())
                 ]
             );
             let journal_mode: String = repository
@@ -2987,6 +4909,507 @@ mod tests {
         repository
     }
 
+    fn approve_authorization(repository: &mut StateRepository, intent: &ActionIntent) -> i64 {
+        let pending = repository
+            .request_authorization(intent)
+            .unwrap()
+            .approval
+            .unwrap();
+        repository
+            .resolve_approval(pending.id, ApprovalResolution::Approve, true)
+            .unwrap();
+        pending.id
+    }
+
+    fn successful_completion(output: &str) -> RunCompletion {
+        RunCompletion {
+            status: RunAttemptStatus::Succeeded,
+            output_summary: Some(output.to_string()),
+            stderr_excerpt: None,
+            response_id: Some("response-1".to_string()),
+            runtime_model: Some("runtime-model".to_string()),
+            usage: RunUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(20),
+                total_tokens: Some(30),
+            },
+            changed_files: vec!["src/example.rs".to_string()],
+            diff: Some("diff --git a/src/example.rs b/src/example.rs".to_string()),
+            duration_seconds: 3,
+            error_code: None,
+            error_message: None,
+            truncation: RunTruncationEvidence::default(),
+            recovery_disposition: None,
+        }
+    }
+
+    #[test]
+    fn task_0005_admission_is_single_idempotent_and_completion_is_immutable() {
+        let mut repository = initialized_authorization_repository();
+        let intent = authorization_intent();
+        let approval_id = approve_authorization(&mut repository, &intent);
+        let admitted = repository.admit_run("request-1", &intent).unwrap();
+        assert!(!admitted.duplicate);
+        assert_eq!(admitted.attempt.status, RunAttemptStatus::Admitted);
+        assert_eq!(admitted.attempt.approval_id, Some(approval_id));
+        let consumed_before_start: Option<i64> = repository
+            .connection
+            .query_row(
+                "SELECT consumed_at_unix_ms FROM approval_requests WHERE id = ?1",
+                [approval_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(consumed_before_start.is_none());
+
+        let duplicate = repository.admit_run("request-1", &intent).unwrap();
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.attempt.id, admitted.attempt.id);
+        assert_eq!(
+            repository.admit_run("request-2", &intent).unwrap_err().code,
+            "RUN_BUSY"
+        );
+
+        let attempt_id = admitted.attempt.id;
+        repository
+            .prepare_run_attempt(
+                attempt_id,
+                "OpenAI",
+                "codex-test",
+                Some("workspace-authorization"),
+            )
+            .unwrap();
+        repository.mark_run_dispatching(attempt_id).unwrap();
+        repository.mark_run_started(attempt_id).unwrap();
+        let consumed_after_start: Option<i64> = repository
+            .connection
+            .query_row(
+                "SELECT consumed_at_unix_ms FROM approval_requests WHERE id = ?1",
+                [approval_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(consumed_after_start.is_some());
+        assert_eq!(
+            repository.load().unwrap().unwrap().state.agents[1].tasks[0].status,
+            "Running"
+        );
+
+        let complete = repository
+            .complete_run(attempt_id, &successful_completion("Completed safely."))
+            .unwrap();
+        assert_eq!(complete.status, RunAttemptStatus::Succeeded);
+        assert!(repository.run_snapshot().unwrap().active_attempt.is_none());
+        let duplicate_completion = repository
+            .complete_run(
+                attempt_id,
+                &RunCompletion::terminal_error(
+                    RunAttemptStatus::Failed,
+                    "LATE_FAILURE",
+                    "late result",
+                    4,
+                ),
+            )
+            .unwrap();
+        assert_eq!(duplicate_completion.status, RunAttemptStatus::Succeeded);
+        let envelope = repository.load().unwrap().unwrap();
+        let mut forged_lifecycle = envelope.state;
+        forged_lifecycle.agents[1].tasks[0].status = "Pending".to_string();
+        forged_lifecycle.agents[1].tasks[0].phase = "Assigned".to_string();
+        forged_lifecycle.agents[1].tasks[0].result = Some("forged result".to_string());
+        repository
+            .save(envelope.revision, &forged_lifecycle, false)
+            .unwrap();
+        let protected_task = &repository.load().unwrap().unwrap().state.agents[1].tasks[0];
+        assert_ne!(protected_task.status, "Pending");
+        assert_eq!(protected_task.result.as_deref(), Some("Completed safely."));
+        assert_eq!(
+            repository
+                .record_run_event(attempt_id, "progress", "late")
+                .unwrap_err()
+                .code,
+            "RUN_EVENT_STALE"
+        );
+        assert!(repository
+            .connection
+            .execute(
+                "UPDATE run_attempts SET status = 'failed' WHERE id = ?1",
+                [attempt_id]
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn task_0005_concurrent_connections_admit_exactly_one_global_run() {
+        let directory = TestDirectory::new();
+        let path = directory.database_path();
+        let mut first = StateRepository::open(&path).unwrap();
+        let initialized = first.initialize_fresh().unwrap();
+        first
+            .save(initialized.revision, &authorization_state(), true)
+            .unwrap();
+        let intent = authorization_intent();
+        approve_authorization(&mut first, &intent);
+        let second = StateRepository::open(&path).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let first_barrier = barrier.clone();
+        let first_intent = intent.clone();
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first.admit_run("concurrent-first", &first_intent)
+        });
+        let second_barrier = barrier.clone();
+        let second_intent = intent.clone();
+        let second_thread = std::thread::spawn(move || {
+            let mut second = second;
+            second_barrier.wait();
+            second.admit_run("concurrent-second", &second_intent)
+        });
+        let results = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .map(|error| error.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["RUN_BUSY"]
+        );
+    }
+
+    #[test]
+    fn task_0005_startup_failure_preserves_approval_and_cancellation_is_deterministic() {
+        let mut repository = initialized_authorization_repository();
+        let intent = authorization_intent();
+        let approval_id = approve_authorization(&mut repository, &intent);
+        let envelope = repository.load().unwrap().unwrap();
+        let mut forged_pending_lifecycle = envelope.state;
+        forged_pending_lifecycle.agents[1].tasks[0].status = "Running".to_string();
+        forged_pending_lifecycle.agents[1].tasks[0].phase = "Specialist Work".to_string();
+        forged_pending_lifecycle.agents[1].tasks[0].result = Some("forged result".to_string());
+        repository
+            .save(envelope.revision, &forged_pending_lifecycle, false)
+            .unwrap();
+        let protected_task = &repository.load().unwrap().unwrap().state.agents[1].tasks[0];
+        assert_eq!(protected_task.status, "Pending");
+        assert_eq!(protected_task.phase, "Assigned");
+        assert!(protected_task.result.is_none());
+
+        let attempt = repository.admit_run("startup-failure", &intent).unwrap();
+        repository
+            .prepare_run_attempt(attempt.attempt.id, "OpenAI", "codex-test", None)
+            .unwrap();
+        let failed = repository
+            .complete_run(
+                attempt.attempt.id,
+                &RunCompletion::terminal_error(
+                    RunAttemptStatus::StartupFailed,
+                    "START_FAILED",
+                    "Provider startup failed before dispatch.",
+                    0,
+                ),
+            )
+            .unwrap();
+        assert_eq!(failed.status, RunAttemptStatus::StartupFailed);
+        let (status, consumed): (String, Option<i64>) = repository
+            .connection
+            .query_row(
+                "SELECT status, consumed_at_unix_ms FROM approval_requests WHERE id = ?1",
+                [approval_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "Approved");
+        assert!(consumed.is_none());
+
+        let retry = repository
+            .admit_run("cancel-before-spawn", &intent)
+            .unwrap();
+        let cancelling = repository
+            .request_run_cancellation(retry.attempt.id)
+            .unwrap();
+        assert_eq!(cancelling.status, RunAttemptStatus::CancelRequested);
+        assert_eq!(
+            repository
+                .request_run_cancellation(retry.attempt.id)
+                .unwrap()
+                .status,
+            RunAttemptStatus::CancelRequested
+        );
+        let cancelled = repository
+            .complete_run(
+                retry.attempt.id,
+                &RunCompletion::terminal_error(
+                    RunAttemptStatus::Cancelled,
+                    "RUN_CANCELLED",
+                    "Cancelled before provider startup.",
+                    0,
+                ),
+            )
+            .unwrap();
+        assert_eq!(cancelled.status, RunAttemptStatus::Cancelled);
+        let consumed: Option<i64> = repository
+            .connection
+            .query_row(
+                "SELECT consumed_at_unix_ms FROM approval_requests WHERE id = ?1",
+                [approval_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(consumed.is_none());
+
+        let interrupted = repository.admit_run("worker-stopped", &intent).unwrap();
+        repository
+            .prepare_run_attempt(interrupted.attempt.id, "OpenAI", "codex-test", None)
+            .unwrap();
+        let mut completion = RunCompletion::terminal_error(
+            RunAttemptStatus::Interrupted,
+            "RUN_WORKER_STOPPED",
+            "The worker stopped before dispatch.",
+            0,
+        );
+        completion.recovery_disposition = Some("safe_to_retry".to_string());
+        let interrupted = repository
+            .complete_run(interrupted.attempt.id, &completion)
+            .unwrap();
+        assert_eq!(
+            interrupted.recovery_disposition.as_deref(),
+            Some("safe_to_retry")
+        );
+        assert_eq!(
+            repository.load().unwrap().unwrap().state.agents[1].tasks[0].status,
+            "Pending"
+        );
+    }
+
+    #[test]
+    fn task_0005_dispatch_cancellation_consumes_once_and_timeout_is_terminal() {
+        let mut repository = initialized_authorization_repository();
+        let intent = authorization_intent();
+        let approval_id = approve_authorization(&mut repository, &intent);
+        let attempt = repository
+            .admit_run("cancel-during-spawn", &intent)
+            .unwrap();
+        repository
+            .prepare_run_attempt(attempt.attempt.id, "OpenAI", "codex-test", None)
+            .unwrap();
+        repository.mark_run_dispatching(attempt.attempt.id).unwrap();
+        repository
+            .request_run_cancellation(attempt.attempt.id)
+            .unwrap();
+        repository.mark_run_started(attempt.attempt.id).unwrap();
+        let cancelled = repository
+            .complete_run(
+                attempt.attempt.id,
+                &RunCompletion::terminal_error(
+                    RunAttemptStatus::Cancelled,
+                    "RUN_CANCELLED",
+                    "Cancelled during provider startup.",
+                    1,
+                ),
+            )
+            .unwrap();
+        assert_eq!(cancelled.status, RunAttemptStatus::Cancelled);
+        let consumed: Option<i64> = repository
+            .connection
+            .query_row(
+                "SELECT consumed_at_unix_ms FROM approval_requests WHERE id = ?1",
+                [approval_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(consumed.is_some());
+
+        let approval_id = approve_authorization(&mut repository, &intent);
+        let timeout = repository.admit_run("timeout", &intent).unwrap();
+        repository
+            .prepare_run_attempt(timeout.attempt.id, "Ollama", "local-test", None)
+            .unwrap();
+        repository.mark_run_dispatching(timeout.attempt.id).unwrap();
+        repository.mark_run_started(timeout.attempt.id).unwrap();
+        let timed_out = repository
+            .complete_run(
+                timeout.attempt.id,
+                &RunCompletion::terminal_error(
+                    RunAttemptStatus::TimedOut,
+                    "RUN_TIMED_OUT",
+                    "The bounded run timeout elapsed.",
+                    60,
+                ),
+            )
+            .unwrap();
+        assert_eq!(timed_out.status, RunAttemptStatus::TimedOut);
+        assert_eq!(timed_out.approval_id, Some(approval_id));
+    }
+
+    #[test]
+    fn task_0005_output_progress_and_history_bounds_are_visible() {
+        let mut repository = initialized_authorization_repository();
+        let intent = authorization_intent();
+        approve_authorization(&mut repository, &intent);
+        let attempt = repository.admit_run("bounded-output", &intent).unwrap();
+        repository
+            .prepare_run_attempt(attempt.attempt.id, "OpenAI", "codex-test", None)
+            .unwrap();
+        repository.mark_run_dispatching(attempt.attempt.id).unwrap();
+        repository.mark_run_started(attempt.attempt.id).unwrap();
+        for index in 0..=MAX_PROGRESS_EVENTS {
+            repository
+                .record_run_event(attempt.attempt.id, "progress", &format!("event-{index}"))
+                .unwrap();
+        }
+        let mut completion = successful_completion(&"s".repeat(MAX_SUMMARY_BYTES + 1));
+        completion.changed_files = (0..=crate::run_coordinator::MAX_CHANGED_FILES)
+            .map(|index| format!("src/{index}.rs"))
+            .collect();
+        completion.diff = Some("d".repeat(crate::run_coordinator::MAX_DIFF_CHARS + 1));
+        let complete = repository
+            .complete_run(attempt.attempt.id, &completion)
+            .unwrap();
+        assert!(complete.truncation.summary_truncated);
+        assert!(complete.truncation.changed_files_truncated);
+        assert!(complete.truncation.diff_truncated);
+        assert!(complete.truncation.progress_truncated);
+        assert_eq!(complete.progress_event_count, MAX_PROGRESS_EVENTS as u64);
+        assert_eq!(
+            complete.changed_files.len(),
+            crate::run_coordinator::MAX_CHANGED_FILES
+        );
+    }
+
+    #[test]
+    fn task_0005_ledger_prunes_oldest_terminal_attempts_at_the_history_bound() {
+        let mut repository = initialized_authorization_repository();
+        repository
+            .connection
+            .execute(
+                "WITH RECURSIVE ids(id) AS (
+                     VALUES(1)
+                     UNION ALL SELECT id + 1 FROM ids WHERE id <= ?1
+                 )
+                 INSERT INTO run_attempts
+                 (request_id, intent_json, intent_fingerprint, policy_fingerprint,
+                  workspace_fingerprint, agent_id, task_owner_agent_id, task_id,
+                  task_title, run_mode, status, task_status_before, task_phase_before,
+                  review_status_before, admitted_at_unix_ms, completed_at_unix_ms)
+                 SELECT 'history-' || id, '{}', 'history', 'history', 'history',
+                        2, 2, 41, 'History', 'execute', 'failed', 'Pending',
+                        'Assigned', 'Not Requested', id, id
+                 FROM ids",
+                [MAX_RETAINED_ATTEMPTS],
+            )
+            .unwrap();
+        let transaction = repository
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        prune_run_history(&transaction, 10_000).unwrap();
+        refresh_run_retention_meta(&transaction).unwrap();
+        transaction.commit().unwrap();
+        let snapshot = repository.run_snapshot().unwrap();
+        assert_eq!(
+            snapshot.retained_attempt_count,
+            MAX_RETAINED_ATTEMPTS as u64
+        );
+        assert_eq!(snapshot.pruned_attempt_count, 1);
+        assert_eq!(snapshot.last_pruned_at_unix_ms, Some(10_000));
+        assert!(snapshot.recent_attempts.iter().all(|attempt| {
+            attempt.status == RunAttemptStatus::Failed && attempt.request_id != "history-1"
+        }));
+    }
+
+    #[test]
+    fn task_0005_restart_reconciliation_distinguishes_safe_and_uncertain_dispatch() {
+        let safe_directory = TestDirectory::new();
+        let safe_path = safe_directory.database_path();
+        let safe_approval;
+        {
+            let mut repository = StateRepository::open(&safe_path).unwrap();
+            let initialized = repository.initialize_fresh().unwrap();
+            repository
+                .save(initialized.revision, &authorization_state(), true)
+                .unwrap();
+            let intent = authorization_intent();
+            safe_approval = approve_authorization(&mut repository, &intent);
+            let attempt = repository.admit_run("safe-restart", &intent).unwrap();
+            repository
+                .prepare_run_attempt(attempt.attempt.id, "OpenAI", "codex-test", None)
+                .unwrap();
+        }
+        let mut reopened = StateRepository::open(&safe_path).unwrap();
+        let safe = reopened.run_snapshot().unwrap().recent_attempts.remove(0);
+        assert_eq!(safe.status, RunAttemptStatus::Interrupted);
+        assert_eq!(safe.recovery_disposition.as_deref(), Some("safe_to_retry"));
+        let safe_consumed: Option<i64> = reopened
+            .connection
+            .query_row(
+                "SELECT consumed_at_unix_ms FROM approval_requests WHERE id = ?1",
+                [safe_approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(safe_consumed.is_none());
+
+        let uncertain_directory = TestDirectory::new();
+        let uncertain_path = uncertain_directory.database_path();
+        let uncertain_approval;
+        {
+            let mut repository = StateRepository::open(&uncertain_path).unwrap();
+            let initialized = repository.initialize_fresh().unwrap();
+            repository
+                .save(initialized.revision, &authorization_state(), true)
+                .unwrap();
+            let intent = authorization_intent();
+            uncertain_approval = approve_authorization(&mut repository, &intent);
+            let attempt = repository.admit_run("uncertain-restart", &intent).unwrap();
+            repository
+                .prepare_run_attempt(attempt.attempt.id, "OpenAI", "codex-test", None)
+                .unwrap();
+            repository.mark_run_dispatching(attempt.attempt.id).unwrap();
+        }
+        let mut reopened = StateRepository::open(&uncertain_path).unwrap();
+        let uncertain = reopened.run_snapshot().unwrap().recent_attempts.remove(0);
+        assert_eq!(uncertain.status, RunAttemptStatus::Interrupted);
+        assert_eq!(
+            uncertain.recovery_disposition.as_deref(),
+            Some("manual_review_required")
+        );
+        let status: String = reopened
+            .connection
+            .query_row(
+                "SELECT status FROM approval_requests WHERE id = ?1",
+                [uncertain_approval],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "Expired");
+        assert_eq!(
+            reopened.load().unwrap().unwrap().state.agents[1].tasks[0].status,
+            "Blocked"
+        );
+
+        reopened
+            .connection
+            .execute(
+                "UPDATE agent_tasks
+                 SET status = 'Running', phase = 'Specialist Work'
+                 WHERE owner_agent_id = 2 AND id = 41",
+                [],
+            )
+            .unwrap();
+        drop(reopened);
+        let mut reopened = StateRepository::open(&uncertain_path).unwrap();
+        let snapshot = reopened.run_snapshot().unwrap();
+        assert!(snapshot.recent_attempts.iter().any(|attempt| {
+            attempt.request_id.starts_with("recovery:2:41:execute:")
+                && attempt.recovery_disposition.as_deref() == Some("manual_review_required")
+        }));
+        assert_eq!(
+            reopened.load().unwrap().unwrap().state.agents[1].tasks[0].status,
+            "Blocked"
+        );
+    }
+
     #[test]
     fn schema_one_approvals_upgrade_as_non_authoritative_expired_history() {
         let directory = TestDirectory::new();
@@ -3017,7 +5440,7 @@ mod tests {
         drop(connection);
 
         let repository = StateRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 2);
+        assert_eq!(repository.schema_version().unwrap(), 3);
         let upgraded: (String, i64, String) = repository
             .connection
             .query_row(
@@ -3131,6 +5554,20 @@ mod tests {
         let mut changed_task = envelope.state;
         changed_task.agents[1].tasks[0].title =
             "Run cargo test and edit a different parser".to_string();
+        assert_eq!(
+            repository
+                .save(envelope.revision, &changed_task, false)
+                .unwrap_err()
+                .code,
+            "RUN_TASK_LOCKED"
+        );
+        repository
+            .connection
+            .execute(
+                "UPDATE approval_requests SET status = 'Expired' WHERE id = ?1",
+                [pending.id],
+            )
+            .unwrap();
         repository
             .save(envelope.revision, &changed_task, false)
             .unwrap();

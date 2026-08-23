@@ -33,8 +33,10 @@ implementation.
 6. Do not require a paid API key or paid external service.
 7. Make backend state, policy, authorization, and run lifecycle authoritative.
    TASK-0004 makes approval and current privileged-action policy
-   backend-authoritative. Broader domain state and run lifecycle remain
-   incomplete until their owning roadmap tasks pass.
+   backend-authoritative. TASK-0005 makes single-run admission, task/run
+   lifecycle projection, cancellation state, recovery, and bounded attempt
+   evidence backend-authoritative. Broader domain semantics remain incomplete
+   until their owning roadmap tasks pass.
 8. Keep one active product AI run system-wide and execute work sequentially
    until an explicit superseding decision changes that model.
 9. Reminders and scheduling do not run AI models in the background.

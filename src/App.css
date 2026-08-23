@@ -427,6 +427,64 @@ small {
   overscroll-behavior: contain;
 }
 
+.global-run-banner {
+  position: sticky;
+  top: 16px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 18px;
+  padding: 14px 16px;
+  border: 1px solid color-mix(in srgb, var(--accent) 48%, var(--border));
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--surface) 92%, var(--accent) 8%);
+  box-shadow: 0 12px 30px rgb(0 0 0 / 18%);
+}
+
+.global-run-banner > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.global-run-banner strong,
+.global-run-banner small,
+.global-run-progress {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.global-run-progress {
+  max-width: min(720px, 68vw);
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.run-evidence-warning {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, #f0ad4e 55%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, #f0ad4e 10%, transparent);
+  color: var(--text);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+@media (max-width: 720px) {
+  .global-run-banner {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .global-run-progress {
+    max-width: 100%;
+  }
+}
+
 .main-content > * {
   width: min(100%, 1580px);
   margin-right: auto;

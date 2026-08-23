@@ -37,6 +37,7 @@ import type {
   VoiceState,
   WorkspaceDefinition,
   ApplicationState,
+  StateEnvelope,
   AccentColor,
 } from "./applicationState";
 export type {
@@ -59,6 +60,16 @@ import {
   type InvokeFunction,
 } from "./persistence";
 import { interpretVoiceCommand } from "./voiceCommand";
+import {
+  applyRunCoordinatorEvent,
+  applyRunCoordinatorSnapshot,
+  createRunCoordinatorUiState,
+  hasVisibleTruncation,
+  markRunStopRequested,
+  type RunCoordinatorEvent,
+  type RunCoordinatorSnapshot,
+  type RunCoordinatorUiState,
+} from "./runCoordinator";
 import logoUrl from "../AI-Agents.png";
 import "./App.css";
 
@@ -96,12 +107,6 @@ type AgentRunResult = {
   changedFiles: string[];
   diff: string | null;
   durationSeconds: number;
-};
-
-type CodexRunEvent = {
-  runId: string;
-  kind: "status" | "progress" | "complete";
-  message: string;
 };
 
 type VoiceRuntimeStatus = {
@@ -1062,7 +1067,8 @@ function AgentsPage({
   setAgents,
   models,
   preferences,
-  setAgentRunActive,
+  runCoordinator,
+  setRunCoordinator,
   approvalRequests,
   setApprovalRequests,
   onOpenApprovals,
@@ -1071,7 +1077,10 @@ function AgentsPage({
   setAgents: React.Dispatch<React.SetStateAction<Agent[]>>;
   models: ModelDefinition[];
   preferences: AppPreferences;
-  setAgentRunActive: React.Dispatch<React.SetStateAction<boolean>>;
+  runCoordinator: RunCoordinatorUiState;
+  setRunCoordinator: React.Dispatch<
+    React.SetStateAction<RunCoordinatorUiState>
+  >;
   approvalRequests: ApprovalRequest[];
   setApprovalRequests: React.Dispatch<
     React.SetStateAction<ApprovalRequest[]>
@@ -1104,17 +1113,21 @@ function AgentsPage({
   >("Development");
   const [activeWorkspaceTab, setActiveWorkspaceTab] =
     useState<WorkspaceTab>("Overview");
-  const [runningTaskId, setRunningTaskId] = useState<number | null>(null);
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
-  const [activeRunKind, setActiveRunKind] =
-    useState<"execution" | "review">("execution");
-  const [runtimeProgress, setRuntimeProgress] = useState<string[]>([]);
-  const [cancelRequested, setCancelRequested] = useState(false);
   const [runtimeError, setRuntimeError] = useState("");
   const [systemCapabilityMessage, setSystemCapabilityMessage] = useState("");
 
   const selectedAgent =
     agents.find((agent) => agent.id === selectedAgentId) ?? null;
+  const activeRun = runCoordinator.snapshot.activeAttempt;
+  const runActive = activeRun !== null;
+  const runningTaskId =
+    activeRun && activeRun.taskOwnerAgentId === selectedAgentId
+      ? activeRun.taskId
+      : null;
+  const activeRunId = activeRun?.requestId ?? null;
+  const activeRunKind = activeRun?.runMode === "review" ? "review" : "execution";
+  const runtimeProgress = runCoordinator.progress;
+  const cancelRequested = runCoordinator.stopRequested;
 
   const selectedAgentTasks = selectedAgent?.tasks ?? [];
   const completedTaskCount = selectedAgentTasks.filter(
@@ -1176,6 +1189,14 @@ function AgentsPage({
     return (
       approval?.consumedAt === null &&
       (approval.status === "Pending" || approval.status === "Approved")
+    );
+  }
+
+  function latestRunForTask(task: AgentTask) {
+    return runCoordinator.snapshot.recentAttempts.find(
+      (attempt) =>
+        attempt.taskOwnerAgentId === selectedAgent?.id &&
+        attempt.taskId === task.id,
     );
   }
 
@@ -1677,7 +1698,7 @@ function AgentsPage({
     _executionResult?: AgentRunResult,
     continuation = false,
   ) {
-    if (!selectedAgent || (!continuation && runningTaskId !== null)) {
+    if (!selectedAgent || (!continuation && runActive)) {
       return;
     }
     if (!isDesktopRuntime()) {
@@ -1728,60 +1749,10 @@ function AgentsPage({
       onOpenApprovals();
       return;
     }
-    markApprovalConsumed(setApprovalRequests, reviewAuthorization.approval);
     const reviewRunId = `review-${task.id}-${Date.now()}`;
-    let stopReviewListening: (() => void) | null = null;
-
     setRuntimeError("");
-    setRuntimeProgress([]);
-    setCancelRequested(false);
-    setAgentRunActive(true);
-    setRunningTaskId(task.id);
-    setActiveRunKind("review");
-    setActiveRunId(reviewRunId);
-    setAgents((currentAgents) =>
-      currentAgents.map((agent) => {
-        if (agent.id === selectedAgent.id) {
-          return {
-            ...agent,
-            status: "Waiting",
-            tasks: agent.tasks.map((item) =>
-              item.id === task.id
-                ? {
-                    ...item,
-                    status: "Under Review",
-                    phase: "Senior Review",
-                    reviewAgentId: reviewer.id,
-                    reviewStatus: "Running",
-                  }
-                : item,
-            ),
-          };
-        }
-        return agent.id === reviewer.id
-          ? {
-              ...agent,
-              status: "Working",
-              activity: [
-                createActivity(`Started senior review for "${task.title}".`),
-                ...agent.activity,
-              ],
-            }
-          : agent;
-      }),
-    );
 
     try {
-      stopReviewListening = await listen<CodexRunEvent>(
-        "codex-run-event",
-        (event) => {
-          if (event.payload.runId !== reviewRunId) return;
-          setRuntimeProgress((current) =>
-            [...current, event.payload.message].slice(-14),
-          );
-        },
-      );
-
       const result = await invoke<AgentRunResult>("run_agent_task", {
         request: {
           runId: reviewRunId,
@@ -1795,112 +1766,18 @@ function AgentsPage({
       const changesRequested = /\bverdict\s*:\s*changes requested\b/i.test(
         result.output,
       );
-      const reviewStatus: ReviewStatus = approved
-        ? "Approved"
-        : changesRequested
-          ? "Changes Requested"
-          : "Failed";
-
-      setAgents((currentAgents) =>
-        currentAgents.map((agent) => {
-          if (agent.id === selectedAgent.id) {
-            return {
-              ...agent,
-              status: "Waiting",
-              tasks: agent.tasks.map((item) =>
-                item.id === task.id
-                  ? {
-                      ...item,
-                      status: approved
-                        ? "Completed"
-                        : changesRequested
-                          ? "Pending"
-                          : "Under Review",
-                      phase: approved
-                        ? "Finished"
-                        : changesRequested
-                          ? "Assigned"
-                          : "Senior Review",
-                      completedAt: approved ? new Date().toISOString() : null,
-                      reviewAgentId: reviewer.id,
-                      reviewStatus,
-                      reviewResult: result.output,
-                      reviewModel: result.model,
-                      reviewDurationSeconds: result.durationSeconds,
-                      reviewedAt: new Date().toISOString(),
-                    }
-                  : item,
-              ),
-              activity: [
-                createActivity(
-                  `${reviewer.name} ${approved ? "approved" : changesRequested ? "requested changes to" : "could not decide on"} "${task.title}".`,
-                ),
-                ...agent.activity,
-              ],
-            };
-          }
-          return agent.id === reviewer.id
-            ? {
-                ...agent,
-                status: "Waiting",
-                activity: [
-                  createActivity(
-                    `Completed senior review for "${task.title}": ${reviewStatus}.`,
-                  ),
-                  ...agent.activity,
-                ],
-              }
-            : agent;
-        }),
-      );
-
       if (!approved && !changesRequested) {
         setRuntimeError(
           "The reviewer returned no valid verdict. Review its result and run the senior review again.",
         );
       }
     } catch (error) {
-      const message = errorMessage(error);
-      const wasCancelled = message.toLowerCase().includes("cancelled");
-      setRuntimeError(message);
-      setAgents((currentAgents) =>
-        currentAgents.map((agent) => {
-          if (agent.id === selectedAgent.id) {
-            return {
-              ...agent,
-              status: "Waiting",
-              tasks: agent.tasks.map((item) =>
-                item.id === task.id
-                  ? {
-                      ...item,
-                      status: "Under Review",
-                      phase: "Senior Review",
-                      reviewAgentId: reviewer.id,
-                      reviewStatus: wasCancelled ? "Pending" : "Failed",
-                    }
-                  : item,
-              ),
-            };
-          }
-          return agent.id === reviewer.id
-            ? { ...agent, status: "Waiting" }
-            : agent;
-        }),
-      );
-    } finally {
-      stopReviewListening?.();
-      if (!continuation) {
-        setRunningTaskId(null);
-        setActiveRunId(null);
-        setCancelRequested(false);
-        setAgentRunActive(false);
-        setActiveRunKind("execution");
-      }
+      setRuntimeError(errorMessage(error));
     }
   }
 
   async function runTaskWithAgent(task: AgentTask) {
-    if (!selectedAgent || runningTaskId !== null) {
+    if (!selectedAgent || runActive) {
       return;
     }
 
@@ -1985,36 +1862,13 @@ function AgentsPage({
       setRuntimeError(
         "This run is waiting for backend authorization. Open Approvals to approve or deny it.",
       );
-      setTaskWorkflow(task.id, "Blocked", "Supervisor Approval");
       return;
     }
-    markApprovalConsumed(setApprovalRequests, authorization.approval);
 
     setRuntimeError("");
-    setRuntimeProgress([]);
-    setCancelRequested(false);
-    setAgentRunActive(true);
-    setRunningTaskId(task.id);
-    setActiveRunKind("execution");
-    setTaskWorkflow(task.id, "Running", "Specialist Work");
     const runId = `task-${task.id}-${Date.now()}`;
-    setActiveRunId(runId);
-    let stopListening: (() => void) | null = null;
 
     try {
-      stopListening = await listen<CodexRunEvent>(
-        "codex-run-event",
-        (event) => {
-          if (event.payload.runId !== runId) {
-            return;
-          }
-
-          setRuntimeProgress((current) =>
-            [...current, event.payload.message].slice(-14),
-          );
-        },
-      );
-
       const result = await invoke<AgentRunResult>("run_agent_task", {
         request: {
           runId,
@@ -2025,99 +1879,11 @@ function AgentsPage({
         },
       });
 
-      const reviewRequired = preferences.reviewMode !== "off";
-      setAgents((currentAgents) =>
-        currentAgents.map((agent) =>
-          agent.id === selectedAgent.id
-            ? {
-                ...agent,
-                status: "Waiting",
-                tasks: agent.tasks.map((item) =>
-                  item.id === task.id
-                    ? {
-                        ...item,
-                        status: reviewRequired ? "Under Review" : "Completed",
-                        phase: reviewRequired ? "Senior Review" : "Finished",
-                        completedAt: reviewRequired
-                          ? null
-                          : new Date().toISOString(),
-                        result: result.output,
-                        responseId: result.responseId,
-                        runtimeModel: result.model,
-                        totalTokens: result.usage.totalTokens,
-                        changedFiles: result.changedFiles,
-                        diff: result.diff,
-                        durationSeconds: result.durationSeconds,
-                        reviewAgentId: null,
-                        reviewStatus: reviewRequired
-                          ? "Pending"
-                          : "Not Requested",
-                        reviewResult:
-                          task.reviewStatus === "Changes Requested"
-                            ? task.reviewResult
-                            : null,
-                        reviewModel: null,
-                        reviewDurationSeconds: null,
-                        reviewedAt: null,
-                      }
-                    : item,
-                ),
-                activity: [
-                  createActivity(
-                    `${selectedModel.provider} agent completed "${task.title}" with ${result.model}.`,
-                  ),
-                  ...agent.activity,
-                ],
-              }
-            : agent,
-        ),
-      );
       if (preferences.reviewMode === "automatic") {
-        stopListening?.();
-        stopListening = null;
         await runSeniorReview(task, result, true);
       }
     } catch (error) {
-      const message = errorMessage(error);
-      const wasCancelled = message.toLowerCase().includes("cancelled");
-      setRuntimeError(message);
-      setAgents((currentAgents) =>
-        currentAgents.map((agent) =>
-          agent.id === selectedAgent.id
-            ? {
-                ...agent,
-                status: "Waiting",
-                tasks: agent.tasks.map((item) =>
-                  item.id === task.id
-                    ? {
-                        ...item,
-                        status: wasCancelled ? "Pending" : "Failed",
-                        phase: wasCancelled ? "Assigned" : "Failed",
-                        completedAt: wasCancelled
-                          ? null
-                          : new Date().toISOString(),
-                      }
-                    : item,
-                ),
-                activity: [
-                  createActivity(
-                    wasCancelled
-                      ? `Agent run cancelled: ${task.title}`
-                      : `Agent run failed: ${message}`,
-                  ),
-                  ...agent.activity,
-                ],
-              }
-            : agent,
-        ),
-      );
-    } finally {
-      stopListening?.();
-      setRunningTaskId(null);
-      setActiveRunId(null);
-      setCancelRequested(false);
-      setAgentRunActive(false);
-      setActiveRunKind("execution");
+      setRuntimeError(errorMessage(error));
     }
   }
 
@@ -2126,23 +1892,17 @@ function AgentsPage({
       return;
     }
 
-    setCancelRequested(true);
+    setRunCoordinator((current) => markRunStopRequested(current, true));
     try {
       const accepted = await invoke<boolean>("cancel_agent_run", {
         runId: activeRunId,
       });
-      setRuntimeProgress((current) => [
-        ...current,
-        accepted
-          ? "Cancellation requested…"
-          : "The process is still starting. Click Stop again in a moment.",
-      ]);
       if (!accepted) {
-        setCancelRequested(false);
+        setRunCoordinator((current) => markRunStopRequested(current, false));
       }
     } catch (error) {
       setRuntimeError(errorMessage(error));
-      setCancelRequested(false);
+      setRunCoordinator((current) => markRunStopRequested(current, false));
     }
   }
 
@@ -2258,7 +2018,6 @@ function AgentsPage({
           <div>
             <button
               className="secondary-button"
-              disabled={runningTaskId !== null}
               onClick={() => {
                 setSelectedAgentId(null);
                 setActiveWorkspaceTab("Overview");
@@ -2297,7 +2056,6 @@ function AgentsPage({
                   ? "primary-button"
                   : "secondary-button"
               }
-              disabled={runningTaskId !== null && tab !== "Tasks"}
               onClick={() => setActiveWorkspaceTab(tab)}
             >
               {tab}
@@ -2795,7 +2553,7 @@ function AgentsPage({
                             <strong>
                               {activeRunKind === "review"
                                 ? "Live senior review"
-                                : "Live Codex progress"}
+                                : "Live agent progress"}
                             </strong>
                             <small>{cancelRequested ? "Stopping…" : "Running"}</small>
                           </div>
@@ -2804,6 +2562,24 @@ function AgentsPage({
                               <span key={`${index}-${line}`}>{line}</span>
                             ))}
                           </div>
+                        </div>
+                      )}
+
+                      {latestRunForTask(task) &&
+                        hasVisibleTruncation(latestRunForTask(task)!) && (
+                          <div className="run-evidence-warning" role="status">
+                            Stored run evidence reached a safety bound. The run
+                            ledger records which output, progress, diff, file list,
+                            or workspace snapshot was truncated.
+                          </div>
+                        )}
+
+                      {latestRunForTask(task)?.status === "interrupted" && (
+                        <div className="run-evidence-warning" role="alert">
+                          {latestRunForTask(task)?.recoveryDisposition ===
+                          "safe_to_retry"
+                            ? "The previous run stopped before dispatch and is safe to retry."
+                            : "The previous run may have reached the workspace. Inspect its files before retrying."}
                         </div>
                       )}
 
@@ -2882,7 +2658,7 @@ function AgentsPage({
                         latestApprovalForTask(task)?.status === "Pending" && (
                           <button
                             className="primary-button"
-                            disabled={runningTaskId !== null}
+                            disabled={runActive}
                             onClick={onOpenApprovals}
                           >
                             Review approval
@@ -2895,7 +2671,7 @@ function AgentsPage({
                         !awaitingRunApproval(task) && (
                           <button
                             className="secondary-button"
-                            disabled={runningTaskId !== null}
+                            disabled={runActive}
                             onClick={() => autoRouteTask(task)}
                           >
                             Auto-route
@@ -2910,7 +2686,7 @@ function AgentsPage({
                               ? "secondary-button"
                               : "primary-button"
                           }
-                          disabled={runningTaskId !== null}
+                          disabled={runActive}
                           onClick={() => runTaskWithAgent(task)}
                         >
                           {runningTaskId === task.id
@@ -2945,7 +2721,7 @@ function AgentsPage({
                         task.reviewStatus !== "Changes Requested" && (
                           <button
                             className="primary-button"
-                            disabled={runningTaskId !== null}
+                            disabled={runActive}
                             onClick={() => runSeniorReview(task)}
                           >
                             Run senior review
@@ -2958,7 +2734,7 @@ function AgentsPage({
                         task.phase !== "Failed" && (
                           <button
                             className="secondary-button"
-                            disabled={runningTaskId !== null}
+                            disabled={runActive}
                             onClick={() => advanceTask(task)}
                           >
                             {task.phase === "Assigned"
@@ -2980,7 +2756,7 @@ function AgentsPage({
                         task.status !== "Failed" && (
                           <button
                             className="secondary-button"
-                            disabled={runningTaskId !== null}
+                            disabled={runActive}
                             onClick={() =>
                               setTaskWorkflow(
                                 task.id,
@@ -2998,7 +2774,7 @@ function AgentsPage({
                         !awaitingRunApproval(task) && (
                         <button
                           className="secondary-button"
-                          disabled={runningTaskId !== null}
+                          disabled={runActive}
                           onClick={() =>
                             setTaskWorkflow(
                               task.id,
@@ -3017,7 +2793,7 @@ function AgentsPage({
                         task.status !== "Completed" && (
                           <button
                             className="secondary-button"
-                            disabled={runningTaskId !== null}
+                            disabled={runActive}
                             onClick={() =>
                               setTaskWorkflow(
                                 task.id,
@@ -3034,7 +2810,7 @@ function AgentsPage({
                         task.status === "Completed") && (
                         <button
                           className="secondary-button"
-                          disabled={runningTaskId !== null}
+                          disabled={runActive}
                           onClick={() =>
                             setTaskWorkflow(
                               task.id,
@@ -3049,7 +2825,7 @@ function AgentsPage({
 
                       <button
                         className="danger-button"
-                        disabled={runningTaskId !== null}
+                        disabled={runActive}
                         onClick={() => deleteTask(task.id)}
                       >
                         Delete
@@ -7609,12 +7385,14 @@ function App() {
     useState<OllamaRuntimeStatus | null>(null);
   const [aiProviderBusy, setAiProviderBusy] = useState(false);
   const [aiProviderMessage, setAiProviderMessage] = useState("");
-  const [agentRunActive, setAgentRunActive] = useState(false);
+  const [runCoordinator, setRunCoordinator] =
+    useState<RunCoordinatorUiState>(createRunCoordinatorUiState);
   const [persistencePhase, setPersistencePhase] = useState<
     "loading" | "mutating" | "hydrating" | "ready" | "error"
   >(desktopRuntime ? "loading" : "ready");
   const [persistenceMessage, setPersistenceMessage] = useState("");
   const persistenceWriter = useRef<ApplicationStateWriter | null>(null);
+  const suppressNextPersistenceWrite = useRef(false);
 
   const [taskRetentionDays, setTaskRetentionDays] =
     useState<HistoryRetentionDays>(() => {
@@ -8428,8 +8206,8 @@ function App() {
     }
   });
 
-  function hydrateApplicationState(state: ApplicationState) {
-    setPersistencePhase("hydrating");
+  function applyAuthoritativeApplicationState(state: ApplicationState) {
+    suppressNextPersistenceWrite.current = true;
     setAgents(state.agents);
     setModels(state.models);
     setApprovalRequests(state.approvalRequests);
@@ -8437,6 +8215,11 @@ function App() {
     setTaskRetentionDays(state.taskRetentionDays);
     setActivityRetentionDays(state.activityRetentionDays);
     setPreferences(state.preferences);
+  }
+
+  function hydrateApplicationState(state: ApplicationState) {
+    setPersistencePhase("hydrating");
+    applyAuthoritativeApplicationState(state);
   }
 
   useEffect(() => {
@@ -8478,6 +8261,89 @@ function App() {
       setPersistencePhase("ready");
     }
   }, [persistencePhase]);
+
+  useEffect(() => {
+    if (!desktopRuntime || persistencePhase !== "ready") {
+      return;
+    }
+    let active = true;
+    const unlisten: Array<() => void> = [];
+    let refreshInFlight = false;
+    let refreshQueued = false;
+
+    const refreshAuthoritativeState = async () => {
+      if (refreshInFlight) {
+        refreshQueued = true;
+        return;
+      }
+      refreshInFlight = true;
+      try {
+        const envelope = await invoke<StateEnvelope | null>(
+          "load_application_state",
+        );
+        if (active && envelope) {
+          applyAuthoritativeApplicationState(envelope.state);
+        }
+      } catch (error) {
+        if (active) {
+          setPersistenceMessage(persistenceErrorMessage(error));
+        }
+      } finally {
+        refreshInFlight = false;
+        if (active && refreshQueued) {
+          refreshQueued = false;
+          void refreshAuthoritativeState();
+        }
+      }
+    };
+
+    void invoke<RunCoordinatorSnapshot>("run_coordinator_snapshot")
+      .then((snapshot) => {
+        if (active) {
+          setRunCoordinator((current) =>
+            applyRunCoordinatorSnapshot(current, snapshot),
+          );
+        }
+      })
+      .catch((error) => {
+        if (active) {
+          setPersistenceMessage(errorMessage(error));
+        }
+      });
+    void listen<RunCoordinatorEvent>("run-coordinator-event", (event) => {
+      if (active) {
+        setRunCoordinator((current) =>
+          applyRunCoordinatorEvent(current, event.payload),
+        );
+      }
+    }).then((stop) => {
+      if (active) unlisten.push(stop);
+      else stop();
+    });
+    void listen<RunCoordinatorSnapshot>(
+      "run-coordinator-snapshot",
+      (event) => {
+        if (!active) return;
+        setRunCoordinator((current) =>
+          applyRunCoordinatorSnapshot(current, event.payload),
+        );
+        if (
+          event.payload.activeAttempt === null ||
+          event.payload.activeAttempt.startedAtUnixMs !== null
+        ) {
+          void refreshAuthoritativeState();
+        }
+      },
+    ).then((stop) => {
+      if (active) unlisten.push(stop);
+      else stop();
+    });
+
+    return () => {
+      active = false;
+      unlisten.forEach((stop) => stop());
+    };
+  }, [desktopRuntime, persistencePhase]);
 
   async function importApplicationBackup(backupJson: string) {
     const writer = persistenceWriter.current;
@@ -8713,6 +8579,10 @@ function App() {
     };
     if (desktopRuntime) {
       if (persistencePhase === "ready") {
+        if (suppressNextPersistenceWrite.current) {
+          suppressNextPersistenceWrite.current = false;
+          return;
+        }
         persistenceWriter.current?.enqueue(state);
       }
       return;
@@ -8756,6 +8626,28 @@ function App() {
     preferences,
     desktopRuntime,
   ]);
+
+  const globalActiveRun = runCoordinator.snapshot.activeAttempt;
+  const latestRunProgress =
+    runCoordinator.progress[runCoordinator.progress.length - 1];
+
+  async function stopGlobalRun() {
+    if (!globalActiveRun || runCoordinator.stopRequested) {
+      return;
+    }
+    setRunCoordinator((current) => markRunStopRequested(current, true));
+    try {
+      const accepted = await invoke<boolean>("cancel_agent_run", {
+        runId: globalActiveRun.requestId,
+      });
+      if (!accepted) {
+        setRunCoordinator((current) => markRunStopRequested(current, false));
+      }
+    } catch (error) {
+      setPersistenceMessage(errorMessage(error));
+      setRunCoordinator((current) => markRunStopRequested(current, false));
+    }
+  }
 
   if (desktopRuntime && persistencePhase !== "ready") {
     const failed = persistencePhase === "error";
@@ -8801,7 +8693,6 @@ function App() {
             <button
               key={page}
               className={`nav-item ${activePage === page ? "active" : ""}`}
-              disabled={agentRunActive && activePage !== page}
               onClick={() => setActivePage(page)}
             >
               <span>{page}</span>
@@ -8860,6 +8751,33 @@ function App() {
             {persistenceMessage}
           </p>
         )}
+        {globalActiveRun && (
+          <section className="global-run-banner" aria-live="polite">
+            <div>
+              <span className="eyebrow">ONE ACTIVE AI RUN</span>
+              <strong>{globalActiveRun.taskTitle}</strong>
+              <small>
+                {globalActiveRun.runMode === "review"
+                  ? "Senior review"
+                  : "Task execution"}
+                {` · ${globalActiveRun.status.replace(/_/g, " ")}`}
+                {globalActiveRun.model ? ` · ${globalActiveRun.model}` : ""}
+              </small>
+              {latestRunProgress && (
+                <span className="global-run-progress">
+                  {latestRunProgress}
+                </span>
+              )}
+            </div>
+            <button
+              className="danger-button"
+              disabled={runCoordinator.stopRequested}
+              onClick={() => void stopGlobalRun()}
+            >
+              {runCoordinator.stopRequested ? "Stopping…" : "Stop active run"}
+            </button>
+          </section>
+        )}
         {activePage === "Dashboard" ? (
           <DashboardPage
             agents={agents}
@@ -8874,7 +8792,8 @@ function App() {
             setAgents={setAgents}
             models={models}
             preferences={preferences}
-            setAgentRunActive={setAgentRunActive}
+            runCoordinator={runCoordinator}
+            setRunCoordinator={setRunCoordinator}
             approvalRequests={approvalRequests}
             setApprovalRequests={setApprovalRequests}
             onOpenApprovals={() => setActivePage("Approvals")}
