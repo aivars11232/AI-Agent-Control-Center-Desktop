@@ -32,8 +32,9 @@ implementation.
 5. Preserve both the installed Codex CLI and local Ollama execution paths.
 6. Do not require a paid API key or paid external service.
 7. Make backend state, policy, authorization, and run lifecycle authoritative.
-   This is a target requirement; the 0.5.1 renderer still owns substantial
-   state and approval workflow.
+   TASK-0004 makes approval and current privileged-action policy
+   backend-authoritative. Broader domain state and run lifecycle remain
+   incomplete until their owning roadmap tasks pass.
 8. Keep one active product AI run system-wide and execute work sequentially
    until an explicit superseding decision changes that model.
 9. Reminders and scheduling do not run AI models in the background.

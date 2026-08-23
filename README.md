@@ -24,8 +24,10 @@ The current checkout contains:
 Important limits are documented in [CURRENT_STATE.md](CURRENT_STATE.md) and
 [SECURITY_MODEL.md](SECURITY_MODEL.md). Desktop product state is now persisted
 through typed Tauri commands and a schema-versioned backend database. Routing,
-run coordination, and approval authorization are still prototype boundaries;
-durable approval rows are explicitly non-authoritative until TASK-0004.
+review orchestration, and durable run coordination are still prototype
+boundaries. Approval issuance, matching, expiry, trusted resolution, and
+single-use consumption are backend-authoritative; imported legacy approval
+rows remain non-authoritative history.
 Browser preview storage is retained only as a non-authoritative preview path.
 
 The supported product direction is Arch Linux, KDE Plasma, and Wayland first.
@@ -62,7 +64,7 @@ npm run verify:fast
 ```
 
 It runs 24 frontend characterization/persistence tests, the TypeScript check,
-the Rust format check, and 23 locked/offline Rust tests. The full gate adds the
+the Rust format check, and 41 locked/offline Rust tests. The full gate adds the
 frontend build, Clippy, shell/Python/JSON checks, dependency-tree checks, and
 production plus development npm audits:
 

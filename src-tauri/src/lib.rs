@@ -1,5 +1,7 @@
 mod app_state;
+mod authorization;
 mod persistence;
+mod policy;
 
 use app_state::{ApplicationState, LegacyRendererState};
 use ashpd::desktop::{
@@ -9,10 +11,15 @@ use ashpd::desktop::{
     },
     PersistMode, Session,
 };
+use authorization::{
+    request_native_confirmation, ApprovalResolution, AuthorizationGrant, AuthorizationOutcome,
+    ResolveApprovalRequest,
+};
 use keyring::Entry;
 use persistence::{
     PersistenceError, PersistenceService, SaveReceipt, StateEnvelope, StateRepository,
 };
+use policy::{ActionIntent, RunMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -52,6 +59,20 @@ const KEYSYM_ALT: i32 = 0xffe9;
 const KEYSYM_CONTROL: i32 = 0xffe3;
 const KEYSYM_SHIFT: i32 = 0xffe1;
 const KEYSYM_SUPER: i32 = 0xffeb;
+
+fn authorization_error_message(error: PersistenceError) -> String {
+    format!("{}: {}", error.code, error.message)
+}
+
+async fn consume_authorization(
+    persistence: &PersistenceService,
+    intent: ActionIntent,
+) -> Result<AuthorizationGrant, String> {
+    persistence
+        .authorize_intent(intent)
+        .await
+        .map_err(authorization_error_message)
+}
 
 #[derive(Default)]
 struct ActiveRuns {
@@ -102,8 +123,16 @@ struct OllamaModel {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AgentRunRequest {
+    run_id: String,
+    agent_id: i64,
+    task_owner_agent_id: i64,
+    task_id: i64,
+    run_mode: String,
+}
+
+struct AuthorizedAgentRun {
     run_id: String,
     run_mode: String,
     agent_name: String,
@@ -114,7 +143,6 @@ struct AgentRunRequest {
     review_feedback: Option<String>,
     task_title: String,
     model: String,
-    #[serde(default)]
     model_provider: String,
     strength: u8,
     focus: String,
@@ -122,16 +150,16 @@ struct AgentRunRequest {
     workspace_path: String,
     file_access: String,
     terminal_access: String,
-    approval_id: Option<u64>,
     authorized_scopes: Vec<String>,
     destructive_actions_approved: bool,
     timeout_seconds: u64,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct OpenWorkspaceItemRequest {
-    workspace_path: String,
+    agent_id: i64,
+    workspace_id: String,
     item_path: String,
 }
 
@@ -815,7 +843,7 @@ fn is_ollama_provider(provider: &str) -> bool {
     provider.trim().eq_ignore_ascii_case("ollama")
 }
 
-fn agent_prompt(request: &AgentRunRequest, local_ollama: bool) -> String {
+fn agent_prompt(request: &AuthorizedAgentRun, local_ollama: bool) -> String {
     let memory = if request.memory.trim().is_empty() {
         "No persistent agent memory has been provided.".to_string()
     } else {
@@ -839,11 +867,7 @@ fn agent_prompt(request: &AgentRunRequest, local_ollama: bool) -> String {
         "No elevated one-time authorization was needed for this run.".to_string()
     } else {
         format!(
-            "One-time authorization {} permits these scopes for this run only: {}.",
-            request
-                .approval_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "untracked".to_string()),
+            "Backend policy authorized these scopes for this run only: {}.",
             request.authorized_scopes.join(", ")
         )
     };
@@ -892,7 +916,7 @@ fn contains_any(text: &str, patterns: &[&str]) -> bool {
     patterns.iter().any(|pattern| normalized.contains(pattern))
 }
 
-fn validate_run_safety(request: &AgentRunRequest) -> Result<(), String> {
+fn validate_run_safety(request: &AuthorizedAgentRun) -> Result<(), String> {
     if !matches!(request.run_mode.as_str(), "execute" | "review") {
         return Err("The requested agent run mode is invalid.".to_string());
     }
@@ -921,9 +945,6 @@ fn validate_run_safety(request: &AgentRunRequest) -> Result<(), String> {
         .any(|scope| !allowed_scopes.contains(&scope.as_str()))
     {
         return Err("The run contains an unknown authorization scope.".to_string());
-    }
-    if !request.authorized_scopes.is_empty() && request.approval_id.is_none() {
-        return Err("The one-time authorization identifier is missing.".to_string());
     }
     if request.run_mode == "review" {
         if !matches!(request.file_access.as_str(), "none" | "read")
@@ -994,16 +1015,223 @@ fn validate_run_safety(request: &AgentRunRequest) -> Result<(), String> {
         );
     }
     if request.destructive_actions_approved
-        && (request.approval_id.is_none()
-            || !request
-                .authorized_scopes
-                .iter()
-                .any(|scope| scope == "files"))
+        && !request
+            .authorized_scopes
+            .iter()
+            .any(|scope| scope == "files")
     {
         return Err("The destructive-action authorization is incomplete.".to_string());
     }
 
     Ok(())
+}
+
+fn run_action_intent(request: &AgentRunRequest) -> Result<ActionIntent, String> {
+    if request.run_id.trim().is_empty()
+        || request.run_id.len() > 256
+        || request.run_id.chars().any(char::is_control)
+    {
+        return Err("The agent run identifier is invalid.".to_string());
+    }
+    let run_mode = match request.run_mode.as_str() {
+        "execute" => RunMode::Execute,
+        "review" => RunMode::Review,
+        _ => return Err("The requested agent run mode is invalid.".to_string()),
+    };
+    Ok(ActionIntent::RunTask {
+        agent_id: request.agent_id,
+        task_owner_agent_id: request.task_owner_agent_id,
+        task_id: request.task_id,
+        run_mode,
+    })
+}
+
+fn build_authorized_agent_run(
+    request: AgentRunRequest,
+    state: &ApplicationState,
+    grant: &AuthorizationGrant,
+) -> Result<AuthorizedAgentRun, String> {
+    let run_mode = match request.run_mode.as_str() {
+        "execute" => RunMode::Execute,
+        "review" => RunMode::Review,
+        _ => return Err("The requested agent run mode is invalid.".to_string()),
+    };
+    let agent = state
+        .agents
+        .iter()
+        .find(|agent| agent.id == request.agent_id)
+        .ok_or_else(|| "The selected agent no longer exists.".to_string())?;
+    let owner = state
+        .agents
+        .iter()
+        .find(|candidate| candidate.id == request.task_owner_agent_id)
+        .ok_or_else(|| "The task owner no longer exists.".to_string())?;
+    let task = owner
+        .tasks
+        .iter()
+        .find(|task| task.id == request.task_id)
+        .ok_or_else(|| "The selected task no longer exists.".to_string())?;
+    let workspace_id = task
+        .workspace_id
+        .as_ref()
+        .or(state.preferences.active_workspace_id.as_ref())
+        .ok_or_else(|| "The task has no selected workspace.".to_string())?;
+    let workspace = state
+        .preferences
+        .workspaces
+        .iter()
+        .find(|workspace| &workspace.id == workspace_id)
+        .ok_or_else(|| "The task workspace no longer exists.".to_string())?;
+    let model = state
+        .models
+        .iter()
+        .find(|model| model.name == agent.model)
+        .ok_or_else(|| {
+            "The selected agent model is not registered in backend state.".to_string()
+        })?;
+
+    let task_text = format!("{} {}", task.title, task.category).to_ascii_lowercase();
+    let destructive = run_mode == RunMode::Execute
+        && contains_any(
+            &task_text,
+            &[
+                "delete",
+                "remove",
+                "erase",
+                "wipe",
+                "truncate",
+                "overwrite",
+                "reset --hard",
+                "clean -",
+                "rm ",
+                "rmdir",
+                "unlink",
+            ],
+        );
+    let writes_workspace = run_mode == RunMode::Execute
+        && (destructive
+            || task.category == "Development"
+            || contains_any(
+                &task_text,
+                &[
+                    "create",
+                    "write",
+                    "edit",
+                    "modify",
+                    "change",
+                    "update",
+                    "refactor",
+                    "fix",
+                    "move",
+                    "rename",
+                    "replace",
+                    "generate",
+                    "add",
+                    "implement",
+                    "build",
+                    "compile",
+                    "install",
+                    "format",
+                ],
+            ));
+    let uses_terminal = run_mode == RunMode::Execute
+        && contains_any(
+            &task_text,
+            &[
+                "command", "terminal", "shell", "bash", "execute", "npm", "pnpm", "yarn", "cargo",
+                "rustc", "git", "python", "pytest", "compile", "install",
+            ],
+        );
+    let enable_web_search = run_mode == RunMode::Execute
+        && agent.capabilities.internet != "none"
+        && (task.category == "Browsing"
+            || contains_any(
+                &task_text,
+                &[
+                    "internet",
+                    "website",
+                    "web search",
+                    "browse",
+                    "download",
+                    "upload",
+                    "curl",
+                    "wget",
+                    "url",
+                    "online",
+                ],
+            ));
+    let authorized_scopes = grant
+        .approval
+        .as_ref()
+        .map(|approval| approval.scopes.clone())
+        .unwrap_or_default();
+    let specialist_output = task.result.as_deref().unwrap_or("No summary returned.");
+    let changed_files = if task.changed_files.is_empty() {
+        "none".to_string()
+    } else {
+        task.changed_files.join(", ")
+    };
+    let diff_evidence = task.diff.as_deref().map_or_else(
+        || {
+            "No Git working-tree diff is available. Inspect the relevant workspace files directly."
+                .to_string()
+        },
+        |diff| format!("Working-tree diff:\n{diff}"),
+    );
+    let review_prompt = format!(
+        "Perform an independent, read-only senior review of task {}.\n\nOriginal task: {}\n\nSpecialist summary:\n{}\n\nReported changed files: {}\n\n{}\n\nCheck correctness, completeness, regressions, safety, and whether the requested result was actually verified. Do not modify files or run commands. End with exactly one verdict line: VERDICT: APPROVED or VERDICT: CHANGES REQUESTED.",
+        task.id, task.title, specialist_output, changed_files, diff_evidence
+    );
+    let execution = AuthorizedAgentRun {
+        run_id: request.run_id,
+        run_mode: request.run_mode,
+        agent_name: agent.name.clone(),
+        description: agent.description.clone(),
+        role: agent.role.clone(),
+        category: agent.category.clone(),
+        memory: agent.memory.clone(),
+        review_feedback: if run_mode == RunMode::Execute
+            && task.review_status == "Changes Requested"
+        {
+            task.review_result.clone()
+        } else {
+            None
+        },
+        task_title: if run_mode == RunMode::Review {
+            review_prompt
+        } else {
+            task.title.clone()
+        },
+        model: model.name.clone(),
+        model_provider: model.provider.clone(),
+        strength: u8::try_from(agent.performance.strength)
+            .unwrap_or(5)
+            .clamp(1, 10),
+        focus: agent.performance.focus.clone(),
+        enable_web_search,
+        workspace_path: workspace.path.clone(),
+        file_access: if run_mode == RunMode::Review {
+            "read".to_string()
+        } else if writes_workspace {
+            agent.capabilities.files.clone()
+        } else if agent.capabilities.files == "none" {
+            "none".to_string()
+        } else {
+            "read".to_string()
+        },
+        terminal_access: if uses_terminal {
+            agent.capabilities.terminal.clone()
+        } else {
+            "none".to_string()
+        },
+        authorized_scopes,
+        destructive_actions_approved: destructive && grant.approval.is_some(),
+        timeout_seconds: u64::try_from(state.preferences.agent_timeout_minutes)
+            .unwrap_or(30)
+            .saturating_mul(60),
+    };
+    validate_run_safety(&execution)?;
+    Ok(execution)
 }
 
 fn emit_run_event(app: &AppHandle, run_id: &str, kind: &str, message: impl Into<String>) {
@@ -1457,7 +1685,7 @@ fn tool_string_argument<'a>(arguments: &'a Value, name: &str) -> Result<&'a str,
 
 fn execute_ollama_workspace_tool(
     workspace: &Path,
-    request: &AgentRunRequest,
+    request: &AuthorizedAgentRun,
     tool_call: &OllamaToolCall,
 ) -> Result<String, String> {
     match tool_call.name.as_str() {
@@ -1550,7 +1778,7 @@ fn ollama_chat_with_cancellation(
 fn run_ollama_task(
     app: AppHandle,
     active_runs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
-    request: AgentRunRequest,
+    request: AuthorizedAgentRun,
 ) -> Result<AgentRunResult, String> {
     let started = Instant::now();
     let run_id = request.run_id.trim().to_string();
@@ -1714,7 +1942,7 @@ fn run_ollama_task(
 fn run_codex_task(
     app: AppHandle,
     active_runs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
-    request: AgentRunRequest,
+    request: AuthorizedAgentRun,
 ) -> Result<AgentRunResult, String> {
     let started = Instant::now();
     let run_id = request.run_id.trim().to_string();
@@ -1975,8 +2203,28 @@ fn cancel_agent_run(run_id: String, state: State<'_, ActiveRuns>) -> Result<bool
 }
 
 #[tauri::command]
-fn open_workspace_item(request: OpenWorkspaceItemRequest) -> Result<(), String> {
-    let workspace = resolve_workspace(&request.workspace_path)?;
+async fn open_workspace_item(
+    request: OpenWorkspaceItemRequest,
+    persistence: State<'_, PersistenceService>,
+) -> Result<(), String> {
+    let intent = ActionIntent::OpenWorkspaceItem {
+        agent_id: request.agent_id,
+        workspace_id: request.workspace_id.clone(),
+        item_path: request.item_path.clone(),
+    };
+    let (_, state) = persistence
+        .inner()
+        .authorize_intent_and_state(intent)
+        .await
+        .map_err(authorization_error_message)?;
+    let workspace_path = state
+        .preferences
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == request.workspace_id)
+        .map(|workspace| workspace.path.as_str())
+        .ok_or_else(|| "The selected workspace no longer exists.".to_string())?;
+    let workspace = resolve_workspace(workspace_path)?;
     let candidate = if Path::new(&request.item_path).is_absolute() {
         PathBuf::from(&request.item_path)
     } else {
@@ -1997,8 +2245,26 @@ fn open_workspace_item(request: OpenWorkspaceItemRequest) -> Result<(), String> 
 }
 
 #[tauri::command]
-fn launch_allowed_application(application: String) -> Result<(), String> {
+async fn launch_allowed_application(
+    agent_id: i64,
+    application: String,
+    persistence: State<'_, PersistenceService>,
+) -> Result<(), String> {
     let requested = application.trim().to_ascii_lowercase();
+    if !matches!(
+        requested.as_str(),
+        "terminal" | "firefox" | "dolphin" | "system-settings" | "code"
+    ) {
+        return Err("That application is not approved for voice launch.".to_string());
+    }
+    consume_authorization(
+        persistence.inner(),
+        ActionIntent::LaunchAllowedApplication {
+            agent_id,
+            application: requested.clone(),
+        },
+    )
+    .await?;
     if requested == "terminal" {
         let terminal = ["konsole", "kitty", "gnome-terminal", "xterm"]
             .into_iter()
@@ -2029,7 +2295,19 @@ fn launch_allowed_application(application: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn launch_desktop_application(application: String) -> Result<(), String> {
+async fn launch_desktop_application(
+    agent_id: i64,
+    application: String,
+    persistence: State<'_, PersistenceService>,
+) -> Result<(), String> {
+    consume_authorization(
+        persistence.inner(),
+        ActionIntent::LaunchDesktopApplication {
+            agent_id,
+            application: application.clone(),
+        },
+    )
+    .await?;
     let desktop_id = desktop_application_id(&application)?;
     let launcher = find_in_path("gtk-launch")
         .ok_or_else(|| "The desktop application launcher is unavailable.".to_string())?;
@@ -2041,11 +2319,30 @@ fn launch_desktop_application(application: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_standard_folder(folder: String) -> Result<(), String> {
+async fn open_standard_folder(
+    agent_id: i64,
+    folder: String,
+    persistence: State<'_, PersistenceService>,
+) -> Result<(), String> {
+    let normalized_folder = folder.trim().to_ascii_lowercase();
+    if !matches!(
+        normalized_folder.as_str(),
+        "downloads" | "documents" | "desktop" | "home"
+    ) {
+        return Err("That folder is not approved for voice control.".to_string());
+    }
+    consume_authorization(
+        persistence.inner(),
+        ActionIntent::OpenStandardFolder {
+            agent_id,
+            folder: normalized_folder.clone(),
+        },
+    )
+    .await?;
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "Could not find the home directory.".to_string())?;
-    let (label, path) = match folder.trim().to_ascii_lowercase().as_str() {
+    let (label, path) = match normalized_folder.as_str() {
         "downloads" => ("Downloads", home.join("Downloads")),
         "documents" => ("Documents", home.join("Documents")),
         "desktop" => ("Desktop", home.join("Desktop")),
@@ -2063,14 +2360,27 @@ fn open_standard_folder(folder: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn close_allowed_application(application: String) -> Result<(), String> {
-    let (label, executable) = match application.trim().to_ascii_lowercase().as_str() {
+async fn close_allowed_application(
+    agent_id: i64,
+    application: String,
+    persistence: State<'_, PersistenceService>,
+) -> Result<(), String> {
+    let normalized_application = application.trim().to_ascii_lowercase();
+    let (label, executable) = match normalized_application.as_str() {
         "firefox" => ("Firefox", "firefox"),
         "dolphin" => ("Dolphin", "dolphin"),
         "system-settings" => ("System Settings", "systemsettings"),
         "code" => ("Visual Studio Code", "code"),
         _ => return Err("That application is not approved for voice close.".to_string()),
     };
+    consume_authorization(
+        persistence.inner(),
+        ActionIntent::CloseAllowedApplication {
+            agent_id,
+            application: normalized_application,
+        },
+    )
+    .await?;
     let pkill = find_in_path("pkill")
         .ok_or_else(|| "The operating-system process controller is unavailable.".to_string())?;
     let status = Command::new(pkill)
@@ -2107,8 +2417,15 @@ fn desktop_control_status(
 
 #[tauri::command]
 async fn enable_desktop_control(
+    agent_id: i64,
     state: State<'_, DesktopControl>,
+    persistence: State<'_, PersistenceService>,
 ) -> Result<DesktopControlStatus, String> {
+    consume_authorization(
+        persistence.inner(),
+        ActionIntent::EnableDesktopControl { agent_id },
+    )
+    .await?;
     if state
         .session
         .lock()
@@ -2160,9 +2477,33 @@ async fn enable_desktop_control(
 
 #[tauri::command]
 async fn send_desktop_pointer_action(
+    agent_id: i64,
     action: String,
     state: State<'_, DesktopControl>,
+    persistence: State<'_, PersistenceService>,
 ) -> Result<(), String> {
+    let action = action.trim().to_ascii_lowercase();
+    if !matches!(
+        action.as_str(),
+        "move-left"
+            | "move-right"
+            | "move-up"
+            | "move-down"
+            | "click"
+            | "double-click"
+            | "scroll-up"
+            | "scroll-down"
+    ) {
+        return Err("That pointer action is not approved for voice control.".to_string());
+    }
+    consume_authorization(
+        persistence.inner(),
+        ActionIntent::DesktopPointer {
+            agent_id,
+            action: action.clone(),
+        },
+    )
+    .await?;
     let active_session = state
         .session
         .lock()
@@ -2171,7 +2512,7 @@ async fn send_desktop_pointer_action(
         .ok_or_else(|| {
             "Enable KDE desktop input before using voice pointer commands.".to_string()
         })?;
-    match action.trim().to_ascii_lowercase().as_str() {
+    match action.as_str() {
         "move-left" => {
             active_session
                 .portal
@@ -2278,7 +2619,16 @@ async fn send_desktop_pointer_action(
 }
 
 #[tauri::command]
-async fn close_active_desktop_application(state: State<'_, DesktopControl>) -> Result<(), String> {
+async fn close_active_desktop_application(
+    agent_id: i64,
+    state: State<'_, DesktopControl>,
+    persistence: State<'_, PersistenceService>,
+) -> Result<(), String> {
+    consume_authorization(
+        persistence.inner(),
+        ActionIntent::CloseActiveApplication { agent_id },
+    )
+    .await?;
     let active_session = state
         .session
         .lock()
@@ -2476,9 +2826,56 @@ if (selected) {{
 
 #[tauri::command]
 async fn send_desktop_keyboard_action(
+    agent_id: i64,
     action: String,
     state: State<'_, DesktopControl>,
+    persistence: State<'_, PersistenceService>,
 ) -> Result<(), String> {
+    let action = action.trim().to_ascii_lowercase();
+    if !matches!(
+        action.as_str(),
+        "open-launcher"
+            | "volume-up"
+            | "volume-down"
+            | "toggle-mute"
+            | "minimize-window"
+            | "maximize-window"
+            | "restore-window"
+            | "next-window"
+            | "previous-window"
+            | "snap-left"
+            | "snap-right"
+            | "left"
+            | "right"
+            | "up"
+            | "down"
+            | "home"
+            | "end"
+            | "page-up"
+            | "page-down"
+            | "tab"
+            | "shift-tab"
+            | "enter"
+            | "escape"
+            | "backspace"
+            | "delete"
+            | "select-all"
+            | "copy"
+            | "cut"
+            | "paste"
+            | "undo"
+            | "redo"
+    ) {
+        return Err("That keyboard action is not approved for voice control.".to_string());
+    }
+    consume_authorization(
+        persistence.inner(),
+        ActionIntent::DesktopKeyboard {
+            agent_id,
+            action: action.clone(),
+        },
+    )
+    .await?;
     let active_session = state
         .session
         .lock()
@@ -2487,7 +2884,6 @@ async fn send_desktop_keyboard_action(
         .ok_or_else(|| {
             "Enable KDE desktop input before using voice keyboard commands.".to_string()
         })?;
-    let action = action.trim().to_ascii_lowercase();
     let kwin_shortcut = match action.as_str() {
         "minimize-window" => Some("Window Minimize"),
         "maximize-window" => Some("Window Maximize"),
@@ -2605,11 +3001,33 @@ async fn send_desktop_keyboard_action(
 }
 
 #[tauri::command]
-fn control_named_desktop_window(
+async fn control_named_desktop_window(
+    agent_id: i64,
     application: String,
     action: String,
     state: State<'_, DesktopControl>,
+    persistence: State<'_, PersistenceService>,
 ) -> Result<(), String> {
+    let normalized_action = action.trim().to_ascii_lowercase();
+    let normalized_application = normalized_application_name(&application);
+    if normalized_application.is_empty() || normalized_application.len() > 80 {
+        return Err("Say the name of the application window to control.".to_string());
+    }
+    if !matches!(
+        normalized_action.as_str(),
+        "restore" | "minimize" | "maximize"
+    ) {
+        return Err("That named window action is not approved for voice control.".to_string());
+    }
+    consume_authorization(
+        persistence.inner(),
+        ActionIntent::DesktopWindow {
+            agent_id,
+            application: normalized_application.clone(),
+            action: normalized_action.clone(),
+        },
+    )
+    .await?;
     let desktop_control_active = state
         .session
         .lock()
@@ -2621,11 +3039,16 @@ fn control_named_desktop_window(
                 .to_string(),
         );
     }
-    control_named_kwin_window(&application, action.trim().to_ascii_lowercase().as_str())
+    control_named_kwin_window(&normalized_application, &normalized_action)
 }
 
 #[tauri::command]
-async fn type_desktop_text(text: String, state: State<'_, DesktopControl>) -> Result<(), String> {
+async fn type_desktop_text(
+    agent_id: i64,
+    text: String,
+    state: State<'_, DesktopControl>,
+    persistence: State<'_, PersistenceService>,
+) -> Result<(), String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("Say the text to type after type, write, or dictate.".to_string());
@@ -2641,6 +3064,14 @@ async fn type_desktop_text(text: String, state: State<'_, DesktopControl>) -> Re
     {
         return Err("Dictated text can contain up to 280 ASCII letters, numbers, spaces, line breaks, and common terminal symbols.".to_string());
     }
+    consume_authorization(
+        persistence.inner(),
+        ActionIntent::TypeDesktopText {
+            agent_id,
+            text: text.to_string(),
+        },
+    )
+    .await?;
     let active_session = state
         .session
         .lock()
@@ -2679,7 +3110,6 @@ async fn type_desktop_text(text: String, state: State<'_, DesktopControl>) -> Re
 
 #[tauri::command]
 fn voice_runtime_status(state: State<'_, VoiceListener>) -> Result<VoiceRuntimeStatus, String> {
-    ensure_voice_listener_config()?;
     let installed = voice_runtime_installed()?;
     let listening = listener_is_running(&state)?;
     let message = if !installed {
@@ -2698,18 +3128,22 @@ fn voice_runtime_status(state: State<'_, VoiceListener>) -> Result<VoiceRuntimeS
 }
 
 #[tauri::command]
-fn save_voice_listener_config(config: VoiceListenerConfig) -> Result<(), String> {
-    save_voice_listener_config_file(config)
-}
-
-#[tauri::command]
-fn install_voice_runtime(app: AppHandle) -> Result<(), String> {
-    let setup_script = voice_runtime_file(&app, "setup.sh")?;
-    let runtime_dir = voice_runtime_data_dir()?;
+async fn install_voice_runtime(
+    agent_id: i64,
+    app: AppHandle,
+    persistence: State<'_, PersistenceService>,
+) -> Result<(), String> {
     if voice_runtime_installed()? {
         emit_voice_runtime_status(&app, true, false, "Offline voice is already installed.");
         return Ok(());
     }
+    consume_authorization(
+        persistence.inner(),
+        ActionIntent::InstallVoiceRuntime { agent_id },
+    )
+    .await?;
+    let setup_script = voice_runtime_file(&app, "setup.sh")?;
+    let runtime_dir = voice_runtime_data_dir()?;
 
     emit_voice_runtime_status(
         &app,
@@ -2756,7 +3190,11 @@ fn install_voice_runtime(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn install_high_accuracy_voice_runtime(app: AppHandle) -> Result<(), String> {
+async fn install_high_accuracy_voice_runtime(
+    agent_id: i64,
+    app: AppHandle,
+    persistence: State<'_, PersistenceService>,
+) -> Result<(), String> {
     if high_accuracy_voice_available() {
         emit_voice_runtime_status(
             &app,
@@ -2766,6 +3204,11 @@ fn install_high_accuracy_voice_runtime(app: AppHandle) -> Result<(), String> {
         );
         return Ok(());
     }
+    consume_authorization(
+        persistence.inner(),
+        ActionIntent::InstallHighAccuracyVoiceRuntime { agent_id },
+    )
+    .await?;
     let setup_script = voice_runtime_file(&app, "setup-high-accuracy.sh")?;
     let runtime_dir = voice_runtime_data_dir()?;
     emit_voice_runtime_status(
@@ -2809,10 +3252,37 @@ fn install_high_accuracy_voice_runtime(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn start_voice_listener(app: AppHandle, state: State<'_, VoiceListener>) -> Result<(), String> {
+async fn start_voice_listener(
+    agent_id: i64,
+    app: AppHandle,
+    state: State<'_, VoiceListener>,
+    persistence: State<'_, PersistenceService>,
+) -> Result<(), String> {
     if listener_is_running(&state)? {
         return Ok(());
     }
+    let (_, application_state) = persistence
+        .inner()
+        .authorize_intent_and_state(ActionIntent::StartVoiceListener { agent_id })
+        .await
+        .map_err(authorization_error_message)?;
+    let phrase_list = |value: &str| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|phrase| !phrase.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    save_voice_listener_config_file(VoiceListenerConfig {
+        wake_phrase: application_state.preferences.voice_wake_phrase.clone(),
+        deactivate_phrase: application_state
+            .preferences
+            .voice_deactivate_phrase
+            .clone(),
+        open_phrases: phrase_list(&application_state.preferences.voice_open_phrases),
+        close_phrases: phrase_list(&application_state.preferences.voice_close_phrases),
+    })?;
     let model = voice_model_dir()?;
     if !model.is_dir() {
         return Err(
@@ -2919,9 +3389,36 @@ async fn save_application_state(
     state: State<'_, PersistenceService>,
     request: SaveApplicationStateRequest,
 ) -> Result<SaveReceipt, PersistenceError> {
+    let security_change = state
+        .inner()
+        .security_change_summary(request.expected_revision, request.state.clone())
+        .await?;
+    let confirmed = if let Some(summary) = security_change {
+        tauri::async_runtime::spawn_blocking(move || {
+            request_native_confirmation(
+                "Confirm protected security change",
+                &format!(
+                    "AI Agent Control Center is requesting changes to: {summary}. Approve this exact security-boundary update?"
+                ),
+            )
+        })
+        .await
+        .map_err(|_| {
+            PersistenceError::new(
+                "NATIVE_CONFIRMATION_UNAVAILABLE",
+                "The trusted desktop confirmation worker stopped unexpectedly.",
+                false,
+            )
+        })?
+        .map_err(|message| {
+            PersistenceError::new("NATIVE_CONFIRMATION_UNAVAILABLE", message, true)
+        })?
+    } else {
+        false
+    };
     state
         .inner()
-        .save(request.expected_revision, request.state)
+        .save(request.expected_revision, request.state, confirmed)
         .await
 }
 
@@ -2930,6 +3427,28 @@ async fn reset_application_state(
     state: State<'_, PersistenceService>,
     request: ResetApplicationStateRequest,
 ) -> Result<StateEnvelope, PersistenceError> {
+    let confirmed = tauri::async_runtime::spawn_blocking(|| {
+        request_native_confirmation(
+            "Confirm application reset",
+            "Reset all application state and approval history to factory defaults?",
+        )
+    })
+    .await
+    .map_err(|_| {
+        PersistenceError::new(
+            "NATIVE_CONFIRMATION_UNAVAILABLE",
+            "The trusted desktop confirmation worker stopped unexpectedly.",
+            false,
+        )
+    })?
+    .map_err(|message| PersistenceError::new("NATIVE_CONFIRMATION_UNAVAILABLE", message, true))?;
+    if !confirmed {
+        return Err(PersistenceError::new(
+            "NATIVE_CONFIRMATION_DENIED",
+            "The application reset was not confirmed.",
+            true,
+        ));
+    }
     state
         .inner()
         .reset(request.expected_revision, request.confirmation)
@@ -2941,6 +3460,28 @@ async fn import_legacy_backup(
     state: State<'_, PersistenceService>,
     request: ImportLegacyBackupRequest,
 ) -> Result<StateEnvelope, PersistenceError> {
+    let confirmed = tauri::async_runtime::spawn_blocking(|| {
+        request_native_confirmation(
+            "Confirm legacy backup import",
+            "Replace current application state with this validated legacy backup? Imported approvals remain non-authoritative.",
+        )
+    })
+    .await
+    .map_err(|_| {
+        PersistenceError::new(
+            "NATIVE_CONFIRMATION_UNAVAILABLE",
+            "The trusted desktop confirmation worker stopped unexpectedly.",
+            false,
+        )
+    })?
+    .map_err(|message| PersistenceError::new("NATIVE_CONFIRMATION_UNAVAILABLE", message, true))?;
+    if !confirmed {
+        return Err(PersistenceError::new(
+            "NATIVE_CONFIRMATION_DENIED",
+            "The legacy backup import was not confirmed.",
+            true,
+        ));
+    }
     state
         .inner()
         .import_legacy_backup(request.expected_revision, request.backup_json)
@@ -2959,11 +3500,67 @@ async fn acknowledge_legacy_cleanup(
 }
 
 #[tauri::command]
+async fn request_authorization(
+    state: State<'_, PersistenceService>,
+    intent: ActionIntent,
+) -> Result<AuthorizationOutcome, PersistenceError> {
+    state.inner().request_authorization(intent).await
+}
+
+#[tauri::command]
+async fn resolve_approval(
+    state: State<'_, PersistenceService>,
+    request: ResolveApprovalRequest,
+) -> Result<app_state::ApprovalRequest, PersistenceError> {
+    let native_confirmed = if request.resolution == ApprovalResolution::Approve {
+        let confirmation = state
+            .inner()
+            .approval_confirmation(request.approval_id)
+            .await?;
+        tauri::async_runtime::spawn_blocking(move || {
+            request_native_confirmation(&confirmation.title, &confirmation.message)
+        })
+        .await
+        .map_err(|_| {
+            PersistenceError::new(
+                "NATIVE_CONFIRMATION_UNAVAILABLE",
+                "The trusted desktop confirmation worker stopped unexpectedly.",
+                false,
+            )
+        })?
+        .map_err(|message| {
+            PersistenceError::new("NATIVE_CONFIRMATION_UNAVAILABLE", message, true)
+        })?
+    } else {
+        false
+    };
+    if request.resolution == ApprovalResolution::Approve && !native_confirmed {
+        return Err(PersistenceError::new(
+            "NATIVE_CONFIRMATION_DENIED",
+            "The one-time authorization was not confirmed.",
+            true,
+        ));
+    }
+    state
+        .inner()
+        .resolve_approval(request.approval_id, request.resolution, native_confirmed)
+        .await
+}
+
+#[tauri::command]
 async fn run_agent_task(
     app: AppHandle,
     state: State<'_, ActiveRuns>,
+    persistence: State<'_, PersistenceService>,
     request: AgentRunRequest,
 ) -> Result<AgentRunResult, String> {
+    let intent = run_action_intent(&request)?;
+    let (grant, application_state) = persistence
+        .inner()
+        .authorize_intent_and_state(intent)
+        .await
+        .map_err(authorization_error_message)?;
+    let request = build_authorized_agent_run(request, &application_state, &grant)?;
     let active_runs = state.runs.clone();
     tauri::async_runtime::spawn_blocking(move || {
         if is_ollama_provider(&request.model_provider) {
@@ -3051,6 +3648,8 @@ pub fn run() {
             reset_application_state,
             import_legacy_backup,
             acknowledge_legacy_cleanup,
+            request_authorization,
+            resolve_approval,
             codex_runtime_status,
             ollama_runtime_status,
             choose_workspace_folder,
@@ -3068,7 +3667,6 @@ pub fn run() {
             enable_desktop_control,
             send_desktop_pointer_action,
             voice_runtime_status,
-            save_voice_listener_config,
             install_voice_runtime,
             install_high_accuracy_voice_runtime,
             start_voice_listener,
@@ -3084,8 +3682,149 @@ mod tests {
     use super::*;
     use std::{io::ErrorKind, net::TcpListener};
 
-    fn agent_run_request_fixture() -> AgentRunRequest {
-        AgentRunRequest {
+    #[test]
+    fn tauri_webview_boundary_has_restrictive_csp_and_minimal_core_permissions() {
+        let config: Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let security = &config["app"]["security"];
+        let csp = security["csp"].as_str().unwrap();
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("object-src 'none'"));
+        assert!(csp.contains("base-uri 'none'"));
+        assert!(csp.contains("connect-src 'self' ipc: http://ipc.localhost"));
+        assert!(!csp.contains("unsafe-eval"));
+        assert!(!csp.contains("localhost:1420"));
+        assert_eq!(security["freezePrototype"], true);
+
+        let capability: Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        assert_eq!(capability["windows"], serde_json::json!(["main"]));
+        assert_eq!(
+            capability["permissions"],
+            serde_json::json!(["core:event:allow-listen", "core:event:allow-unlisten"])
+        );
+    }
+
+    #[test]
+    fn run_ipc_rejects_renderer_supplied_authorization_and_policy_fields() {
+        let legacy_request = serde_json::json!({
+            "runId": "run-1",
+            "agentId": 2,
+            "taskOwnerAgentId": 2,
+            "taskId": 41,
+            "runMode": "execute",
+            "approvalId": 9,
+            "authorizedScopes": ["files", "terminal"],
+            "destructiveActionsApproved": true,
+            "workspacePath": "/tmp/forged",
+            "terminalAccess": "admin"
+        });
+        assert!(serde_json::from_value::<AgentRunRequest>(legacy_request).is_err());
+        let request: AgentRunRequest = serde_json::from_value(serde_json::json!({
+            "runId": "run-1",
+            "agentId": 2,
+            "taskOwnerAgentId": 2,
+            "taskId": 41,
+            "runMode": "execute"
+        }))
+        .unwrap();
+        assert!(matches!(
+            run_action_intent(&request).unwrap(),
+            ActionIntent::RunTask {
+                agent_id: 2,
+                task_owner_agent_id: 2,
+                task_id: 41,
+                run_mode: RunMode::Execute
+            }
+        ));
+        assert!(
+            serde_json::from_value::<OpenWorkspaceItemRequest>(serde_json::json!({
+                "agentId": 2,
+                "workspaceId": "workspace-1",
+                "itemPath": ".",
+                "approvalId": 9
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn every_privileged_ipc_handler_routes_through_backend_authority() {
+        let source = include_str!("lib.rs");
+        let handlers = [
+            ("open_workspace_item", "ActionIntent::OpenWorkspaceItem"),
+            (
+                "launch_allowed_application",
+                "ActionIntent::LaunchAllowedApplication",
+            ),
+            (
+                "launch_desktop_application",
+                "ActionIntent::LaunchDesktopApplication",
+            ),
+            ("open_standard_folder", "ActionIntent::OpenStandardFolder"),
+            (
+                "close_allowed_application",
+                "ActionIntent::CloseAllowedApplication",
+            ),
+            (
+                "enable_desktop_control",
+                "ActionIntent::EnableDesktopControl",
+            ),
+            (
+                "send_desktop_pointer_action",
+                "ActionIntent::DesktopPointer",
+            ),
+            (
+                "close_active_desktop_application",
+                "ActionIntent::CloseActiveApplication",
+            ),
+            (
+                "send_desktop_keyboard_action",
+                "ActionIntent::DesktopKeyboard",
+            ),
+            (
+                "control_named_desktop_window",
+                "ActionIntent::DesktopWindow",
+            ),
+            ("type_desktop_text", "ActionIntent::TypeDesktopText"),
+            ("install_voice_runtime", "ActionIntent::InstallVoiceRuntime"),
+            (
+                "install_high_accuracy_voice_runtime",
+                "ActionIntent::InstallHighAccuracyVoiceRuntime",
+            ),
+            ("start_voice_listener", "ActionIntent::StartVoiceListener"),
+        ];
+        for (handler, intent) in handlers {
+            let marker = format!("async fn {handler}(");
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("missing privileged IPC handler {handler}"));
+            let remaining = &source[start..];
+            let end = remaining
+                .find("\n#[tauri::command]")
+                .or_else(|| remaining.find("\n#[cfg_attr"))
+                .unwrap_or(remaining.len());
+            let body = &remaining[..end];
+            assert!(
+                body.contains(intent),
+                "{handler} must construct the expected typed action intent"
+            );
+            assert!(
+                body.contains("consume_authorization")
+                    || body.contains("authorize_intent_and_state"),
+                "{handler} must call backend authorization before its side effect"
+            );
+        }
+
+        let run_start = source.find("async fn run_agent_task(").unwrap();
+        let run_remaining = &source[run_start..];
+        let run_end = run_remaining.find("\n#[cfg_attr").unwrap();
+        let run_body = &run_remaining[..run_end];
+        assert!(run_body.contains("run_action_intent"));
+        assert!(run_body.contains("authorize_intent_and_state"));
+    }
+
+    fn agent_run_request_fixture() -> AuthorizedAgentRun {
+        AuthorizedAgentRun {
             run_id: "run-1".to_string(),
             run_mode: "execute".to_string(),
             agent_name: "Fixture Agent".to_string(),
@@ -3103,14 +3842,13 @@ mod tests {
             workspace_path: "/tmp/task-0002-fixture".to_string(),
             file_access: "read".to_string(),
             terminal_access: "none".to_string(),
-            approval_id: None,
             authorized_scopes: Vec::new(),
             destructive_actions_approved: false,
             timeout_seconds: 60,
         }
     }
 
-    fn assert_safety_error(request: &AgentRunRequest, expected: &str) {
+    fn assert_safety_error(request: &AuthorizedAgentRun, expected: &str) {
         assert_eq!(validate_run_safety(request).unwrap_err(), expected);
     }
 
@@ -3137,18 +3875,10 @@ mod tests {
     }
 
     #[test]
-    fn run_safety_requires_known_scopes_and_an_authorization_id() {
+    fn run_safety_requires_backend_issued_known_scopes() {
         let mut request = agent_run_request_fixture();
         request.authorized_scopes = vec!["network".to_string()];
-        request.approval_id = Some(7);
         assert_safety_error(&request, "The run contains an unknown authorization scope.");
-
-        let mut request = agent_run_request_fixture();
-        request.authorized_scopes = vec!["files".to_string()];
-        assert_safety_error(
-            &request,
-            "The one-time authorization identifier is missing.",
-        );
     }
 
     #[test]
@@ -3186,7 +3916,6 @@ mod tests {
             "The destructive-action authorization is incomplete.",
         );
 
-        destructive.approval_id = Some(9);
         destructive.authorized_scopes = vec!["files".to_string()];
         assert!(validate_run_safety(&destructive).is_ok());
     }

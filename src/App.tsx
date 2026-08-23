@@ -123,6 +123,92 @@ type DesktopControlStatus = {
   message: string;
 };
 
+type BackendActionIntent =
+  | {
+      kind: "runTask";
+      agentId: number;
+      taskOwnerAgentId: number;
+      taskId: number;
+      runMode: "execute" | "review";
+    }
+  | {
+      kind: "openWorkspaceItem";
+      agentId: number;
+      workspaceId: string;
+      itemPath: string;
+    }
+  | { kind: "launchAllowedApplication"; agentId: number; application: string }
+  | { kind: "launchDesktopApplication"; agentId: number; application: string }
+  | { kind: "openStandardFolder"; agentId: number; folder: string }
+  | { kind: "closeAllowedApplication"; agentId: number; application: string }
+  | { kind: "closeActiveApplication"; agentId: number }
+  | { kind: "desktopKeyboard"; agentId: number; action: string }
+  | { kind: "desktopWindow"; agentId: number; application: string; action: string }
+  | { kind: "typeDesktopText"; agentId: number; text: string }
+  | { kind: "enableDesktopControl"; agentId: number }
+  | { kind: "desktopPointer"; agentId: number; action: string }
+  | { kind: "installVoiceRuntime"; agentId: number }
+  | { kind: "installHighAccuracyVoiceRuntime"; agentId: number }
+  | { kind: "startVoiceListener"; agentId: number };
+
+type AuthorizationOutcome = {
+  decision: "allowed" | "approvalRequired";
+  approval: ApprovalRequest | null;
+};
+
+type AuthorizationReadiness = {
+  ready: boolean;
+  approval: ApprovalRequest | null;
+};
+
+function upsertApprovalRequest(
+  requests: ApprovalRequest[],
+  approval: ApprovalRequest,
+): ApprovalRequest[] {
+  const existingIndex = requests.findIndex((request) => request.id === approval.id);
+  if (existingIndex === -1) {
+    return [approval, ...requests];
+  }
+  return requests.map((request) =>
+    request.id === approval.id ? approval : request,
+  );
+}
+
+async function prepareBackendAuthorization(
+  intent: BackendActionIntent,
+  setApprovalRequests: React.Dispatch<React.SetStateAction<ApprovalRequest[]>>,
+): Promise<AuthorizationReadiness> {
+  const outcome = await invoke<AuthorizationOutcome>("request_authorization", {
+    intent,
+  });
+  if (outcome.approval) {
+    setApprovalRequests((requests) =>
+      upsertApprovalRequest(requests, outcome.approval as ApprovalRequest),
+    );
+  }
+  return {
+    ready:
+      outcome.decision === "allowed" || outcome.approval?.status === "Approved",
+    approval: outcome.approval,
+  };
+}
+
+function markApprovalConsumed(
+  setApprovalRequests: React.Dispatch<React.SetStateAction<ApprovalRequest[]>>,
+  approval: ApprovalRequest | null,
+) {
+  if (!approval || approval.status !== "Approved") {
+    return;
+  }
+  setApprovalRequests((requests) =>
+    requests.map((request) =>
+      request.id === approval.id
+        ? { ...request, consumedAt: new Date().toISOString() }
+        : request,
+    ),
+  );
+}
+
 function isDesktopRuntime() {
   return "__TAURI_INTERNALS__" in window;
 }
@@ -1259,21 +1345,41 @@ function AgentsPage({
       return;
     }
 
-    setSystemCapabilityMessage("Requesting KDE desktop input permission...");
-    void invoke<DesktopControlStatus>("enable_desktop_control")
-      .then((status) => setSystemCapabilityMessage(status.message))
-      .catch((error) => setSystemCapabilityMessage(errorMessage(error)));
+    setSystemCapabilityMessage(
+      "Confirm the capability change in the trusted desktop dialog, then select Enable KDE desktop input.",
+    );
   }
 
-  function enableDesktopInput() {
+  async function enableDesktopInput() {
     if (!isDesktopRuntime()) {
       setSystemCapabilityMessage("KDE desktop input can only be enabled in the installed app, not the browser preview.");
       return;
     }
-    setSystemCapabilityMessage("Requesting KDE desktop input permission...");
-    void invoke<DesktopControlStatus>("enable_desktop_control")
-      .then((status) => setSystemCapabilityMessage(status.message))
-      .catch((error) => setSystemCapabilityMessage(errorMessage(error)));
+    if (!selectedAgent) {
+      setSystemCapabilityMessage("Select PC Control Agent first.");
+      return;
+    }
+    setSystemCapabilityMessage("Requesting backend authorization...");
+    try {
+      const authorization = await prepareBackendAuthorization(
+        { kind: "enableDesktopControl", agentId: selectedAgent.id },
+        setApprovalRequests,
+      );
+      if (!authorization.ready) {
+        setSystemCapabilityMessage(
+          "Desktop input is waiting for trusted authorization in Approvals.",
+        );
+        onOpenApprovals();
+        return;
+      }
+      const status = await invoke<DesktopControlStatus>("enable_desktop_control", {
+        agentId: selectedAgent.id,
+      });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
+      setSystemCapabilityMessage(status.message);
+    } catch (error) {
+      setSystemCapabilityMessage(errorMessage(error));
+    }
   }
 
   function updateApproval(key: ApprovalKey, value: ApprovalMode) {
@@ -1566,99 +1672,9 @@ function AgentsPage({
     }
   }
 
-  function requestRunApproval(
-    task: AgentTask,
-    workspace: WorkspaceDefinition,
-    assessment: TaskSafetyAssessment,
-  ) {
-    if (!selectedAgent) {
-      return;
-    }
-
-    const now = Date.now();
-    const existingPending = approvalRequests.find(
-      (request) =>
-        request.agentId === selectedAgent.id &&
-        request.taskId === task.id &&
-        request.taskSnapshot === task.title &&
-        request.status === "Pending" &&
-        new Date(request.expiresAt).getTime() > now,
-    );
-
-    if (existingPending) {
-      setRuntimeError(
-        "This run is waiting for authorization. Open Approvals to approve or deny it.",
-      );
-      setTaskWorkflow(task.id, "Blocked", "Supervisor Approval");
-      return;
-    }
-
-    const requestId = Date.now() + Math.floor(Math.random() * 1000);
-    const createdAt = new Date();
-    const expiresAt = new Date(
-      createdAt.getTime() + preferences.approvalExpiryMinutes * 60 * 1000,
-    );
-
-    setApprovalRequests((currentRequests) => [
-      {
-        id: requestId,
-        agentId: selectedAgent.id,
-        taskId: task.id,
-        title: `Authorize one run: ${task.title}`,
-        reason: assessment.reason,
-        status: "Pending",
-        createdAt: createdAt.toISOString(),
-        resolvedAt: null,
-        riskLevel: assessment.riskLevel,
-        scopes: assessment.approvalScopes,
-        workspaceId: workspace.id,
-        taskSnapshot: task.title,
-        expiresAt: expiresAt.toISOString(),
-        consumedAt: null,
-      },
-      ...currentRequests.map((request) =>
-        request.agentId === selectedAgent.id &&
-        request.taskId === task.id &&
-        request.status === "Pending" &&
-        new Date(request.expiresAt).getTime() <= now
-          ? { ...request, status: "Expired" as ApprovalRequestStatus }
-          : request,
-      ),
-    ]);
-    setAgents((currentAgents) =>
-      currentAgents.map((agent) =>
-        agent.id === selectedAgent.id
-          ? {
-              ...agent,
-              status: "Waiting",
-              tasks: agent.tasks.map((item) =>
-                item.id === task.id
-                  ? {
-                      ...item,
-                      status: "Blocked",
-                      phase: "Supervisor Approval",
-                      completedAt: null,
-                    }
-                  : item,
-              ),
-              activity: [
-                createActivity(
-                  `Safety approval requested for "${task.title}" (${assessment.riskLevel} risk).`,
-                ),
-                ...agent.activity,
-              ],
-            }
-          : agent,
-      ),
-    );
-    setRuntimeError(
-      "This run needs one-time authorization. Open Approvals to review it.",
-    );
-  }
-
   async function runSeniorReview(
     task: AgentTask,
-    executionResult?: AgentRunResult,
+    _executionResult?: AgentRunResult,
     continuation = false,
   ) {
     if (!selectedAgent || (!continuation && runningTaskId !== null)) {
@@ -1689,28 +1705,30 @@ function AgentsPage({
       setRuntimeError("Add a registered model to the catalog before starting a senior review.");
       return;
     }
-    const reviewerModel = models.some((model) => model.name === reviewer.model)
-      ? reviewer.model
-      : models.some((model) => model.name === selectedAgent.model)
-        ? selectedAgent.model
-        : (models[0]?.name ?? selectedAgent.model);
-    const reviewerModelProvider =
-      models.find((model) => model.name === reviewerModel)?.provider ??
-      "OpenAI";
-
-    const specialistOutput = executionResult?.output ?? task.result ?? "No summary returned.";
-    const changedFiles = executionResult?.changedFiles ?? task.changedFiles;
-    const diff = executionResult?.diff ?? task.diff;
-    const reviewPrompt = [
-      "Perform an independent, read-only senior review of another agent's completed task.",
-      `Original task: ${task.title}`,
-      `Specialist: ${selectedAgent.name}`,
-      `Specialist summary:\n${specialistOutput}`,
-      `Reported changed files: ${changedFiles.length > 0 ? changedFiles.join(", ") : "none"}`,
-      diff ? `Working-tree diff:\n${diff}` : "No Git working-tree diff is available. Inspect the relevant workspace files directly.",
-      "Check correctness, completeness, regressions, safety, and whether the requested result was actually verified.",
-      "Do not modify files and do not run commands. End with exactly one verdict line: VERDICT: APPROVED or VERDICT: CHANGES REQUESTED.",
-    ].join("\n\n");
+    let reviewAuthorization: AuthorizationReadiness;
+    try {
+      reviewAuthorization = await prepareBackendAuthorization(
+        {
+          kind: "runTask",
+          agentId: reviewer.id,
+          taskOwnerAgentId: selectedAgent.id,
+          taskId: task.id,
+          runMode: "review",
+        },
+        setApprovalRequests,
+      );
+    } catch (error) {
+      setRuntimeError(errorMessage(error));
+      return;
+    }
+    if (!reviewAuthorization.ready) {
+      setRuntimeError(
+        "This review is waiting for backend authorization. Open Approvals to approve or deny it.",
+      );
+      onOpenApprovals();
+      return;
+    }
+    markApprovalConsumed(setApprovalRequests, reviewAuthorization.approval);
     const reviewRunId = `review-${task.id}-${Date.now()}`;
     let stopReviewListening: (() => void) | null = null;
 
@@ -1768,25 +1786,9 @@ function AgentsPage({
         request: {
           runId: reviewRunId,
           runMode: "review",
-          agentName: reviewer.name,
-          description: reviewer.description,
-          role: reviewer.role,
-          category: reviewer.category,
-          memory: reviewer.memory,
-          reviewFeedback: null,
-          taskTitle: reviewPrompt,
-          model: reviewerModel,
-          modelProvider: reviewerModelProvider,
-          strength: reviewer.performance.strength,
-          focus: reviewer.performance.focus,
-          enableWebSearch: false,
-          workspacePath: workspace.path,
-          fileAccess: "read",
-          terminalAccess: "none",
-          approvalId: null,
-          authorizedScopes: [],
-          destructiveActionsApproved: false,
-          timeoutSeconds: preferences.agentTimeoutMinutes * 60,
+          agentId: reviewer.id,
+          taskOwnerAgentId: selectedAgent.id,
+          taskId: task.id,
         },
       });
       const approved = /\bverdict\s*:\s*approved\b/i.test(result.output);
@@ -1963,32 +1965,30 @@ function AgentsPage({
       return;
     }
 
-    const now = Date.now();
-    const approvedRequest = approvalRequests.find(
-      (request) =>
-        request.agentId === selectedAgent.id &&
-        request.taskId === task.id &&
-        request.taskSnapshot === task.title &&
-        request.workspaceId === workspace.id &&
-        request.status === "Approved" &&
-        request.consumedAt === null &&
-        new Date(request.expiresAt).getTime() > now,
-    );
-
-    if (assessment.requiresApproval && !approvedRequest) {
-      requestRunApproval(task, workspace, assessment);
+    let authorization: AuthorizationReadiness;
+    try {
+      authorization = await prepareBackendAuthorization(
+        {
+          kind: "runTask",
+          agentId: selectedAgent.id,
+          taskOwnerAgentId: selectedAgent.id,
+          taskId: task.id,
+          runMode: "execute",
+        },
+        setApprovalRequests,
+      );
+    } catch (error) {
+      setRuntimeError(errorMessage(error));
       return;
     }
-
-    if (approvedRequest) {
-      setApprovalRequests((currentRequests) =>
-        currentRequests.map((request) =>
-          request.id === approvedRequest.id
-            ? { ...request, consumedAt: new Date().toISOString() }
-            : request,
-        ),
+    if (!authorization.ready) {
+      setRuntimeError(
+        "This run is waiting for backend authorization. Open Approvals to approve or deny it.",
       );
+      setTaskWorkflow(task.id, "Blocked", "Supervisor Approval");
+      return;
     }
+    markApprovalConsumed(setApprovalRequests, authorization.approval);
 
     setRuntimeError("");
     setRuntimeProgress([]);
@@ -2019,36 +2019,9 @@ function AgentsPage({
         request: {
           runId,
           runMode: "execute",
-          agentName: selectedAgent.name,
-          description: selectedAgent.description,
-          role: selectedAgent.role,
-          category: selectedAgent.category,
-          memory: selectedAgent.memory,
-          reviewFeedback:
-            task.reviewStatus === "Changes Requested"
-              ? task.reviewResult
-              : null,
-          taskTitle: task.title,
-          model: selectedAgent.model,
-          modelProvider: selectedModel.provider,
-          strength: selectedAgent.performance.strength,
-          focus: selectedAgent.performance.focus,
-          enableWebSearch:
-            selectedAgent.capabilities.internet !== "none" &&
-            (selectedAgent.approvals.internet === "allow" ||
-              approvedRequest?.scopes.includes("internet") === true),
-          workspacePath: workspace.path,
-          fileAccess: assessment.writesWorkspace
-            ? selectedAgent.capabilities.files
-            : selectedAgent.capabilities.files === "none"
-              ? "none"
-              : "read",
-          terminalAccess: selectedAgent.capabilities.terminal,
-          approvalId: approvedRequest?.id ?? null,
-          authorizedScopes: approvedRequest?.scopes ?? [],
-          destructiveActionsApproved:
-            assessment.destructive && approvedRequest !== undefined,
-          timeoutSeconds: preferences.agentTimeoutMinutes * 60,
+          agentId: selectedAgent.id,
+          taskOwnerAgentId: selectedAgent.id,
+          taskId: task.id,
         },
       });
 
@@ -2181,12 +2154,33 @@ function AgentsPage({
     }
 
     try {
+      if (!selectedAgent) {
+        throw new Error("Select the task agent before opening workspace files.");
+      }
+      const authorization = await prepareBackendAuthorization(
+        {
+          kind: "openWorkspaceItem",
+          agentId: selectedAgent.id,
+          workspaceId: workspace.id,
+          itemPath,
+        },
+        setApprovalRequests,
+      );
+      if (!authorization.ready) {
+        setRuntimeError(
+          "Opening this workspace item is waiting for backend authorization.",
+        );
+        onOpenApprovals();
+        return;
+      }
       await invoke("open_workspace_item", {
         request: {
-          workspacePath: workspace.path,
+          agentId: selectedAgent.id,
+          workspaceId: workspace.id,
           itemPath,
         },
       });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
     } catch (error) {
       setRuntimeError(errorMessage(error));
     }
@@ -3429,7 +3423,6 @@ function TasksPage({
   setAgents,
   retentionDays,
   setRetentionDays,
-  approvalRequests,
   setApprovalRequests,
 }: {
   agents: Agent[];
@@ -3438,7 +3431,6 @@ function TasksPage({
   setRetentionDays: React.Dispatch<
     React.SetStateAction<HistoryRetentionDays>
   >;
-  approvalRequests: ApprovalRequest[];
   setApprovalRequests: React.Dispatch<
     React.SetStateAction<ApprovalRequest[]>
   >;
@@ -3620,47 +3612,32 @@ function TasksPage({
     );
   }
 
-  function requestTaskApproval(agent: Agent, task: AgentTask) {
-    const alreadyPending = approvalRequests.some(
-      (request) =>
-        request.taskId === task.id &&
-        request.agentId === agent.id &&
-        request.status === "Pending",
-    );
-
-    if (alreadyPending) {
-      window.alert("This task already has a pending approval request.");
-      return;
-    }
-
+  async function requestTaskApproval(agent: Agent, task: AgentTask) {
     const assessment = taskSafetyAssessment(task, agent, "strict");
     if (assessment.blockedReason) {
       window.alert(assessment.blockedReason);
       return;
     }
-    const createdAt = new Date();
-
-    setApprovalRequests((currentRequests) => [
-      {
-        id: Date.now(),
-        agentId: agent.id,
-        taskId: task.id,
-        title: `Approval required: ${task.title}`,
-        reason: assessment.reason,
-        status: "Pending",
-        createdAt: createdAt.toISOString(),
-        resolvedAt: null,
-        riskLevel: assessment.riskLevel,
-        scopes: assessment.approvalScopes,
-        workspaceId: task.workspaceId,
-        taskSnapshot: task.title,
-        expiresAt: new Date(
-          createdAt.getTime() + 30 * 60 * 1000,
-        ).toISOString(),
-        consumedAt: null,
-      },
-      ...currentRequests,
-    ]);
+    let authorization: AuthorizationReadiness;
+    try {
+      authorization = await prepareBackendAuthorization(
+        {
+          kind: "runTask",
+          agentId: agent.id,
+          taskOwnerAgentId: agent.id,
+          taskId: task.id,
+          runMode: "execute",
+        },
+        setApprovalRequests,
+      );
+    } catch (error) {
+      window.alert(errorMessage(error));
+      return;
+    }
+    if (authorization.ready && !authorization.approval) {
+      window.alert("Current backend policy allows this task without an approval record.");
+      return;
+    }
 
     setAgents((currentAgents) =>
       currentAgents.map((currentAgent) =>
@@ -3671,15 +3648,15 @@ function TasksPage({
                 item.id === task.id
                   ? {
                       ...item,
-                      status: "Blocked",
-                      phase: "Supervisor Approval",
+                      status: authorization.ready ? "Pending" : "Blocked",
+                      phase: authorization.ready ? "Assigned" : "Supervisor Approval",
                     }
                   : item,
               ),
               activity: [
                 {
                   id: Date.now() + Math.floor(Math.random() * 1000),
-                  message: `Approval requested for task "${task.title}".`,
+                  message: `Backend authorization ${authorization.ready ? "is ready" : "was requested"} for task "${task.title}".`,
                   createdAt: new Date().toISOString(),
                 },
                 ...currentAgent.activity,
@@ -4026,6 +4003,7 @@ function ApprovalsPage({
 }) {
   const [statusFilter, setStatusFilter] =
     useState<ApprovalRequestStatus | "All">("Pending");
+  const [resolutionError, setResolutionError] = useState("");
 
   const filteredRequests = approvalRequests.filter(
     (request) =>
@@ -4045,7 +4023,7 @@ function ApprovalsPage({
     (request) => request.status === "Expired",
   ).length;
 
-  function resolveApproval(
+  async function resolveApproval(
     requestId: number,
     status: "Approved" | "Denied",
   ) {
@@ -4053,25 +4031,21 @@ function ApprovalsPage({
     if (!request) {
       return;
     }
-    if (new Date(request.expiresAt).getTime() <= Date.now()) {
-      setApprovalRequests((currentRequests) =>
-        currentRequests.map((item) =>
-          item.id === requestId ? { ...item, status: "Expired" } : item,
-        ),
-      );
+    setResolutionError("");
+    let resolved: ApprovalRequest;
+    try {
+      resolved = await invoke<ApprovalRequest>("resolve_approval", {
+        request: {
+          approvalId: requestId,
+          resolution: status === "Approved" ? "approve" : "deny",
+        },
+      });
+    } catch (error) {
+      setResolutionError(errorMessage(error));
       return;
     }
-
     setApprovalRequests((currentRequests) =>
-      currentRequests.map((request) =>
-        request.id === requestId
-          ? {
-              ...request,
-              status,
-              resolvedAt: new Date().toISOString(),
-            }
-          : request,
-      ),
+      upsertApprovalRequest(currentRequests, resolved),
     );
     setAgents((currentAgents) =>
       currentAgents.map((agent) =>
@@ -4105,30 +4079,6 @@ function ApprovalsPage({
     );
   }
 
-  function deleteApproval(requestId: number) {
-    setApprovalRequests((currentRequests) =>
-      currentRequests.filter(
-        (request) => request.id !== requestId,
-      ),
-    );
-  }
-
-  function clearResolvedApprovals() {
-    const shouldClear = window.confirm(
-      "Delete all approved and denied requests?",
-    );
-
-    if (!shouldClear) {
-      return;
-    }
-
-    setApprovalRequests((currentRequests) =>
-      currentRequests.filter(
-        (request) => request.status === "Pending",
-      ),
-    );
-  }
-
   return (
     <>
       <header className="topbar">
@@ -4137,15 +4087,9 @@ function ApprovalsPage({
           <h1>Approvals</h1>
           <p className="page-message">
             Review and resolve actions that require human authorization.
+            Approval history is managed by the backend.
           </p>
         </div>
-
-        <button
-          className="danger-button"
-          onClick={clearResolvedApprovals}
-        >
-          Clear resolved
-        </button>
       </header>
 
       <section className="summary-grid">
@@ -4175,6 +4119,9 @@ function ApprovalsPage({
       </section>
 
       <section className="panel">
+        {resolutionError && (
+          <p className="page-message" role="alert">{resolutionError}</p>
+        )}
         <div className="panel-heading">
           <div>
             <span className="eyebrow">REQUEST QUEUE</span>
@@ -4338,17 +4285,6 @@ function ApprovalsPage({
                           Deny
                         </button>
                       </>
-                    )}
-
-                    {request.status !== "Pending" && (
-                      <button
-                        className="danger-button"
-                        onClick={() =>
-                          deleteApproval(request.id)
-                        }
-                      >
-                        Delete
-                      </button>
                     )}
 
                     {request.status === "Approved" &&
@@ -4725,12 +4661,16 @@ function ActivityPage({
 function VoiceControlPage({
   agents,
   setAgents,
+  setApprovalRequests,
   preferences,
   setPreferences,
   visible = true,
 }: {
   agents: Agent[];
   setAgents: React.Dispatch<React.SetStateAction<Agent[]>>;
+  setApprovalRequests: React.Dispatch<
+    React.SetStateAction<ApprovalRequest[]>
+  >;
   preferences: AppPreferences;
   setPreferences: React.Dispatch<React.SetStateAction<AppPreferences>>;
   visible?: boolean;
@@ -4807,6 +4747,29 @@ function VoiceControlPage({
   const openPhrases = phraseList(preferences.voiceOpenPhrases);
   const closePhrases = phraseList(preferences.voiceClosePhrases);
 
+  async function authorizeVoiceAction(
+    intent: BackendActionIntent,
+  ): Promise<AuthorizationReadiness | null> {
+    try {
+      const authorization = await prepareBackendAuthorization(
+        intent,
+        setApprovalRequests,
+      );
+      if (!authorization.ready) {
+        setMessage(
+          "This action is waiting for trusted backend authorization. Open Approvals to approve or deny it.",
+        );
+        setVoiceUiState("PROCESSING");
+        return null;
+      }
+      return authorization;
+    } catch (error) {
+      setMessage(errorMessage(error));
+      setVoiceUiState("ERROR");
+      return null;
+    }
+  }
+
   function createCodingTask(request: string) {
     if (!codingAgent) {
       setMessage("Lucy cannot route work because the Coding Agent is missing.");
@@ -4882,7 +4845,17 @@ function VoiceControlPage({
     }
 
     try {
-      await invoke("launch_allowed_application", { application: application.key });
+      const authorization = await authorizeVoiceAction({
+        kind: "launchAllowedApplication",
+        agentId: pcAgent.id,
+        application: application.key,
+      });
+      if (!authorization) return;
+      await invoke("launch_allowed_application", {
+        agentId: pcAgent.id,
+        application: application.key,
+      });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
       setPendingApplication(null);
       setMessage(`Opened ${application.label}.`);
     } catch (error) {
@@ -4911,7 +4884,17 @@ function VoiceControlPage({
     }
 
     try {
-      await invoke("close_allowed_application", { application: application.key });
+      const authorization = await authorizeVoiceAction({
+        kind: "closeAllowedApplication",
+        agentId: pcAgent.id,
+        application: application.key,
+      });
+      if (!authorization) return;
+      await invoke("close_allowed_application", {
+        agentId: pcAgent.id,
+        application: application.key,
+      });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
       setPendingApplication(null);
       setMessage(`Requested that ${application.label} close.`);
     } catch (error) {
@@ -4940,7 +4923,17 @@ function VoiceControlPage({
     }
 
     try {
-      await invoke("send_desktop_pointer_action", { action: action.key });
+      const authorization = await authorizeVoiceAction({
+        kind: "desktopPointer",
+        agentId: pcAgent.id,
+        action: action.key,
+      });
+      if (!authorization) return;
+      await invoke("send_desktop_pointer_action", {
+        agentId: pcAgent.id,
+        action: action.key,
+      });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
       setPendingApplication(null);
       setMessage(`Voice pointer: ${action.label}.`);
     } catch (error) {
@@ -4962,7 +4955,14 @@ function VoiceControlPage({
       return;
     }
     try {
-      await invoke("send_desktop_keyboard_action", { action });
+      const authorization = await authorizeVoiceAction({
+        kind: "desktopKeyboard",
+        agentId: pcAgent.id,
+        action,
+      });
+      if (!authorization) return;
+      await invoke("send_desktop_keyboard_action", { agentId: pcAgent.id, action });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
       setVoiceUiState("SUCCESS");
       setMessage(`Requested: ${desktopActionLabels[action] ?? action}.`);
     } catch (error) {
@@ -4985,7 +4985,19 @@ function VoiceControlPage({
       return;
     }
     try {
-      await invoke("control_named_desktop_window", { application, action });
+      const authorization = await authorizeVoiceAction({
+        kind: "desktopWindow",
+        agentId: pcAgent.id,
+        application,
+        action,
+      });
+      if (!authorization) return;
+      await invoke("control_named_desktop_window", {
+        agentId: pcAgent.id,
+        application,
+        action,
+      });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
       setVoiceUiState("SUCCESS");
       setMessage(`Requested ${action} for the existing ${application} window.`);
     } catch (error) {
@@ -5008,7 +5020,14 @@ function VoiceControlPage({
       return;
     }
     try {
-      await invoke("type_desktop_text", { text });
+      const authorization = await authorizeVoiceAction({
+        kind: "typeDesktopText",
+        agentId: pcAgent.id,
+        text,
+      });
+      if (!authorization) return;
+      await invoke("type_desktop_text", { agentId: pcAgent.id, text });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
       setVoiceUiState("SUCCESS");
       setMessage("Typed dictated text into the focused application.");
     } catch (error) {
@@ -5031,7 +5050,17 @@ function VoiceControlPage({
       return;
     }
     try {
-      await invoke("launch_desktop_application", { application });
+      const authorization = await authorizeVoiceAction({
+        kind: "launchDesktopApplication",
+        agentId: pcAgent.id,
+        application,
+      });
+      if (!authorization) return;
+      await invoke("launch_desktop_application", {
+        agentId: pcAgent.id,
+        application,
+      });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
       setVoiceUiState("SUCCESS");
       setMessage(`Opened ${application}.`);
     } catch (error) {
@@ -5041,12 +5070,23 @@ function VoiceControlPage({
   }
 
   async function openStandardFolder(folder: string) {
+    if (!pcAgent) {
+      setMessage("PC Control Agent is unavailable.");
+      return;
+    }
     if (!isDesktopRuntime()) {
       setMessage("Opening folders is available in the installed Tauri app, not the browser preview.");
       return;
     }
     try {
-      await invoke("open_standard_folder", { folder });
+      const authorization = await authorizeVoiceAction({
+        kind: "openStandardFolder",
+        agentId: pcAgent.id,
+        folder,
+      });
+      if (!authorization) return;
+      await invoke("open_standard_folder", { agentId: pcAgent.id, folder });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
       setVoiceUiState("SUCCESS");
       setMessage(`Opened ${folder}.`);
     } catch (error) {
@@ -5069,7 +5109,13 @@ function VoiceControlPage({
       return;
     }
     try {
-      await invoke("close_active_desktop_application");
+      const authorization = await authorizeVoiceAction({
+        kind: "closeActiveApplication",
+        agentId: pcAgent.id,
+      });
+      if (!authorization) return;
+      await invoke("close_active_desktop_application", { agentId: pcAgent.id });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
       setMessage("Requested that the active application close.");
     } catch (error) {
       setMessage(errorMessage(error));
@@ -5222,16 +5268,9 @@ function VoiceControlPage({
 
   useEffect(() => {
     if (!isDesktopRuntime() || !preferences.backgroundVoiceEnabled || !preferences.voiceControlMasterEnabled) return;
-    void invoke("start_voice_listener")
-      .then(() => {
-        setVoiceUiState("PROCESSING");
-        setMessage("Starting Lucy's microphone listener...");
-      })
-      .catch((error) => {
-        setIsListening(false);
-        setVoiceUiState("ERROR");
-        setMessage(errorMessage(error));
-      });
+    if (pcAgent) {
+      void startListening();
+    }
   }, [preferences.backgroundVoiceEnabled, preferences.voiceControlMasterEnabled, preferences.voiceWakePhrase]);
 
   function toggleBackgroundVoice() {
@@ -5274,21 +5313,19 @@ function VoiceControlPage({
     setPreferences((current) => ({ ...current, [key]: value.toLowerCase() }));
   }
 
-  useEffect(() => {
-    if (!isDesktopRuntime()) return;
-    void invoke("save_voice_listener_config", {
-      config: {
-        wakePhrase: preferences.voiceWakePhrase,
-        deactivatePhrase: preferences.voiceDeactivatePhrase,
-        openPhrases,
-        closePhrases,
-      },
-    }).catch((error) => setMessage(errorMessage(error)));
-  }, [preferences.voiceWakePhrase, preferences.voiceDeactivatePhrase, preferences.voiceOpenPhrases, preferences.voiceClosePhrases]);
-
   async function installOfflineVoice() {
+    if (!pcAgent) {
+      setMessage("PC Control Agent is unavailable.");
+      return;
+    }
     try {
-      await invoke("install_voice_runtime");
+      const authorization = await authorizeVoiceAction({
+        kind: "installVoiceRuntime",
+        agentId: pcAgent.id,
+      });
+      if (!authorization) return;
+      await invoke("install_voice_runtime", { agentId: pcAgent.id });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
       setMessage("Downloading the local speech model. Keep the app open until installation finishes.");
     } catch (error) {
       setMessage(errorMessage(error));
@@ -5296,8 +5333,18 @@ function VoiceControlPage({
   }
 
   async function installHighAccuracyVoice() {
+    if (!pcAgent) {
+      setMessage("PC Control Agent is unavailable.");
+      return;
+    }
     try {
-      await invoke("install_high_accuracy_voice_runtime");
+      const authorization = await authorizeVoiceAction({
+        kind: "installHighAccuracyVoiceRuntime",
+        agentId: pcAgent.id,
+      });
+      if (!authorization) return;
+      await invoke("install_high_accuracy_voice_runtime", { agentId: pcAgent.id });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
       setMessage("Building the high-accuracy speech engine and downloading its local model. This can take several minutes.");
     } catch (error) {
       setMessage(errorMessage(error));
@@ -5310,7 +5357,15 @@ function VoiceControlPage({
       return;
     }
     try {
-      const status = await invoke<DesktopControlStatus>("enable_desktop_control");
+      const authorization = await authorizeVoiceAction({
+        kind: "enableDesktopControl",
+        agentId: pcAgent.id,
+      });
+      if (!authorization) return;
+      const status = await invoke<DesktopControlStatus>("enable_desktop_control", {
+        agentId: pcAgent.id,
+      });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
       setDesktopControl(status);
       setMessage(status.message);
     } catch (error) {
@@ -5325,12 +5380,7 @@ function VoiceControlPage({
     }
     if (desktopControl?.enabled || desktopRestoreAttempted.current) return;
     desktopRestoreAttempted.current = true;
-    void invoke<DesktopControlStatus>("enable_desktop_control")
-      .then((status) => {
-        setDesktopControl(status);
-        setMessage(status.message);
-      })
-      .catch((error) => setMessage(errorMessage(error)));
+    void enableDesktopControl();
   }, [desktopControl?.enabled, pcAgent?.capabilities.system]);
 
   function activateFullSystemPermission() {
@@ -5362,26 +5412,32 @@ function VoiceControlPage({
       ),
     );
     setMessage("Full system permission is active. Requesting KDE desktop input permission...");
-    void invoke<DesktopControlStatus>("enable_desktop_control")
-      .then((status) => {
-        setDesktopControl(status);
-        setMessage(status.message);
-      })
-      .catch((error) => setMessage(errorMessage(error)));
+    void enableDesktopControl();
   }
 
   function startListening() {
     if (isDesktopRuntime()) {
-      void invoke("start_voice_listener")
-        .then(() => {
-          setVoiceUiState("PROCESSING");
-          setMessage("Starting Lucy's microphone listener...");
-        })
-        .catch((error) => {
-          setIsListening(false);
-          setVoiceUiState("ERROR");
-          setMessage(errorMessage(error));
-        });
+      if (!pcAgent) {
+        setMessage("PC Control Agent is unavailable.");
+        return;
+      }
+      void authorizeVoiceAction({
+        kind: "startVoiceListener",
+        agentId: pcAgent.id,
+      }).then((authorization) => {
+        if (!authorization) return;
+        void invoke("start_voice_listener", { agentId: pcAgent.id })
+          .then(() => {
+            markApprovalConsumed(setApprovalRequests, authorization.approval);
+            setVoiceUiState("PROCESSING");
+            setMessage("Starting Lucy's microphone listener...");
+          })
+          .catch((error) => {
+            setIsListening(false);
+            setVoiceUiState("ERROR");
+            setMessage(errorMessage(error));
+          });
+      });
       return;
     }
     const speechWindow = window as typeof window & {
@@ -6322,12 +6378,37 @@ function SettingsPage({
 
   async function openWorkspace(workspace: WorkspaceDefinition) {
     try {
+      const workspaceAgent =
+        agents.find(
+          (agent) => agent.status !== "Paused" && agent.capabilities.files !== "none",
+        ) ?? null;
+      if (!workspaceAgent) {
+        throw new Error("No active file-capable agent is available.");
+      }
+      const authorization = await prepareBackendAuthorization(
+        {
+          kind: "openWorkspaceItem",
+          agentId: workspaceAgent.id,
+          workspaceId: workspace.id,
+          itemPath: ".",
+        },
+        setApprovalRequests,
+      );
+      if (!authorization.ready) {
+        setProviderMessageKind("error");
+        setProviderMessage(
+          "Opening this workspace is waiting for trusted backend authorization.",
+        );
+        return;
+      }
       await invoke("open_workspace_item", {
         request: {
-          workspacePath: workspace.path,
+          agentId: workspaceAgent.id,
+          workspaceId: workspace.id,
           itemPath: ".",
         },
       });
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
     } catch (error) {
       setProviderMessageKind("error");
       setProviderMessage(errorMessage(error));
@@ -6932,8 +7013,8 @@ function SettingsPage({
               <input
                 type="text"
                 value={workspacePath}
-                onChange={(event) => setWorkspacePath(event.target.value)}
-                placeholder="/run/media/you/Drive/Project"
+                readOnly
+                placeholder="Choose a folder with the native picker"
                 spellCheck={false}
               />
               <button
@@ -8563,50 +8644,6 @@ function App() {
   ]);
 
   useEffect(() => {
-    function expireUnusedApprovals() {
-      const now = Date.now();
-      const expiring = approvalRequests.filter(
-        (request) =>
-          (request.status === "Pending" ||
-            (request.status === "Approved" && request.consumedAt === null)) &&
-          new Date(request.expiresAt).getTime() <= now,
-      );
-      if (expiring.length === 0) {
-        return;
-      }
-
-      const expiringIds = new Set(expiring.map((request) => request.id));
-      const expiringTasks = new Set(
-        expiring
-          .filter((request) => request.taskId !== null)
-          .map((request) => `${request.agentId}:${request.taskId}`),
-      );
-      setApprovalRequests((currentRequests) =>
-        currentRequests.map((request) =>
-          expiringIds.has(request.id)
-            ? { ...request, status: "Expired" as ApprovalRequestStatus }
-            : request,
-        ),
-      );
-      setAgents((currentAgents) =>
-        currentAgents.map((agent) => ({
-          ...agent,
-          tasks: agent.tasks.map((task) =>
-            expiringTasks.has(`${agent.id}:${task.id}`) &&
-            task.status === "Blocked"
-              ? { ...task, status: "Pending", phase: "Assigned" }
-              : task,
-          ),
-        })),
-      );
-    }
-
-    expireUnusedApprovals();
-    const timer = window.setInterval(expireUnusedApprovals, 30_000);
-    return () => window.clearInterval(timer);
-  }, [approvalRequests]);
-
-  useEffect(() => {
     if (
       taskRetentionDays === "never" &&
       activityRetentionDays === "never"
@@ -8846,6 +8883,7 @@ function App() {
           <VoiceControlPage
             agents={agents}
             setAgents={setAgents}
+            setApprovalRequests={setApprovalRequests}
             preferences={preferences}
             setPreferences={setPreferences}
           />
@@ -8855,7 +8893,6 @@ function App() {
             setAgents={setAgents}
             retentionDays={taskRetentionDays}
             setRetentionDays={setTaskRetentionDays}
-            approvalRequests={approvalRequests}
             setApprovalRequests={setApprovalRequests}
           />
         ) : activePage === "Approvals" ? (
@@ -8910,6 +8947,7 @@ function App() {
           <VoiceControlPage
             agents={agents}
             setAgents={setAgents}
+            setApprovalRequests={setApprovalRequests}
             preferences={preferences}
             setPreferences={setPreferences}
             visible={false}

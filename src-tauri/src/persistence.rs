@@ -5,7 +5,12 @@ use crate::app_state::{
     HistoryRetentionDays, LegacyRendererState, ModelDefinition, Reminder, StateValidationError,
     WorkspaceDefinition, CURRENT_SCHEMA_VERSION, MAX_SAFE_INTEGER,
 };
-use rusqlite::{params, Connection, Transaction, TransactionBehavior};
+use crate::authorization::{
+    build_approval_confirmation, dialog_literal, format_unix_ms, ApprovalConfirmation,
+    ApprovalResolution, AuthorizationGrant, AuthorizationOutcome,
+};
+use crate::policy::{evaluate_policy, ActionIntent, PolicyDisposition, PolicyEvaluation};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -16,6 +21,9 @@ use std::{
 };
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_application_state.sql");
+const AUTHORIZATION_MIGRATION: &str =
+    include_str!("../migrations/0002_authoritative_approvals.sql");
+const MAX_AUTHORIZATION_RECORDS: i64 = 10_000;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -143,8 +151,20 @@ impl PersistenceService {
         &self,
         expected_revision: i64,
         state: ApplicationState,
+        security_change_confirmed: bool,
     ) -> PersistenceResult<SaveReceipt> {
-        self.run(move |repository| repository.save(expected_revision, &state))
+        self.run(move |repository| {
+            repository.save(expected_revision, &state, security_change_confirmed)
+        })
+        .await
+    }
+
+    pub async fn security_change_summary(
+        &self,
+        expected_revision: i64,
+        state: ApplicationState,
+    ) -> PersistenceResult<Option<String>> {
+        self.run(move |repository| repository.security_change_summary(expected_revision, &state))
             .await
     }
 
@@ -171,6 +191,50 @@ impl PersistenceService {
         expected_revision: i64,
     ) -> PersistenceResult<StateEnvelope> {
         self.run(move |repository| repository.acknowledge_legacy_cleanup(expected_revision))
+            .await
+    }
+
+    pub async fn request_authorization(
+        &self,
+        intent: ActionIntent,
+    ) -> PersistenceResult<AuthorizationOutcome> {
+        self.run(move |repository| repository.request_authorization(&intent))
+            .await
+    }
+
+    pub async fn resolve_approval(
+        &self,
+        approval_id: i64,
+        resolution: ApprovalResolution,
+        native_confirmed: bool,
+    ) -> PersistenceResult<ApprovalRequest> {
+        self.run(move |repository| {
+            repository.resolve_approval(approval_id, resolution, native_confirmed)
+        })
+        .await
+    }
+
+    pub async fn approval_confirmation(
+        &self,
+        approval_id: i64,
+    ) -> PersistenceResult<ApprovalConfirmation> {
+        self.run(move |repository| repository.approval_confirmation(approval_id))
+            .await
+    }
+
+    pub async fn authorize_intent(
+        &self,
+        intent: ActionIntent,
+    ) -> PersistenceResult<AuthorizationGrant> {
+        self.run(move |repository| repository.authorize_intent(&intent))
+            .await
+    }
+
+    pub async fn authorize_intent_and_state(
+        &self,
+        intent: ActionIntent,
+    ) -> PersistenceResult<(AuthorizationGrant, ApplicationState)> {
+        self.run(move |repository| repository.authorize_intent_and_state(&intent))
             .await
     }
 
@@ -271,7 +335,7 @@ impl StateRepository {
                 true,
             ));
         }
-        write_application_state(&transaction, &state, "fresh", &HashMap::new())?;
+        write_application_state(&transaction, &state, "fresh", &HashMap::new(), true)?;
         transaction
             .execute(
                 "UPDATE application_meta
@@ -327,6 +391,7 @@ impl StateRepository {
             &state,
             "legacy_local_storage",
             &approval_origins,
+            true,
         )?;
         transaction
             .execute(
@@ -405,7 +470,13 @@ impl StateRepository {
             .iter()
             .map(|request| (request.id, "legacy_backup".to_string()))
             .collect::<HashMap<_, _>>();
-        write_application_state(&transaction, &state, "legacy_backup", &approval_origins)?;
+        write_application_state(
+            &transaction,
+            &state,
+            "legacy_backup",
+            &approval_origins,
+            true,
+        )?;
         let revision = next_revision(meta.state_revision)?;
         transaction
             .execute(
@@ -431,6 +502,7 @@ impl StateRepository {
         &mut self,
         expected_revision: i64,
         state: &ApplicationState,
+        security_change_confirmed: bool,
     ) -> PersistenceResult<SaveReceipt> {
         validate_application_state(state).map_err(PersistenceError::validation)?;
         let transaction = self
@@ -439,8 +511,25 @@ impl StateRepository {
             .map_err(PersistenceError::database)?;
         let meta = application_meta_from(&transaction)?;
         ensure_expected_revision(&meta, expected_revision)?;
-        let origins = approval_origins(&transaction)?;
-        write_application_state(&transaction, state, "renderer_prototype", &origins)?;
+        let current = read_application_state(&transaction)?;
+        if let Some(summary) = protected_security_change_summary(&current, state) {
+            if !security_change_confirmed {
+                return Err(PersistenceError::new(
+                    "NATIVE_CONFIRMATION_REQUIRED",
+                    format!(
+                        "A protected security change requires trusted desktop confirmation: {summary}"
+                    ),
+                    true,
+                ));
+            }
+        }
+        write_application_state(
+            &transaction,
+            state,
+            "renderer_prototype",
+            &HashMap::new(),
+            false,
+        )?;
         let revision = next_revision(meta.state_revision)?;
         transaction
             .execute(
@@ -453,6 +542,24 @@ impl StateRepository {
             schema_version: CURRENT_SCHEMA_VERSION,
             revision,
         })
+    }
+
+    pub fn security_change_summary(
+        &mut self,
+        expected_revision: i64,
+        state: &ApplicationState,
+    ) -> PersistenceResult<Option<String>> {
+        validate_application_state(state).map_err(PersistenceError::validation)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(PersistenceError::database)?;
+        let meta = application_meta_from(&transaction)?;
+        ensure_expected_revision(&meta, expected_revision)?;
+        let current = read_application_state(&transaction)?;
+        let summary = protected_security_change_summary(&current, state);
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(summary)
     }
 
     pub fn reset(
@@ -475,7 +582,7 @@ impl StateRepository {
             .map_err(PersistenceError::database)?;
         let meta = application_meta_from(&transaction)?;
         ensure_expected_revision(&meta, expected_revision)?;
-        write_application_state(&transaction, &state, "fresh", &HashMap::new())?;
+        write_application_state(&transaction, &state, "fresh", &HashMap::new(), true)?;
         let revision = next_revision(meta.state_revision)?;
         transaction
             .execute(
@@ -501,6 +608,204 @@ impl StateRepository {
         self.connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(PersistenceError::database)
+    }
+
+    pub fn request_authorization(
+        &mut self,
+        intent: &ActionIntent,
+    ) -> PersistenceResult<AuthorizationOutcome> {
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_state_initialized(&transaction)?;
+        expire_authoritative_approvals(&transaction, timestamp)?;
+        let state = read_application_state(&transaction)?;
+        let evaluation = evaluate_policy(&state, intent).map_err(policy_denial)?;
+        if evaluation.disposition == PolicyDisposition::Allow {
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(AuthorizationOutcome::allowed());
+        }
+
+        if let Some(approval_id) =
+            find_matching_active_approval(&transaction, &evaluation, timestamp)?
+        {
+            let approval = read_approval_request(&transaction, approval_id)?;
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(AuthorizationOutcome::approval_required(approval));
+        }
+
+        let approval = insert_authoritative_approval(&transaction, intent, &evaluation, timestamp)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(AuthorizationOutcome::approval_required(approval))
+    }
+
+    pub fn resolve_approval(
+        &mut self,
+        approval_id: i64,
+        resolution: ApprovalResolution,
+        native_confirmed: bool,
+    ) -> PersistenceResult<ApprovalRequest> {
+        if approval_id <= 0 || approval_id > MAX_SAFE_INTEGER {
+            return Err(PersistenceError::new(
+                "APPROVAL_NOT_FOUND",
+                "The requested approval does not exist.",
+                true,
+            ));
+        }
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_state_initialized(&transaction)?;
+        expire_authoritative_approvals(&transaction, timestamp)?;
+        let stored = read_stored_approval(&transaction, approval_id)?;
+        ensure_pending_authoritative_approval(&stored, timestamp)?;
+
+        if resolution == ApprovalResolution::Approve {
+            if !native_confirmed {
+                return Err(PersistenceError::new(
+                    "NATIVE_CONFIRMATION_REQUIRED",
+                    "Approval requires confirmation in a trusted desktop dialog.",
+                    true,
+                ));
+            }
+            let intent: ActionIntent = serde_json::from_str(&stored.intent_json).map_err(|_| {
+                PersistenceError::new(
+                    "MALFORMED_APPROVAL",
+                    "The stored approval intent is invalid and cannot authorize an action.",
+                    false,
+                )
+            })?;
+            let state = read_application_state(&transaction)?;
+            let evaluation = evaluate_policy(&state, &intent).map_err(policy_denial)?;
+            ensure_evaluation_matches(&stored, &evaluation)?;
+        }
+
+        let (status, resolved_at) = match resolution {
+            ApprovalResolution::Approve => ("Approved", format_unix_ms(timestamp)),
+            ApprovalResolution::Deny => ("Denied", format_unix_ms(timestamp)),
+        };
+        let changed = transaction
+            .execute(
+                "UPDATE approval_requests
+                 SET status = ?1, resolved_at = ?2, resolved_at_unix_ms = ?3
+                 WHERE id = ?4 AND authoritative = 1 AND status = 'Pending'
+                   AND consumed_at_unix_ms IS NULL AND expires_at_unix_ms > ?3",
+                params![status, resolved_at, timestamp, approval_id],
+            )
+            .map_err(PersistenceError::database)?;
+        if changed != 1 {
+            return Err(PersistenceError::new(
+                "APPROVAL_STATE_CHANGED",
+                "The approval changed before the decision could be recorded.",
+                true,
+            ));
+        }
+        let approval = read_approval_request(&transaction, approval_id)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(approval)
+    }
+
+    pub fn approval_confirmation(
+        &mut self,
+        approval_id: i64,
+    ) -> PersistenceResult<ApprovalConfirmation> {
+        if approval_id <= 0 || approval_id > MAX_SAFE_INTEGER {
+            return Err(PersistenceError::new(
+                "APPROVAL_NOT_FOUND",
+                "The requested approval does not exist.",
+                true,
+            ));
+        }
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_state_initialized(&transaction)?;
+        expire_authoritative_approvals(&transaction, timestamp)?;
+        let stored = read_stored_approval(&transaction, approval_id)?;
+        ensure_pending_authoritative_approval(&stored, timestamp)?;
+        let intent: ActionIntent = serde_json::from_str(&stored.intent_json).map_err(|_| {
+            PersistenceError::new(
+                "MALFORMED_APPROVAL",
+                "The stored approval intent is invalid and cannot be confirmed.",
+                false,
+            )
+        })?;
+        let state = read_application_state(&transaction)?;
+        let evaluation = evaluate_policy(&state, &intent).map_err(policy_denial)?;
+        ensure_evaluation_matches(&stored, &evaluation)?;
+        let approval = read_approval_request(&transaction, approval_id)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(build_approval_confirmation(&approval, &intent))
+    }
+
+    pub fn authorize_intent(
+        &mut self,
+        intent: &ActionIntent,
+    ) -> PersistenceResult<AuthorizationGrant> {
+        self.authorize_intent_and_state(intent)
+            .map(|(grant, _)| grant)
+    }
+
+    pub fn authorize_intent_and_state(
+        &mut self,
+        intent: &ActionIntent,
+    ) -> PersistenceResult<(AuthorizationGrant, ApplicationState)> {
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_state_initialized(&transaction)?;
+        expire_authoritative_approvals(&transaction, timestamp)?;
+        let state = read_application_state(&transaction)?;
+        let evaluation = evaluate_policy(&state, intent).map_err(policy_denial)?;
+        if evaluation.disposition == PolicyDisposition::Allow {
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok((AuthorizationGrant::policy_allowed(), state));
+        }
+
+        let Some(approval_id) =
+            find_matching_approved_approval(&transaction, &evaluation, timestamp)?
+        else {
+            let error = missing_approval_error(&transaction, &evaluation, timestamp)?;
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Err(error);
+        };
+        let consumed_at = format_unix_ms(timestamp);
+        let changed = transaction
+            .execute(
+                "UPDATE approval_requests
+                 SET consumed_at = ?1, consumed_at_unix_ms = ?2
+                 WHERE id = ?3 AND authoritative = 1 AND status = 'Approved'
+                   AND consumed_at_unix_ms IS NULL AND expires_at_unix_ms > ?2
+                   AND intent_fingerprint = ?4 AND policy_fingerprint = ?5
+                   AND workspace_fingerprint = ?6",
+                params![
+                    consumed_at,
+                    timestamp,
+                    approval_id,
+                    evaluation.intent_fingerprint,
+                    evaluation.policy_fingerprint,
+                    evaluation.workspace_fingerprint
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        if changed != 1 {
+            return Err(PersistenceError::new(
+                "APPROVAL_STATE_CHANGED",
+                "The approval changed before it could be consumed.",
+                true,
+            ));
+        }
+        let approval = read_approval_request(&transaction, approval_id)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok((AuthorizationGrant::consumed(approval), state))
     }
 
     fn configure_connection_preflight(&self) -> PersistenceResult<()> {
@@ -577,44 +882,74 @@ impl StateRepository {
     }
 
     fn apply_migrations(&mut self) -> PersistenceResult<()> {
-        let version = self.schema_version()?;
         self.verify_supported_schema_version()?;
-        if version == 0 {
-            let transaction = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(PersistenceError::database)?;
-            let locked_version: i64 = transaction
-                .pragma_query_value(None, "user_version", |row| row.get(0))
-                .map_err(PersistenceError::database)?;
-            if locked_version > CURRENT_SCHEMA_VERSION {
-                return Err(PersistenceError::new(
-                    "UNSUPPORTED_NEWER_SCHEMA",
-                    format!(
-                        "Database schema {locked_version} is newer than supported schema {CURRENT_SCHEMA_VERSION}."
-                    ),
-                    false,
-                ));
+        while self.schema_version()? < CURRENT_SCHEMA_VERSION {
+            match self.schema_version()? {
+                0 => self.apply_migration(1, "initial_application_state", INITIAL_MIGRATION)?,
+                1 => self.apply_migration(
+                    2,
+                    "authoritative_approval_lifecycle",
+                    AUTHORIZATION_MIGRATION,
+                )?,
+                version => {
+                    return Err(PersistenceError::new(
+                        "MIGRATION_PATH_MISSING",
+                        format!("No migration path exists from database schema {version}."),
+                        false,
+                    ));
+                }
             }
-            if locked_version == 0 {
-                let timestamp = now_unix_ms()?;
-                transaction
-                    .execute_batch(INITIAL_MIGRATION)
-                    .map_err(PersistenceError::database)?;
-                transaction
-                    .execute(
-                        "INSERT INTO schema_migrations (version, name, applied_at_unix_ms)
-                         VALUES (1, 'initial_application_state', ?1)",
-                        [timestamp],
-                    )
-                    .map_err(PersistenceError::database)?;
-                transaction
-                    .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
-                    .map_err(PersistenceError::database)?;
-            }
-            transaction.commit().map_err(PersistenceError::database)?;
         }
         self.verify_migration_ledger()
+    }
+
+    fn apply_migration(
+        &mut self,
+        target_version: i64,
+        name: &str,
+        sql: &str,
+    ) -> PersistenceResult<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let locked_version: i64 = transaction
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(PersistenceError::database)?;
+        if locked_version > CURRENT_SCHEMA_VERSION {
+            return Err(PersistenceError::new(
+                "UNSUPPORTED_NEWER_SCHEMA",
+                format!(
+                    "Database schema {locked_version} is newer than supported schema {CURRENT_SCHEMA_VERSION}."
+                ),
+                false,
+            ));
+        }
+        if locked_version == target_version - 1 {
+            let timestamp = now_unix_ms()?;
+            transaction
+                .execute_batch(sql)
+                .map_err(PersistenceError::database)?;
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations (version, name, applied_at_unix_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![target_version, name, timestamp],
+                )
+                .map_err(PersistenceError::database)?;
+            transaction
+                .pragma_update(None, "user_version", target_version)
+                .map_err(PersistenceError::database)?;
+        } else if locked_version < target_version {
+            return Err(PersistenceError::new(
+                "MIGRATION_LEDGER_MISMATCH",
+                format!(
+                    "Migration {target_version} cannot be applied from database schema {locked_version}."
+                ),
+                false,
+            ));
+        }
+        transaction.commit().map_err(PersistenceError::database)
     }
 
     fn verify_migration_ledger(&self) -> PersistenceResult<()> {
@@ -648,7 +983,7 @@ impl StateRepository {
             .map_err(PersistenceError::database)?;
         let meta = application_meta_from(&transaction)?;
         ensure_expected_revision(&meta, expected_revision)?;
-        clear_application_state(&transaction)?;
+        clear_application_state(&transaction, true)?;
         Err(PersistenceError::new(
             "INJECTED_INTERRUPTION",
             "Injected interruption before commit.",
@@ -679,6 +1014,7 @@ impl StateRepository {
             &state,
             "legacy_local_storage",
             &HashMap::new(),
+            true,
         )?;
         transaction
             .execute(
@@ -821,6 +1157,662 @@ fn ensure_expected_revision(
     Ok(())
 }
 
+fn ensure_state_initialized(transaction: &Transaction<'_>) -> PersistenceResult<()> {
+    let meta = application_meta_from(transaction)?;
+    if !meta.initialized {
+        return Err(PersistenceError::new(
+            "STATE_NOT_INITIALIZED",
+            "Application state must be initialized before authorization can be evaluated.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn policy_denial(error: crate::policy::PolicyDenial) -> PersistenceError {
+    PersistenceError::new(&error.code, error.message, true)
+}
+
+fn protected_security_change_summary(
+    current: &ApplicationState,
+    requested: &ApplicationState,
+) -> Option<String> {
+    let mut changes: Vec<String> = Vec::new();
+    let current_workspaces = current
+        .preferences
+        .workspaces
+        .iter()
+        .map(|workspace| (workspace.id.as_str(), workspace.path.as_str()))
+        .collect::<HashMap<_, _>>();
+    for workspace in &requested.preferences.workspaces {
+        if current_workspaces.get(workspace.id.as_str()).copied() != Some(workspace.path.as_str()) {
+            changes.push(format!(
+                "workspace {} root -> {}",
+                dialog_literal(&workspace.id),
+                dialog_literal(&workspace.path)
+            ));
+        }
+    }
+    if !requested.preferences.workspace_path.is_empty()
+        && requested.preferences.workspace_path != current.preferences.workspace_path
+    {
+        changes.push(format!(
+            "active workspace root {} -> {}",
+            dialog_literal(&current.preferences.workspace_path),
+            dialog_literal(&requested.preferences.workspace_path)
+        ));
+    }
+
+    if safety_rank(&requested.preferences.safety_mode)
+        > safety_rank(&current.preferences.safety_mode)
+    {
+        changes.push(format!(
+            "global safety mode {} -> {}",
+            dialog_literal(&current.preferences.safety_mode),
+            dialog_literal(&requested.preferences.safety_mode)
+        ));
+    }
+    if requested.preferences.approval_expiry_minutes > current.preferences.approval_expiry_minutes {
+        changes.push(format!(
+            "approval lifetime {} -> {} minutes",
+            current.preferences.approval_expiry_minutes,
+            requested.preferences.approval_expiry_minutes
+        ));
+    }
+    if !current.preferences.voice_control_master_enabled
+        && requested.preferences.voice_control_master_enabled
+    {
+        changes.push("voice-control microphone off -> on".to_string());
+    }
+    if !current.preferences.background_voice_enabled
+        && requested.preferences.background_voice_enabled
+    {
+        changes.push("background microphone listener off -> on".to_string());
+    }
+
+    for requested_agent in &requested.agents {
+        let Some(current_agent) = current
+            .agents
+            .iter()
+            .find(|agent| agent.id == requested_agent.id)
+        else {
+            if requested_agent.status != "Paused" {
+                for (scope, value) in [
+                    ("files", requested_agent.capabilities.files.as_str()),
+                    ("internet", requested_agent.capabilities.internet.as_str()),
+                    ("clipboard", requested_agent.capabilities.clipboard.as_str()),
+                    ("terminal", requested_agent.capabilities.terminal.as_str()),
+                    ("system", requested_agent.capabilities.system.as_str()),
+                ] {
+                    if capability_rank(scope, value) > 0 {
+                        changes.push(format!(
+                            "new active agent {} (ID {}) {scope} capability -> {}",
+                            dialog_literal(&requested_agent.name),
+                            requested_agent.id,
+                            dialog_literal(value)
+                        ));
+                    }
+                }
+            }
+            continue;
+        };
+        let agent_label = format!(
+            "agent {} (ID {})",
+            dialog_literal(&requested_agent.name),
+            requested_agent.id
+        );
+        if current_agent.status == "Paused" && requested_agent.status != "Paused" {
+            changes.push(format!(
+                "{agent_label} status {} -> {}",
+                dialog_literal(&current_agent.status),
+                dialog_literal(&requested_agent.status)
+            ));
+        }
+        if !is_review_role(&current_agent.role) && is_review_role(&requested_agent.role) {
+            changes.push(format!(
+                "{agent_label} role {} -> {}",
+                dialog_literal(&current_agent.role),
+                dialog_literal(&requested_agent.role)
+            ));
+        }
+        for (scope, current_value, requested_value) in [
+            (
+                "files",
+                current_agent.capabilities.files.as_str(),
+                requested_agent.capabilities.files.as_str(),
+            ),
+            (
+                "internet",
+                current_agent.capabilities.internet.as_str(),
+                requested_agent.capabilities.internet.as_str(),
+            ),
+            (
+                "clipboard",
+                current_agent.capabilities.clipboard.as_str(),
+                requested_agent.capabilities.clipboard.as_str(),
+            ),
+            (
+                "terminal",
+                current_agent.capabilities.terminal.as_str(),
+                requested_agent.capabilities.terminal.as_str(),
+            ),
+            (
+                "system",
+                current_agent.capabilities.system.as_str(),
+                requested_agent.capabilities.system.as_str(),
+            ),
+        ] {
+            if capability_rank(scope, requested_value) > capability_rank(scope, current_value) {
+                changes.push(format!(
+                    "{agent_label} {scope} capability {} -> {}",
+                    dialog_literal(current_value),
+                    dialog_literal(requested_value)
+                ));
+            }
+        }
+        for (scope, current_value, requested_value) in [
+            (
+                "files",
+                current_agent.approvals.files.as_str(),
+                requested_agent.approvals.files.as_str(),
+            ),
+            (
+                "internet",
+                current_agent.approvals.internet.as_str(),
+                requested_agent.approvals.internet.as_str(),
+            ),
+            (
+                "clipboard",
+                current_agent.approvals.clipboard.as_str(),
+                requested_agent.approvals.clipboard.as_str(),
+            ),
+            (
+                "terminal",
+                current_agent.approvals.terminal.as_str(),
+                requested_agent.approvals.terminal.as_str(),
+            ),
+            (
+                "system",
+                current_agent.approvals.system.as_str(),
+                requested_agent.approvals.system.as_str(),
+            ),
+        ] {
+            if approval_rank(requested_value) > approval_rank(current_value) {
+                changes.push(format!(
+                    "{agent_label} {scope} approval policy {} -> {}",
+                    dialog_literal(current_value),
+                    dialog_literal(requested_value)
+                ));
+            }
+        }
+    }
+
+    (!changes.is_empty()).then(|| changes.join("; "))
+}
+
+fn is_review_role(role: &str) -> bool {
+    matches!(role, "Senior Agent" | "Team Leader" | "Supervisor")
+}
+
+fn safety_rank(value: &str) -> u8 {
+    match value {
+        "locked" => 0,
+        "strict" => 1,
+        "balanced" => 2,
+        _ => 3,
+    }
+}
+
+fn approval_rank(value: &str) -> u8 {
+    match value {
+        "deny" => 0,
+        "ask" => 1,
+        "allow" => 2,
+        _ => 3,
+    }
+}
+
+fn capability_rank(scope: &str, value: &str) -> u8 {
+    match (scope, value) {
+        (_, "none") => 0,
+        ("files" | "internet" | "clipboard", "read") | ("terminal", "safe") => 1,
+        ("files" | "internet" | "clipboard", "write") | ("terminal", "user") => 2,
+        ("files" | "internet" | "clipboard", "full") | ("terminal", "admin") => 3,
+        ("system", "notifications") => 1,
+        ("system", "power") => 2,
+        ("system", "full") => 3,
+        _ => 4,
+    }
+}
+
+#[derive(Debug)]
+struct StoredApproval {
+    agent_id: i64,
+    task_id: Option<i64>,
+    status: String,
+    workspace_id: Option<String>,
+    authoritative: bool,
+    intent_kind: String,
+    intent_json: String,
+    intent_fingerprint: String,
+    policy_fingerprint: String,
+    workspace_fingerprint: String,
+    expires_at_unix_ms: Option<i64>,
+    consumed_at_unix_ms: Option<i64>,
+}
+
+fn read_stored_approval(
+    transaction: &Transaction<'_>,
+    approval_id: i64,
+) -> PersistenceResult<StoredApproval> {
+    transaction
+        .query_row(
+            "SELECT agent_id, task_id, status, workspace_id, authoritative,
+                    intent_kind, intent_json, intent_fingerprint, policy_fingerprint,
+                    workspace_fingerprint, expires_at_unix_ms, consumed_at_unix_ms
+             FROM approval_requests WHERE id = ?1",
+            [approval_id],
+            |row| {
+                Ok(StoredApproval {
+                    agent_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    status: row.get(2)?,
+                    workspace_id: row.get(3)?,
+                    authoritative: row.get::<_, i64>(4)? == 1,
+                    intent_kind: row.get(5)?,
+                    intent_json: row.get(6)?,
+                    intent_fingerprint: row.get(7)?,
+                    policy_fingerprint: row.get(8)?,
+                    workspace_fingerprint: row.get(9)?,
+                    expires_at_unix_ms: row.get(10)?,
+                    consumed_at_unix_ms: row.get(11)?,
+                })
+            },
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => PersistenceError::new(
+                "APPROVAL_NOT_FOUND",
+                "The requested approval does not exist.",
+                true,
+            ),
+            other => PersistenceError::database(other),
+        })
+}
+
+fn ensure_pending_authoritative_approval(
+    stored: &StoredApproval,
+    timestamp: i64,
+) -> PersistenceResult<()> {
+    if !stored.authoritative {
+        return Err(PersistenceError::new(
+            "APPROVAL_NOT_AUTHORITATIVE",
+            "Imported and renderer-origin approval records cannot authorize actions.",
+            true,
+        ));
+    }
+    if stored.consumed_at_unix_ms.is_some() {
+        return Err(PersistenceError::new(
+            "APPROVAL_ALREADY_CONSUMED",
+            "The approval has already authorized one action and cannot be replayed.",
+            true,
+        ));
+    }
+    if match stored.expires_at_unix_ms {
+        Some(expires_at) => expires_at <= timestamp,
+        None => true,
+    } || stored.status == "Expired"
+    {
+        return Err(PersistenceError::new(
+            "APPROVAL_EXPIRED",
+            "The approval has expired and cannot authorize an action.",
+            true,
+        ));
+    }
+    if stored.status != "Pending" {
+        return Err(PersistenceError::new(
+            "APPROVAL_ALREADY_RESOLVED",
+            "Only a pending approval can be resolved.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_evaluation_matches(
+    stored: &StoredApproval,
+    evaluation: &PolicyEvaluation,
+) -> PersistenceResult<()> {
+    if evaluation.disposition != PolicyDisposition::ApprovalRequired {
+        return Err(PersistenceError::new(
+            "STALE_APPROVAL",
+            "Current policy no longer matches the stored approval request.",
+            true,
+        ));
+    }
+    if stored.agent_id != evaluation.agent_id {
+        return Err(PersistenceError::new(
+            "WRONG_AGENT_APPROVAL",
+            "The approval is bound to a different agent.",
+            true,
+        ));
+    }
+    if stored.task_id != evaluation.task_id {
+        return Err(PersistenceError::new(
+            "WRONG_TASK_APPROVAL",
+            "The approval is bound to a different task.",
+            true,
+        ));
+    }
+    if stored.workspace_id != evaluation.workspace_id
+        || stored.workspace_fingerprint != evaluation.workspace_fingerprint
+    {
+        return Err(PersistenceError::new(
+            "WRONG_WORKSPACE_APPROVAL",
+            "The approval is bound to a different workspace state.",
+            true,
+        ));
+    }
+    if stored.intent_kind != evaluation.intent_kind
+        || stored.intent_fingerprint != evaluation.intent_fingerprint
+    {
+        return Err(PersistenceError::new(
+            "WRONG_INTENT_APPROVAL",
+            "The approval is bound to a different action intent.",
+            true,
+        ));
+    }
+    if stored.policy_fingerprint != evaluation.policy_fingerprint {
+        return Err(PersistenceError::new(
+            "STALE_APPROVAL",
+            "The approval was issued under different capability or safety policy.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn expire_authoritative_approvals(
+    transaction: &Transaction<'_>,
+    timestamp: i64,
+) -> PersistenceResult<()> {
+    let resolved_at = format_unix_ms(timestamp);
+    transaction
+        .execute(
+            "UPDATE approval_requests
+             SET status = 'Expired', resolved_at = COALESCE(resolved_at, ?1),
+                 resolved_at_unix_ms = COALESCE(resolved_at_unix_ms, ?2)
+             WHERE authoritative = 1 AND status IN ('Pending', 'Approved')
+               AND consumed_at_unix_ms IS NULL AND expires_at_unix_ms <= ?2",
+            params![resolved_at, timestamp],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+fn find_matching_active_approval(
+    transaction: &Transaction<'_>,
+    evaluation: &PolicyEvaluation,
+    timestamp: i64,
+) -> PersistenceResult<Option<i64>> {
+    transaction
+        .query_row(
+            "SELECT id FROM approval_requests
+             WHERE authoritative = 1 AND status IN ('Pending', 'Approved')
+               AND consumed_at_unix_ms IS NULL AND expires_at_unix_ms > ?1
+               AND agent_id = ?2 AND task_id IS ?3 AND workspace_id IS ?4
+               AND intent_kind = ?5 AND intent_fingerprint = ?6
+               AND policy_fingerprint = ?7 AND workspace_fingerprint = ?8
+             ORDER BY CASE status WHEN 'Approved' THEN 0 ELSE 1 END, id DESC
+             LIMIT 1",
+            params![
+                timestamp,
+                evaluation.agent_id,
+                evaluation.task_id,
+                evaluation.workspace_id,
+                evaluation.intent_kind,
+                evaluation.intent_fingerprint,
+                evaluation.policy_fingerprint,
+                evaluation.workspace_fingerprint
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(PersistenceError::database)
+}
+
+fn find_matching_approved_approval(
+    transaction: &Transaction<'_>,
+    evaluation: &PolicyEvaluation,
+    timestamp: i64,
+) -> PersistenceResult<Option<i64>> {
+    transaction
+        .query_row(
+            "SELECT id FROM approval_requests
+             WHERE authoritative = 1 AND status = 'Approved'
+               AND consumed_at_unix_ms IS NULL AND expires_at_unix_ms > ?1
+               AND agent_id = ?2 AND task_id IS ?3 AND workspace_id IS ?4
+               AND intent_kind = ?5 AND intent_fingerprint = ?6
+               AND policy_fingerprint = ?7 AND workspace_fingerprint = ?8
+             ORDER BY id DESC LIMIT 1",
+            params![
+                timestamp,
+                evaluation.agent_id,
+                evaluation.task_id,
+                evaluation.workspace_id,
+                evaluation.intent_kind,
+                evaluation.intent_fingerprint,
+                evaluation.policy_fingerprint,
+                evaluation.workspace_fingerprint
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(PersistenceError::database)
+}
+
+fn insert_authoritative_approval(
+    transaction: &Transaction<'_>,
+    intent: &ActionIntent,
+    evaluation: &PolicyEvaluation,
+    timestamp: i64,
+) -> PersistenceResult<ApprovalRequest> {
+    let approval_count: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM approval_requests", [], |row| {
+            row.get(0)
+        })
+        .map_err(PersistenceError::database)?;
+    if approval_count >= MAX_AUTHORIZATION_RECORDS {
+        return Err(PersistenceError::new(
+            "APPROVAL_HISTORY_LIMIT",
+            "Approval history reached its bounded record limit. Reset or future retention controls must clear history before another request can be issued.",
+            false,
+        ));
+    }
+    let approval_id: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(id), 0) + 1 FROM approval_requests",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    if approval_id <= 0 || approval_id > MAX_SAFE_INTEGER {
+        return Err(PersistenceError::new(
+            "APPROVAL_ID_EXHAUSTED",
+            "No safe approval identifier remains available.",
+            false,
+        ));
+    }
+    let position: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM approval_requests",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let expires_at_unix_ms = timestamp
+        .checked_add(evaluation.expires_in_ms)
+        .ok_or_else(|| {
+            PersistenceError::new(
+                "CLOCK_UNAVAILABLE",
+                "The approval expiration could not be represented safely.",
+                false,
+            )
+        })?;
+    let created_at = format_unix_ms(timestamp);
+    let expires_at = format_unix_ms(expires_at_unix_ms);
+    let intent_json = serde_json::to_string(intent).map_err(|_| {
+        PersistenceError::new(
+            "INVALID_INTENT",
+            "The action intent could not be normalized for authorization.",
+            true,
+        )
+    })?;
+    transaction
+        .execute(
+            "INSERT INTO approval_requests
+             (id, position, agent_id, task_id, title, reason, status, created_at,
+              resolved_at, risk_level, workspace_id, task_snapshot, expires_at,
+              consumed_at, origin, authoritative, intent_kind, intent_json,
+              intent_fingerprint, policy_fingerprint, workspace_fingerprint,
+              created_at_unix_ms, resolved_at_unix_ms, expires_at_unix_ms,
+              consumed_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'Pending', ?7, NULL, ?8, ?9,
+                     ?10, ?11, NULL, 'backend_authority', 1, ?12, ?13, ?14,
+                     ?15, ?16, ?17, NULL, ?18, NULL)",
+            params![
+                approval_id,
+                position,
+                evaluation.agent_id,
+                evaluation.task_id,
+                evaluation.title,
+                evaluation.reason,
+                created_at,
+                evaluation.risk_level,
+                evaluation.workspace_id,
+                evaluation.task_snapshot,
+                expires_at,
+                evaluation.intent_kind,
+                intent_json,
+                evaluation.intent_fingerprint,
+                evaluation.policy_fingerprint,
+                evaluation.workspace_fingerprint,
+                timestamp,
+                expires_at_unix_ms
+            ],
+        )
+        .map_err(PersistenceError::database)?;
+    for (position, scope) in evaluation.scopes.iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO approval_scopes (approval_id, position, scope)
+                 VALUES (?1, ?2, ?3)",
+                params![approval_id, position as i64, scope.as_str()],
+            )
+            .map_err(PersistenceError::database)?;
+    }
+    read_approval_request(transaction, approval_id)
+}
+
+fn missing_approval_error(
+    transaction: &Transaction<'_>,
+    evaluation: &PolicyEvaluation,
+    timestamp: i64,
+) -> PersistenceResult<PersistenceError> {
+    let exact: Option<(String, Option<i64>, i64)> = transaction
+        .query_row(
+            "SELECT status, consumed_at_unix_ms, authoritative
+             FROM approval_requests
+             WHERE agent_id = ?1 AND task_id IS ?2 AND workspace_id IS ?3
+               AND intent_kind = ?4 AND intent_fingerprint = ?5
+               AND policy_fingerprint = ?6 AND workspace_fingerprint = ?7
+             ORDER BY id DESC LIMIT 1",
+            params![
+                evaluation.agent_id,
+                evaluation.task_id,
+                evaluation.workspace_id,
+                evaluation.intent_kind,
+                evaluation.intent_fingerprint,
+                evaluation.policy_fingerprint,
+                evaluation.workspace_fingerprint
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(PersistenceError::database)?;
+    if let Some((status, consumed_at, authoritative)) = exact {
+        if authoritative != 1 {
+            return Ok(PersistenceError::new(
+                "APPROVAL_NOT_AUTHORITATIVE",
+                "Imported and renderer-origin approval records cannot authorize actions.",
+                true,
+            ));
+        }
+        if consumed_at.is_some() {
+            return Ok(PersistenceError::new(
+                "APPROVAL_ALREADY_CONSUMED",
+                "The approval has already authorized one action and cannot be replayed.",
+                true,
+            ));
+        }
+        if status == "Expired" {
+            return Ok(PersistenceError::new(
+                "APPROVAL_EXPIRED",
+                "The approval has expired and cannot authorize an action.",
+                true,
+            ));
+        }
+        if status == "Pending" {
+            return Ok(PersistenceError::new(
+                "APPROVAL_PENDING",
+                "The action is waiting for trusted desktop approval.",
+                true,
+            ));
+        }
+        if status == "Denied" {
+            return Ok(PersistenceError::new(
+                "APPROVAL_DENIED",
+                "The action was denied and is not authorized.",
+                true,
+            ));
+        }
+    }
+
+    let stale_exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM approval_requests
+                 WHERE authoritative = 1 AND agent_id = ?1 AND task_id IS ?2
+                   AND intent_kind = ?3 AND intent_fingerprint = ?4
+                   AND (policy_fingerprint <> ?5 OR workspace_fingerprint <> ?6
+                        OR workspace_id IS NOT ?7 OR expires_at_unix_ms <= ?8)
+             )",
+            params![
+                evaluation.agent_id,
+                evaluation.task_id,
+                evaluation.intent_kind,
+                evaluation.intent_fingerprint,
+                evaluation.policy_fingerprint,
+                evaluation.workspace_fingerprint,
+                evaluation.workspace_id,
+                timestamp
+            ],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    if stale_exists {
+        return Ok(PersistenceError::new(
+            "STALE_APPROVAL",
+            "An earlier approval does not match the current workspace or policy state.",
+            true,
+        ));
+    }
+    Ok(PersistenceError::new(
+        "AUTHORIZATION_REQUIRED",
+        "The action requires a current backend-issued approval.",
+        true,
+    ))
+}
+
 fn migration_info(meta: &ApplicationMeta) -> MigrationInfo {
     MigrationInfo {
         source_kind: meta.source_kind.clone(),
@@ -868,11 +1860,18 @@ fn application_meta_from(
     connection.query_meta().map_err(PersistenceError::database)
 }
 
-fn clear_application_state(transaction: &Transaction<'_>) -> PersistenceResult<()> {
+fn clear_application_state(
+    transaction: &Transaction<'_>,
+    replace_approvals: bool,
+) -> PersistenceResult<()> {
+    if replace_approvals {
+        transaction
+            .execute("DELETE FROM approval_requests", [])
+            .map_err(PersistenceError::database)?;
+    }
     transaction
         .execute_batch(
-            "DELETE FROM approval_requests;
-             DELETE FROM reminders;
+            "DELETE FROM reminders;
              DELETE FROM models;
              DELETE FROM agents;
              DELETE FROM workspaces;
@@ -882,29 +1881,15 @@ fn clear_application_state(transaction: &Transaction<'_>) -> PersistenceResult<(
         .map_err(PersistenceError::database)
 }
 
-fn approval_origins(transaction: &Transaction<'_>) -> PersistenceResult<HashMap<i64, String>> {
-    let mut statement = transaction
-        .prepare("SELECT id, origin FROM approval_requests")
-        .map_err(PersistenceError::database)?;
-    let rows = statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(PersistenceError::database)?;
-    let mut origins = HashMap::new();
-    for row in rows {
-        let (id, origin) = row.map_err(PersistenceError::database)?;
-        origins.insert(id, origin);
-    }
-    Ok(origins)
-}
-
 fn write_application_state(
     transaction: &Transaction<'_>,
     state: &ApplicationState,
     default_approval_origin: &str,
     approval_origins: &HashMap<i64, String>,
+    replace_approvals: bool,
 ) -> PersistenceResult<()> {
     validate_application_state(state).map_err(PersistenceError::validation)?;
-    clear_application_state(transaction)?;
+    clear_application_state(transaction, replace_approvals)?;
     write_preferences(transaction, &state.preferences)?;
     transaction
         .execute(
@@ -928,12 +1913,14 @@ fn write_application_state(
             )
             .map_err(PersistenceError::database)?;
     }
-    for (position, request) in state.approval_requests.iter().enumerate() {
-        let origin = approval_origins
-            .get(&request.id)
-            .map(String::as_str)
-            .unwrap_or(default_approval_origin);
-        write_approval_request(transaction, position, request, origin)?;
+    if replace_approvals {
+        for (position, request) in state.approval_requests.iter().enumerate() {
+            let origin = approval_origins
+                .get(&request.id)
+                .map(String::as_str)
+                .unwrap_or(default_approval_origin);
+            write_approval_request(transaction, position, request, origin)?;
+        }
     }
     for (position, reminder) in state.reminders.iter().enumerate() {
         transaction
@@ -1498,6 +2485,40 @@ fn read_approval_requests(connection: &Connection) -> PersistenceResult<Vec<Appr
     Ok(requests)
 }
 
+fn read_approval_request(
+    connection: &Connection,
+    approval_id: i64,
+) -> PersistenceResult<ApprovalRequest> {
+    let mut request = connection
+        .query_row(
+            "SELECT id, agent_id, task_id, title, reason, status, created_at, resolved_at,
+                    risk_level, workspace_id, task_snapshot, expires_at, consumed_at
+             FROM approval_requests WHERE id = ?1",
+            [approval_id],
+            |row| {
+                Ok(ApprovalRequest {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                    title: row.get(3)?,
+                    reason: row.get(4)?,
+                    status: row.get(5)?,
+                    created_at: row.get(6)?,
+                    resolved_at: row.get(7)?,
+                    risk_level: row.get(8)?,
+                    scopes: Vec::new(),
+                    workspace_id: row.get(9)?,
+                    task_snapshot: row.get(10)?,
+                    expires_at: row.get(11)?,
+                    consumed_at: row.get(12)?,
+                })
+            },
+        )
+        .map_err(PersistenceError::database)?;
+    request.scopes = read_approval_scopes(connection, approval_id)?;
+    Ok(request)
+}
+
 fn read_approval_scopes(
     connection: &Connection,
     approval_id: i64,
@@ -1543,6 +2564,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::RunMode;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1596,13 +2618,21 @@ mod tests {
         {
             let mut repository = StateRepository::open(&path).expect("database should open");
             assert_eq!(repository.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-            let migration: (i64, String) = repository
+            let migrations = repository
                 .connection
-                .query_row("SELECT version, name FROM schema_migrations", [], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })
+                .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<(i64, String)>>>()
                 .unwrap();
-            assert_eq!(migration, (1, "initial_application_state".to_string()));
+            assert_eq!(
+                migrations,
+                vec![
+                    (1, "initial_application_state".to_string()),
+                    (2, "authoritative_approval_lifecycle".to_string())
+                ]
+            );
             let journal_mode: String = repository
                 .connection
                 .pragma_query_value(None, "journal_mode", |row| row.get(0))
@@ -1635,14 +2665,16 @@ mod tests {
         let initialized = repository.initialize_fresh().unwrap();
         let mut changed = initialized.state.clone();
         changed.preferences.theme = "light".to_string();
-        let receipt = repository.save(initialized.revision, &changed).unwrap();
+        let receipt = repository
+            .save(initialized.revision, &changed, false)
+            .unwrap();
         assert_eq!(receipt.revision, 2);
 
         let mut stale = changed.clone();
         stale.preferences.theme = "system".to_string();
         assert_eq!(
             repository
-                .save(initialized.revision, &stale)
+                .save(initialized.revision, &stale, false)
                 .unwrap_err()
                 .code,
             "REVISION_CONFLICT"
@@ -1666,7 +2698,7 @@ mod tests {
         first_change.preferences.theme = "light".to_string();
         assert_eq!(
             first
-                .save(initialized.revision, &first_change)
+                .save(initialized.revision, &first_change, false)
                 .unwrap()
                 .revision,
             2
@@ -1676,7 +2708,7 @@ mod tests {
         stale_change.preferences.theme = "system".to_string();
         assert_eq!(
             second
-                .save(second_snapshot.revision, &stale_change)
+                .save(second_snapshot.revision, &stale_change, false)
                 .unwrap_err()
                 .code,
             "REVISION_CONFLICT"
@@ -1895,6 +2927,429 @@ mod tests {
             "DATABASE_CORRUPT"
         );
         assert_eq!(fs::read(&corrupt_path).unwrap(), original);
+    }
+
+    fn authorization_state() -> ApplicationState {
+        let mut state = default_application_state().unwrap();
+        state.preferences.workspaces.push(WorkspaceDefinition {
+            id: "workspace-authorization".to_string(),
+            name: "Authorization fixture".to_string(),
+            path: "/tmp/authorization-fixture".to_string(),
+        });
+        state.preferences.active_workspace_id = Some("workspace-authorization".to_string());
+        state.preferences.workspace_path = "/tmp/authorization-fixture".to_string();
+        state.agents[1].tasks.push(AgentTask {
+            id: 41,
+            title: "Run cargo test and edit the parser".to_string(),
+            category: "Development".to_string(),
+            priority: "Normal".to_string(),
+            assigned_agent_id: 2,
+            status: "Pending".to_string(),
+            phase: "Assigned".to_string(),
+            created_at: "2026-08-23T10:00:00.000Z".to_string(),
+            completed_at: None,
+            result: None,
+            response_id: None,
+            runtime_model: None,
+            total_tokens: None,
+            workspace_id: Some("workspace-authorization".to_string()),
+            changed_files: Vec::new(),
+            diff: None,
+            duration_seconds: None,
+            routing_mode: "selected".to_string(),
+            routed_from_agent_id: None,
+            routing_reason: None,
+            review_agent_id: None,
+            review_status: "Not Requested".to_string(),
+            review_result: None,
+            review_model: None,
+            review_duration_seconds: None,
+            reviewed_at: None,
+        });
+        state
+    }
+
+    fn authorization_intent() -> ActionIntent {
+        ActionIntent::RunTask {
+            agent_id: 2,
+            task_owner_agent_id: 2,
+            task_id: 41,
+            run_mode: RunMode::Execute,
+        }
+    }
+
+    fn initialized_authorization_repository() -> StateRepository {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        let initialized = repository.initialize_fresh().unwrap();
+        repository
+            .save(initialized.revision, &authorization_state(), true)
+            .unwrap();
+        repository
+    }
+
+    #[test]
+    fn schema_one_approvals_upgrade_as_non_authoritative_expired_history() {
+        let directory = TestDirectory::new();
+        let path = directory.database_path();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_migrations (version, name, applied_at_unix_ms)
+                 VALUES (1, 'initial_application_state', 1)",
+                [],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO approval_requests
+                 (id, position, agent_id, task_id, title, reason, status, created_at,
+                  resolved_at, risk_level, workspace_id, task_snapshot, expires_at,
+                  consumed_at, origin, authoritative)
+                 VALUES (1, 0, 2, 41, 'Old approval', 'Old renderer record',
+                         'Approved', '2026-08-20T10:00:00.000Z', NULL, 'High', NULL,
+                         'Old task', '2026-08-20T10:10:00.000Z', NULL,
+                         'renderer_prototype', 0)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let repository = StateRepository::open(&path).unwrap();
+        assert_eq!(repository.schema_version().unwrap(), 2);
+        let upgraded: (String, i64, String) = repository
+            .connection
+            .query_row(
+                "SELECT status, authoritative, intent_fingerprint
+                 FROM approval_requests WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(upgraded, ("Expired".to_string(), 0, String::new()));
+    }
+
+    #[test]
+    fn approval_is_backend_issued_native_confirmed_exact_and_single_use() {
+        let mut repository = initialized_authorization_repository();
+        let intent = authorization_intent();
+        let first = repository.request_authorization(&intent).unwrap();
+        assert_eq!(
+            first.decision,
+            crate::authorization::AuthorizationDecision::ApprovalRequired
+        );
+        let pending = first.approval.unwrap();
+        assert_eq!(pending.status, "Pending");
+        let authority: (String, i64) = repository
+            .connection
+            .query_row(
+                "SELECT origin, authoritative FROM approval_requests WHERE id = ?1",
+                [pending.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(authority, ("backend_authority".to_string(), 1));
+
+        let duplicate = repository.request_authorization(&intent).unwrap();
+        assert_eq!(duplicate.approval.unwrap().id, pending.id);
+        assert_eq!(
+            repository.authorize_intent(&intent).unwrap_err().code,
+            "APPROVAL_PENDING"
+        );
+        assert_eq!(
+            repository
+                .resolve_approval(pending.id, ApprovalResolution::Approve, false)
+                .unwrap_err()
+                .code,
+            "NATIVE_CONFIRMATION_REQUIRED"
+        );
+        let approved = repository
+            .resolve_approval(pending.id, ApprovalResolution::Approve, true)
+            .unwrap();
+        assert_eq!(approved.status, "Approved");
+
+        let grant = repository.authorize_intent(&intent).unwrap();
+        assert!(grant.approval.unwrap().consumed_at.is_some());
+        assert_eq!(
+            repository.authorize_intent(&intent).unwrap_err().code,
+            "APPROVAL_ALREADY_CONSUMED"
+        );
+    }
+
+    #[test]
+    fn renderer_save_cannot_mint_or_overwrite_authoritative_approval_state() {
+        let mut repository = initialized_authorization_repository();
+        let envelope = repository.load().unwrap().unwrap();
+        let mut forged = envelope.state;
+        forged.approval_requests.push(ApprovalRequest {
+            id: 999,
+            agent_id: 2,
+            task_id: Some(41),
+            title: "Forged".to_string(),
+            reason: "Renderer asserted approval".to_string(),
+            status: "Approved".to_string(),
+            created_at: "2026-08-23T10:00:00.000Z".to_string(),
+            resolved_at: Some("2026-08-23T10:00:01.000Z".to_string()),
+            risk_level: "High".to_string(),
+            scopes: vec!["files".to_string(), "terminal".to_string()],
+            workspace_id: Some("workspace-authorization".to_string()),
+            task_snapshot: "Forged task".to_string(),
+            expires_at: "2099-08-23T10:30:00.000Z".to_string(),
+            consumed_at: None,
+        });
+        repository.save(envelope.revision, &forged, false).unwrap();
+        assert!(repository
+            .load()
+            .unwrap()
+            .unwrap()
+            .state
+            .approval_requests
+            .is_empty());
+        assert_eq!(
+            repository
+                .authorize_intent(&authorization_intent())
+                .unwrap_err()
+                .code,
+            "AUTHORIZATION_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn task_and_policy_changes_invalidate_approved_authority() {
+        let mut repository = initialized_authorization_repository();
+        let intent = authorization_intent();
+        let pending = repository
+            .request_authorization(&intent)
+            .unwrap()
+            .approval
+            .unwrap();
+        repository
+            .resolve_approval(pending.id, ApprovalResolution::Approve, true)
+            .unwrap();
+        let envelope = repository.load().unwrap().unwrap();
+        let mut changed_task = envelope.state;
+        changed_task.agents[1].tasks[0].title =
+            "Run cargo test and edit a different parser".to_string();
+        repository
+            .save(envelope.revision, &changed_task, false)
+            .unwrap();
+        assert_eq!(
+            repository.authorize_intent(&intent).unwrap_err().code,
+            "STALE_APPROVAL"
+        );
+
+        let mut repository = initialized_authorization_repository();
+        let pending = repository
+            .request_authorization(&intent)
+            .unwrap()
+            .approval
+            .unwrap();
+        repository
+            .resolve_approval(pending.id, ApprovalResolution::Approve, true)
+            .unwrap();
+        let envelope = repository.load().unwrap().unwrap();
+        let mut changed_policy = envelope.state;
+        changed_policy.agents[1].capabilities.clipboard = "read".to_string();
+        repository
+            .save(envelope.revision, &changed_policy, false)
+            .unwrap();
+        assert_eq!(
+            repository.authorize_intent(&intent).unwrap_err().code,
+            "STALE_APPROVAL"
+        );
+    }
+
+    #[test]
+    fn authoritative_issuance_respects_the_bounded_history_limit() {
+        let mut repository = initialized_authorization_repository();
+        repository
+            .connection
+            .execute(
+                "WITH RECURSIVE ids(id) AS (
+                     VALUES(1)
+                     UNION ALL SELECT id + 1 FROM ids WHERE id < ?1
+                 )
+                 INSERT INTO approval_requests
+                 (id, position, agent_id, task_id, title, reason, status, created_at,
+                  resolved_at, risk_level, workspace_id, task_snapshot, expires_at,
+                  consumed_at, origin, authoritative)
+                 SELECT id, id - 1, 2, NULL, 'History', 'Non-authoritative history',
+                        'Expired', '2026-08-23T00:00:00.000Z', NULL, 'Low', NULL, '',
+                        '2026-08-23T00:00:00.000Z', NULL, 'renderer_prototype', 0
+                 FROM ids",
+                [MAX_AUTHORIZATION_RECORDS],
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .request_authorization(&authorization_intent())
+                .unwrap_err()
+                .code,
+            "APPROVAL_HISTORY_LIMIT"
+        );
+    }
+
+    #[test]
+    fn privilege_increases_require_backend_recorded_native_confirmation() {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        let initialized = repository.initialize_fresh().unwrap();
+        let mut elevated = initialized.state;
+        let pc_agent = elevated
+            .agents
+            .iter_mut()
+            .find(|agent| agent.name == "PC Control Agent")
+            .unwrap();
+        pc_agent.status = "Working".to_string();
+        pc_agent.role = "Senior Agent".to_string();
+        pc_agent.capabilities.system = "full".to_string();
+        pc_agent.approvals.system = "allow".to_string();
+        elevated.preferences.workspaces.push(WorkspaceDefinition {
+            id: "trusted-workspace".to_string(),
+            name: "Trusted workspace".to_string(),
+            path: "/tmp/trusted-workspace".to_string(),
+        });
+        elevated.preferences.active_workspace_id = Some("trusted-workspace".to_string());
+        elevated.preferences.workspace_path = "/tmp/trusted-workspace".to_string();
+
+        let summary = repository
+            .security_change_summary(initialized.revision, &elevated)
+            .unwrap()
+            .unwrap();
+        assert!(summary.contains("agent \"PC Control Agent\" (ID 7)"));
+        assert!(summary.contains("role \"Specialist\" -> \"Senior Agent\""));
+        assert!(summary.contains("system capability \"notifications\" -> \"full\""));
+        assert!(summary.contains("system approval policy \"ask\" -> \"allow\""));
+        assert!(
+            summary.contains("workspace \"trusted-workspace\" root -> \"/tmp/trusted-workspace\"")
+        );
+        assert_eq!(
+            repository
+                .save(initialized.revision, &elevated, false)
+                .unwrap_err()
+                .code,
+            "NATIVE_CONFIRMATION_REQUIRED"
+        );
+        assert_eq!(
+            repository.load().unwrap().unwrap().revision,
+            initialized.revision
+        );
+        let elevated_receipt = repository
+            .save(initialized.revision, &elevated, true)
+            .unwrap();
+
+        let mut reduced = elevated;
+        let pc_agent = reduced
+            .agents
+            .iter_mut()
+            .find(|agent| agent.name == "PC Control Agent")
+            .unwrap();
+        pc_agent.status = "Paused".to_string();
+        pc_agent.capabilities.system = "none".to_string();
+        pc_agent.approvals.system = "deny".to_string();
+        assert!(repository
+            .security_change_summary(elevated_receipt.revision, &reduced)
+            .unwrap()
+            .is_none());
+        repository
+            .save(elevated_receipt.revision, &reduced, false)
+            .unwrap();
+    }
+
+    #[test]
+    fn stale_expired_malformed_and_wrong_subject_approvals_fail_closed() {
+        let mut repository = initialized_authorization_repository();
+        let intent = authorization_intent();
+        let pending = repository
+            .request_authorization(&intent)
+            .unwrap()
+            .approval
+            .unwrap();
+        repository
+            .connection
+            .execute(
+                "UPDATE approval_requests SET intent_json = '{' WHERE id = ?1",
+                [pending.id],
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .resolve_approval(pending.id, ApprovalResolution::Approve, true)
+                .unwrap_err()
+                .code,
+            "MALFORMED_APPROVAL"
+        );
+
+        repository
+            .connection
+            .execute("DELETE FROM approval_requests", [])
+            .unwrap();
+        let pending = repository
+            .request_authorization(&intent)
+            .unwrap()
+            .approval
+            .unwrap();
+        repository
+            .resolve_approval(pending.id, ApprovalResolution::Approve, true)
+            .unwrap();
+        repository
+            .connection
+            .execute(
+                "UPDATE approval_requests
+                 SET created_at_unix_ms = -2, expires_at_unix_ms = -1
+                 WHERE id = ?1",
+                [pending.id],
+            )
+            .unwrap();
+        assert_eq!(
+            repository.authorize_intent(&intent).unwrap_err().code,
+            "APPROVAL_EXPIRED"
+        );
+
+        repository
+            .connection
+            .execute("DELETE FROM approval_requests", [])
+            .unwrap();
+        let pending = repository
+            .request_authorization(&intent)
+            .unwrap()
+            .approval
+            .unwrap();
+        repository
+            .resolve_approval(pending.id, ApprovalResolution::Approve, true)
+            .unwrap();
+        let envelope = repository.load().unwrap().unwrap();
+        let mut moved_workspace = envelope.state;
+        moved_workspace.preferences.workspaces[0].path = "/tmp/moved-workspace".to_string();
+        moved_workspace.preferences.workspace_path = "/tmp/moved-workspace".to_string();
+        repository
+            .save(envelope.revision, &moved_workspace, true)
+            .unwrap();
+        assert_eq!(
+            repository.authorize_intent(&intent).unwrap_err().code,
+            "STALE_APPROVAL"
+        );
+
+        let wrong_task = ActionIntent::RunTask {
+            agent_id: 2,
+            task_owner_agent_id: 2,
+            task_id: 999,
+            run_mode: RunMode::Execute,
+        };
+        assert_eq!(
+            repository.authorize_intent(&wrong_task).unwrap_err().code,
+            "TASK_NOT_FOUND"
+        );
+        let wrong_agent = ActionIntent::RunTask {
+            agent_id: 1,
+            task_owner_agent_id: 2,
+            task_id: 41,
+            run_mode: RunMode::Execute,
+        };
+        assert_eq!(
+            repository.authorize_intent(&wrong_agent).unwrap_err().code,
+            "WRONG_TASK_AGENT"
+        );
     }
 
     #[cfg(unix)]

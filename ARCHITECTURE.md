@@ -32,12 +32,13 @@ The binding decision record is
     React renderer (src/App.tsx)
       |-- typed state/IPC adapter (src/applicationState.ts, src/persistence.ts)
       |-- browser-preview localStorage (non-authoritative compatibility only)
-      |-- renderer policy: routing, review, approval workflow, task state
+      |-- renderer presentation: routing/review workflow and task view state
       |
       | Tauri invoke/events
       v
     Rust backend (src-tauri/src/lib.rs)
       |-- application state validation + SQLite repository/migrations
+      |-- capability policy + authoritative one-use approvals
       |-- Codex CLI process
       |-- local Ollama HTTP + workspace tools
       |-- filesystem/Git inspection
@@ -49,7 +50,8 @@ The binding decision record is
 ### Renderer
 
 <code>src/App.tsx</code> currently combines page composition, import/export,
-routing, review, approvals, run orchestration, and most presentation logic.
+routing, review, approval presentation, run orchestration, and most
+presentation logic.
 Persisted renderer types and the canonical seed are separated into
 <code>src/applicationState.ts</code> and
 <code>src/application-state-seed.json</code>. The desktop renderer gates the UI
@@ -62,27 +64,36 @@ compatibility path.
 <code>src-tauri/src/lib.rs</code> owns native commands, provider
 processes/transports, workspace resolution and tool access, run cancellation,
 diff/change capture, desktop actions, and voice process management. It
-also composes <code>app_state.rs</code> and <code>persistence.rs</code>, which own
-the versioned application-state contract, SQLite schema/repository, legacy
-migration, and typed state IPC. It validates parts of an execution request,
-but it does not yet verify an approval against an authoritative approval
-record.
+also composes <code>app_state.rs</code>, <code>policy.rs</code>,
+<code>authorization.rs</code>, and <code>persistence.rs</code>. Those modules own
+the versioned state contract, normalized action intents, fail-closed
+capability evaluation, authoritative approval lifecycle, SQLite
+schema/repository, legacy migration, and typed state IPC. Privileged command
+handlers consume backend authorization before their first side effect.
 
 ### Persistence and migration
 
 The desktop database is <code>application-state.sqlite3</code> below Tauri's
-platform application-data directory. Migration 0001 establishes schema
-version 1 plus a migration ledger. Repository writes replace one validated
+platform application-data directory. Migrations 0001 and 0002 establish schema
+version 2 plus a migration ledger. Repository writes replace one validated
 aggregate inside an immediate transaction and use a monotonically increasing
 revision to reject stale writers. Startup refuses corrupt or unsupported newer
 databases and retains the typed error for the renderer instead of silently
 creating replacement state.
 
+Schema v2 adds authoritative approval intent, policy, and workspace bindings
+plus backend timestamps. Generic renderer state saves cannot insert, approve,
+consume, or overwrite approval rows. Capability, approval-policy, review-role,
+microphone, safety, approval-lifetime, and workspace-root privilege increases
+require a trusted native confirmation that names the exact elevation and are
+rechecked inside the save transaction.
+
 The one-time legacy path treats seven WebView storage values as untrusted.
 Only a fully parsed and validated candidate commits. Legacy pending/approved
-approvals are downgraded to expired, every persisted approval row remains
-non-authoritative, and browser keys are deleted only after the transaction
-commits. The current version 2 backup UI remains compatible through a bounded
+approvals are downgraded to expired non-authoritative history, and browser keys
+are deleted only after the transaction commits. Backend-issued records use a
+separate authoritative origin and cannot be manufactured by migration or a
+whole-state save. The current version 2 backup UI remains compatible through a bounded
 backend import; strict backup lifecycle design remains owned by TASK-0014.
 
 ### Voice runtime
@@ -104,19 +115,24 @@ behavior were not exercised in TASK-0001.
 ## Current run flow
 
 1. The user creates or selects a task in the renderer.
-2. Renderer logic chooses an agent, assesses safety, and may create a
-   non-authoritative approval record in renderer state.
-3. The renderer builds an <code>AgentRunRequest</code> and invokes
-   <code>run_agent_task</code>.
-4. The backend validates request fields, resolves the workspace, and dispatches
-   Ollama only for the Ollama provider label; otherwise it dispatches Codex.
-5. The backend streams events, handles cancellation/timeout, snapshots the
+2. The renderer sends a typed run intent containing only the run locator,
+   agent, task owner, task, and run mode.
+3. The backend loads current state, rejects invalid or paused subjects, derives
+   scopes and policy, and either allows the intent or creates/returns an exact
+   pending approval.
+4. Approval requires a trusted native dialog that identifies the normalized
+   action, agent, task, workspace, scopes, risk, and expiry. A subsequent
+   matching run IPC atomically consumes the approved record before provider or
+   workspace side effects; stale, mismatched, expired, malformed, or replayed
+   records fail.
+5. The backend derives workspace, model/provider, capability limits, timeout,
+   prompt context, and sandbox from persisted state, then dispatches Ollama
+   only for the backend model's Ollama provider label; otherwise it dispatches
+   Codex.
+6. The backend streams events, handles cancellation/timeout, snapshots the
    workspace, and returns output plus changed-file/diff evidence.
-6. The renderer updates its state projection; the persistence adapter queues a
+7. The renderer updates its state projection; the persistence adapter queues a
    typed backend save using the last committed revision.
-
-This is a description, not an endorsement of the current authorization split.
-[SECURITY_MODEL.md](SECURITY_MODEL.md) describes the gap.
 
 ## Directional architecture
 
@@ -168,8 +184,8 @@ task must choose the smallest structure supported by the code at that time.
 | --- | --- | --- |
 | Agents and hierarchy | Backend SQLite aggregate; renderer manages semantics | Validated backend agent registry (TASK-0009) |
 | Tasks and results | Backend SQLite aggregate; renderer manages lifecycle | Backend domain store and run ledger |
-| Approval records | Backend SQLite, explicitly non-authoritative | Backend policy/approval store |
-| Approval match/consume | Renderer plus request-field validation | Backend transaction |
+| Approval records | Backend SQLite; backend-issued rows are authoritative and imported rows are expired history | Backend policy/approval store |
+| Approval match/consume | Backend exact-match transaction | Backend exact-match transaction |
 | Routing and review | Renderer | Backend scheduler/orchestrator |
 | Active run | Renderer flag plus backend in-memory map | Backend system-wide coordinator |
 | Provider/model truth | Renderer labels plus backend branch | Backend provider registry |

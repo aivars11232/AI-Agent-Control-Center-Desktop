@@ -23,7 +23,7 @@ ready merely because its predecessor's code was edited.
 | TASK-0001 | None | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Authoritative project baseline and development contract |
 | TASK-0002 | TASK-0001 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Reproducible verification and characterization baseline |
 | TASK-0003 | TASK-0002 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Backend persistence and state-migration foundation |
-| TASK-0004 | TASK-0003 | NOT STARTED | NO | NOT STARTED | — | — | Authoritative approvals, capability policy, IPC, and CSP boundary |
+| TASK-0004 | TASK-0003 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Authoritative approvals, capability policy, IPC, and CSP boundary |
 | TASK-0005 | TASK-0004 | NOT STARTED | NO | NOT STARTED | — | — | Single-run coordinator, task lifecycle, ledger, and bounded output |
 | TASK-0006 | TASK-0005 | NOT STARTED | NO | NOT STARTED | — | — | Truthful provider registry and common runtime contract |
 | TASK-0007 | TASK-0006 | NOT STARTED | NO | NOT STARTED | — | — | Codex runtime isolation, cancellation, and evidence hardening |
@@ -131,10 +131,48 @@ ready merely because its predecessor's code was edited.
   <code>origin/main</code>. The TASK-0004 preflight confirmed zero ahead/behind
   and a clean working tree on 2026-08-23.
 
+## TASK-0004 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>980a5db42e78fa958ee49083cbe3f9ba7b99b4e2</code>
+- Starting status: clean; <code>main</code> matched <code>origin/main</code> with
+  zero ahead/behind
+- Dependency: TASK-0003 closed by user commit
+  <code>a4b8cde0ca479ef09f2d5839a3cfcf8a572e0785</code>
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0004 AS PLANNED.</code>
+- Added schema version 2 and migration 0002 for backend-issued authoritative
+  approval records, exact intent/policy/workspace fingerprints, backend
+  timestamps, expiry, and atomic one-use consumption; schema-v1 and imported
+  approval authority is downgraded
+- Added a unified fail-closed backend capability/policy evaluator and exact
+  native confirmation for action approvals and protected privilege increases
+- Removed renderer-supplied run authority and gated every current privileged
+  provider, workspace-open, application/window, keyboard/clipboard, pointer,
+  text, portal, voice-install, and microphone-start IPC before side effects
+- Narrowed the production and development CSPs, froze JavaScript prototypes,
+  and reduced the main-window core capability to event listen/unlisten only
+- Focused verification passed: 24 frontend tests, TypeScript and production web
+  build, 6 policy tests, 2 authorization tests, 18 persistence/approval tests,
+  strict run-IPC/CSP tests, and the privileged-handler routing test
+- Full non-live gate: <code>npm run verify:full</code> passed on 2026-08-23 with
+  24 frontend tests, 41 Rust tests, a 35-module production build, Clippy with
+  warnings denied, shell/Python/JSON checks, dependency trees, and two npm
+  audits reporting zero vulnerabilities
+- Rust advisory result: **indeterminate** because <code>cargo-audit</code> is
+  not installed; this explicit environmental limitation is not a pass
+- Live provider, microphone, listener, portal, install/remove, desktop package,
+  and desktop/system-control actions: not run
+- Git closure: <code>PENDING USER</code>; Codex did not stage, commit, or push
+
 ## Closure rule
 
-TASK-0004 must not begin automatically. Before successor work, the user reviews
-the TASK-0003 diff and either:
+TASK-0005 must not begin automatically. Before successor work, the user reviews
+the TASK-0004 diff and either:
 
 1. commits and pushes the approved task and records the commit plus clean
    worktree; or

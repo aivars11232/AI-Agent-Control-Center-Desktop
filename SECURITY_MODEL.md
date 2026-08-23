@@ -2,9 +2,10 @@
 
 > **Current status:** version 0.5.1 is a development prototype, not a hardened
 > or production-ready control plane. This document distinguishes checked-in
-> controls from planned security invariants. TASK-0003 establishes backend
-> persistence but does not implement TASK-0004 approval authority or IPC/CSP
-> hardening.
+> controls from planned security invariants. TASK-0004 establishes the
+> backend-authoritative approval, action-policy, privileged IPC, and WebView
+> boundary; later tasks still own run coordination, provider hardening,
+> voice semantics, packaging, and live acceptance.
 
 ## Security objective
 
@@ -33,7 +34,7 @@ when stored locally.
 | React renderer/WebView | Untrusted for authorization; may be compromised or hold stale/tampered state |
 | Imported backup and <code>localStorage</code> | Untrusted serialized input requiring validation and migration |
 | Tauri IPC | Untrusted request boundary; backend must authenticate semantics, not just types |
-| Rust backend | Planned authoritative policy, state, and execution boundary |
+| Rust backend | Authoritative approval/action-policy and persistence boundary; later tasks retain broader domain/run work |
 | Codex/Ollama output | Untrusted content and action proposals |
 | Selected workspace | Sensitive bounded filesystem root |
 | External/local provider process | Separate process/service with its own failure and trust model |
@@ -42,11 +43,22 @@ when stored locally.
 
 ## Current controls
 
-Static inspection found these implemented controls:
+Static inspection and deterministic tests found these implemented controls:
 
-- backend validation of run mode, file-access, terminal-access, and scope names;
-- rejection of administrator terminal access;
-- a required approval identifier when the request contains authorized scopes;
+- strict typed action intents and a unified backend capability/policy evaluator;
+- backend rejection of invalid, missing, paused, wrong-task, and ineligible
+  review agents;
+- backend derivation of run workspace, model/provider, capabilities, timeout,
+  prompt context, scopes, and destructive classification from persisted state;
+- a schema-v2 request/approve/deny/expire/validate/consume lifecycle bound to
+  exact agent, task, workspace, intent, and policy fingerprints;
+- trusted native confirmation that identifies the exact normalized action or
+  protected privilege increase before it is recorded;
+- atomic one-use approval consumption with malformed, stale, expired,
+  mismatched, non-authoritative, and replayed records rejected;
+- bounded approval issuance that fails closed at 10,000 retained records;
+- generic renderer saves that preserve backend approval rows and cannot mint or
+  overwrite authorization;
 - read-only/no-terminal/no-elevation constraints for review runs;
 - rejection of a bounded list of privileged, package, power, permission, mount,
   and system-control patterns in task text;
@@ -56,7 +68,7 @@ Static inspection found these implemented controls:
 - Ollama workspace-tool containment, including absolute path, parent traversal,
   and <code>.git</code> rejection;
 - per-run cancellation flags and bounded timeouts;
-- changed-file and Git diff capture where available.
+- changed-file and Git diff capture where available;
 - typed, bounded backend validation for persisted application state;
 - schema-versioned SQLite persistence with foreign keys, integrity checks,
   explicit migration evidence, atomic writes, and stale-revision rejection;
@@ -65,29 +77,18 @@ Static inspection found these implemented controls:
 - one-time legacy migration that commits before renderer cleanup and refuses
   malformed input without partial state;
 - downgrade of pending/approved legacy approvals to expired records whose
-  database rows are constrained to <code>authoritative = 0</code>.
+  database rows remain <code>authoritative = 0</code> after schema upgrade;
+- authorization before provider, workspace-open, application/window,
+  keyboard, clipboard-via-keyboard, pointer, text-input, microphone, portal,
+  and voice-installer side effects;
+- production CSP restricted to local application and Tauri IPC sources, frozen
+  JavaScript prototypes, and a main-window capability containing only event
+  listen/unlisten core permissions.
 
-These controls reduce risk but do not establish the target authorization model.
+These controls establish the TASK-0004 authorization boundary. They do not
+establish production readiness or the later run/provider/platform guarantees.
 
 ## Known current gaps
-
-### Approval authority
-
-Approval records are now durable backend data, but their lifecycle decisions
-remain renderer-managed and every schema-v1 row is explicitly
-non-authoritative. The renderer sends <code>approvalId</code>,
-<code>authorizedScopes</code>, and <code>destructiveActionsApproved</code> to the
-backend. The execution boundary validates their shape and some combinations,
-but does not consult an authoritative approval record to prove:
-
-- who or what issued the approval;
-- exact task, agent, workspace, action, and scope matching;
-- freshness and expiry;
-- atomic one-use consumption;
-- denial, cancellation, or replay state.
-
-Therefore, the current approvals UI is not a complete security boundary.
-TASK-0004 owns the authoritative approval/policy contract.
 
 ### State integrity and recovery
 
@@ -99,14 +100,20 @@ continuous bounded retention, recovery UX, and integrated live upgrade
 evidence. TASK-0014 owns those controls. The browser preview remains
 non-authoritative.
 
-### IPC and web content
+Exact approval binding stores normalized intent JSON in the local database.
+For text-input actions, that record includes the exact text to be typed and may
+therefore contain sensitive user content. Unix database permissions restrict
+the file to the current user, while TASK-0014 retains ownership of explicit
+retention, deletion, export, and recovery UX.
 
-<code>src-tauri/tauri.conf.json</code> currently sets Content Security Policy
-to <code>null</code>. The invoke surface exposes provider, workspace, voice,
-application, window, keyboard, text, pointer, and desktop-control commands.
-Each backend command must enforce its own policy; renderer visibility is
-insufficient. TASK-0004 owns CSP and IPC hardening, while TASK-0015 owns a
-unified voice/system action policy gateway.
+### Residual IPC and web content work
+
+The current privileged invoke surface is policy-gated and production CSP plus
+Tauri core permissions are narrowed. TASK-0013 still owns frontend
+modularization and a single renderer IPC adapter; TASK-0015 owns structured
+voice-intent semantics; TASK-0019 owns mandatory dependency/CI and packaged
+application gates. Current source tests do not replace installed-WebView or
+live platform acceptance.
 
 ### Heuristic task-text checks
 
@@ -125,15 +132,18 @@ through TASK-0008 own these boundaries.
 
 ### Verification coverage
 
-The checked-in non-live suite now includes 24 frontend tests and 23 Rust tests,
-including persistence validation, migration, corruption, concurrency, and
-rollback cases. These checks do not establish end-to-end, packaging, upgrade,
-or live acceptance. Rust advisory status remains indeterminate when
-<code>cargo-audit</code> is unavailable.
+The checked-in non-live suite contains 24 frontend tests and 41 Rust tests. It
+covers frontend characterization plus backend policy, authorization, strict
+IPC, CSP/capability, persistence validation, migration, corruption,
+concurrency, and rollback cases. These checks do not establish end-to-end,
+packaging, upgrade, or live acceptance. Rust advisory status remains
+indeterminate when <code>cargo-audit</code> is unavailable.
 
 ## Target security invariants
 
-The following are **planned requirements**, not current guarantees:
+The approval/action subset of invariants 2 through 5 is implemented for the
+current privileged command surface. The full integrated invariants remain the
+release target:
 
 1. The backend is the sole authority for durable domain state and action
    authorization.
