@@ -110,7 +110,7 @@ pub(crate) fn codex_descriptor() -> ProviderDescriptor {
             workspace_write: true,
             web_search: true,
             workspace_tools: false,
-            usage_reporting: false,
+            usage_reporting: true,
         },
     }
 }
@@ -263,7 +263,7 @@ pub(crate) struct ProviderRunRequest {
     pub(crate) timeout_seconds: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ProviderRunUsage {
     pub(crate) input_tokens: Option<u64>,
     pub(crate) output_tokens: Option<u64>,
@@ -391,10 +391,13 @@ pub(crate) enum ProviderErrorCode {
     ProviderUnavailable,
     ModelUnavailable,
     CapabilityUnsupported,
+    RuntimeIncompatible,
     Cancelled,
     TimedOut,
     StartupFailed,
     ExecutionFailed,
+    OutputLimitExceeded,
+    CleanupFailed,
     ProtocolError,
     EventSinkFailed,
 }
@@ -409,10 +412,13 @@ impl ProviderErrorCode {
             Self::ProviderUnavailable => "PROVIDER_UNAVAILABLE",
             Self::ModelUnavailable => "MODEL_UNAVAILABLE",
             Self::CapabilityUnsupported => "CAPABILITY_UNSUPPORTED",
+            Self::RuntimeIncompatible => "PROVIDER_RUNTIME_INCOMPATIBLE",
             Self::Cancelled => "PROVIDER_CANCELLED",
             Self::TimedOut => "PROVIDER_TIMED_OUT",
             Self::StartupFailed => "PROVIDER_START_FAILED",
             Self::ExecutionFailed => "PROVIDER_EXECUTION_FAILED",
+            Self::OutputLimitExceeded => "PROVIDER_OUTPUT_LIMIT_EXCEEDED",
+            Self::CleanupFailed => "PROVIDER_CLEANUP_FAILED",
             Self::ProtocolError => "PROVIDER_PROTOCOL_ERROR",
             Self::EventSinkFailed => "PROVIDER_EVENT_SINK_FAILED",
         }
@@ -426,6 +432,7 @@ pub(crate) struct ProviderError {
     pub(crate) provider_id: Option<RuntimeProviderId>,
     pub(crate) model: Option<String>,
     pub(crate) retryable: bool,
+    pub(crate) evidence: ProviderRunEvidence,
 }
 
 impl ProviderError {
@@ -440,6 +447,7 @@ impl ProviderError {
             provider_id: None,
             model: None,
             retryable,
+            evidence: ProviderRunEvidence::default(),
         }
     }
 
@@ -450,6 +458,11 @@ impl ProviderError {
 
     pub(crate) fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    pub(crate) fn with_evidence(mut self, evidence: ProviderRunEvidence) -> Self {
+        self.evidence = evidence;
         self
     }
 }

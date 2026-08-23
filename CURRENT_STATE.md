@@ -1,17 +1,15 @@
 # Current State
 
 > **Classification: Current static and fresh non-live evidence.** This snapshot
-> was refreshed for TASK-0006 on 2026-08-23 from starting commit
-> <code>2f55546e6ddf42d87d0985d7084018ef0604a630</code> on branch
-> <code>main</code>; its implementation was recorded by user commit
+> was refreshed for TASK-0007 on 2026-08-23 from starting commit
+> <code>82b0035f3ec4e369dda40bb1f1fe12b450b5af52</code>
+> (<code>task7.1</code>) on branch <code>main</code>. That governance-only commit
+> records closure of the TASK-0006 implementation commit
 > <code>eb2421634b1e202a85fcd1890ba7f1073c137269</code>
 > (<code>task6</code>). At the TASK-0007 preflight, checked-out
-> <code>main</code> and <code>origin/main</code> both resolved to that commit,
-> with zero ahead/behind and a clean working tree on 2026-08-23. The bounded
-> workflow-governance correction that records this closure changes development
-> bookkeeping only, not application runtime behavior. This document does not
-> require a separate post-commit-only edit after every task merely to record Git
-> closure. Reverify later implementation facts when they may have drifted.
+> <code>main</code> and <code>origin/main</code> both resolved to the former
+> commit, with zero ahead/behind and a clean working tree. Reverify later
+> implementation facts when they may have drifted.
 
 This document owns statements about what is implemented now. Planned behavior
 belongs in [ARCHITECTURE.md](ARCHITECTURE.md) and
@@ -27,14 +25,18 @@ hardening. TASK-0005 adds schema-v3 authoritative single-run coordination,
 task/run lifecycle projection, a durable bounded ledger, cancellation, and
 restart reconciliation. TASK-0006 adds an explicit provider registry, a common
 runtime contract, exact active-provider/model resolution, and truthful renderer
-availability. Fresh deterministic checks establish the non-live verification
-baseline described below; they do not establish live runtime readiness.
+availability. TASK-0007 adds capability-gated Codex compatibility checks,
+explicit command isolation, Linux process-lifecycle containment, bounded JSONL
+evidence parsing, and deterministic descendant cleanup. Fresh deterministic
+checks establish the non-live verification baseline described below; they do
+not establish live runtime readiness.
 
-TASK-0006 did **not** run Codex, Ollama, or another model/provider; capture
-microphone input; import or start the Python listener; authorize a KDE/XDG
-portal; execute install/remove scripts; build a desktop package; or perform a
-desktop/system-control action. Earlier audit observations remain historical
-unless this document identifies a fresh TASK-0002 result.
+TASK-0007 did **not** run a live Codex task, Ollama, or another model/provider.
+It also did not capture microphone input; import or start the Python listener;
+authorize a KDE/XDG portal; execute install/remove scripts; build a desktop
+package; or perform a desktop/system-control action. Its Codex subprocess tests
+use an isolated fake CLI. Earlier audit observations remain historical unless
+this document identifies a fresh result.
 
 ## Product and release identity
 
@@ -64,6 +66,7 @@ unless this document identifies a fresh TASK-0002 result.
 | <code>src/voiceCommand.ts</code> | Renderer voice-command interpretation |
 | <code>src-tauri/src/lib.rs</code> | Tauri command/startup composition, provider execution, workspace operations, native desktop control, and voice process management |
 | <code>src-tauri/src/provider_runtime.rs</code> | Provider-neutral identity, capability, request, event, cancellation, result, error, adapter, registry, and fake-test contracts |
+| <code>src-tauri/src/codex_runtime.rs</code> | Linux Codex compatibility probing, isolated command construction, bounded JSONL protocol handling, lifecycle containment, cancellation, timeout, and evidence capture |
 | <code>src-tauri/src/app_state.rs</code> | Backend application-state types, validation, canonical seed loading, and legacy normalization |
 | <code>src-tauri/src/policy.rs</code> / <code>src-tauri/src/authorization.rs</code> | Normalized action intents, capability evaluation, native confirmation, and approval IPC contracts |
 | <code>src-tauri/src/run_coordinator.rs</code> | Run states, legal transitions, ledger projections, and explicit evidence/retention bounds |
@@ -183,11 +186,40 @@ backend-authoritative dynamic agent registry; TASK-0009 owns that outcome.
 
 ### Codex
 
-The Rust backend inspects the installed Codex CLI and login status. A run uses
-<code>codex exec --ephemeral</code>, selects <code>read-only</code> or
-<code>workspace-write</code> from backend-derived task/capability policy, sets the working
-directory to the selected workspace, streams progress, supports cancellation
-and timeouts, and captures changed-file/diff evidence.
+On Linux, the Rust backend resolves canonical Codex and Bubblewrap executables,
+captures the Codex executable identity, and performs bounded compatibility
+probes for versions, required flags, the disableable <code>multi_agent</code>
+feature, and login status. It sanitizes readiness messages and revalidates the
+executable identity immediately before a run. Missing or changed executables,
+unsupported capabilities, unavailable containment, and non-Linux platforms
+fail closed.
+
+A run supplies the private prompt on standard input rather than the process
+argument list. It uses ephemeral, JSONL, ignored user-config/rules, strict
+configuration, no-MCP, no-plugin/app/hook, no-multi-agent, approval-never, and
+backend-derived <code>read-only</code> or <code>workspace-write</code> settings.
+Shell network remains disabled; hosted web search is enabled only by the
+approved run capability. A requested file capability of <code>none</code> fails
+because the inspected CLI cannot enforce it. Write/full file levels collapse
+to workspace-write, and safe/user terminal levels collapse to the Codex
+sandbox; administrator terminal access remains denied by backend policy.
+
+The outer Bubblewrap process unshares user and PID namespaces, drops
+capabilities, binds a private <code>/proc</code>, and dies with its parent. This
+is process-lifecycle containment, not a second filesystem policy: it bind-mounts
+the host tree, while the inner Codex sandbox remains the filesystem authority.
+The backend uses nonblocking pipes and polling, sends termination to the process
+group, escalates to kill after a bounded grace period, and requires namespace
+cleanup before reporting cancellation, timeout, event-sink failure, or success.
+Normal and session-detached descendants are covered by fake-process tests.
+
+Incremental JSONL parsing accepts only completed agent-message output as the
+final response, records the response/thread ID and usage, tolerates unknown
+events, and emits only curated progress. Prompt input is limited to 256 KiB,
+individual JSON lines to 64 KiB, stdout to 1 MiB, stderr to 512 KiB, and curated
+progress to 64 events. Malformed/incomplete protocol, nonzero exit, output
+overflow, compatibility failure, and cleanup failure use distinct stable error
+classes with bounded evidence.
 
 ### Ollama
 
@@ -230,7 +262,8 @@ registry by the resolved runtime ID, stores canonical runtime IDs on new ledger
 rows, and classifies terminal failures from typed error codes rather than
 provider-specific message text. Historical ledger rows are retained unchanged.
 
-No live provider connectivity or model output was checked in TASK-0006.
+No live provider connectivity, authentication, model execution, or model output
+was checked in TASK-0007.
 
 ## Current run, routing, and review behavior
 
@@ -271,8 +304,9 @@ No live provider connectivity or model output was checked in TASK-0006.
   attempt regardless of how the task was created.
 
 Progress is limited to 256 events, 8 KiB per message, and 512 KiB per attempt.
-Codex stdout/stderr capture is limited to 1 MiB/512 KiB; Ollama response and
-conversation payloads to 2 MiB each; summaries to 128 KiB; errors to 64 KiB;
+Codex prompts/JSON lines/stdout/stderr are limited to 256 KiB/64 KiB/1 MiB/
+512 KiB before the common ledger bounds apply; Ollama response and conversation
+payloads are limited to 2 MiB each; summaries to 128 KiB; errors to 64 KiB;
 diffs to 120,000 characters and 512 KiB; snapshots to 20,000 files or five
 seconds; and changed-file evidence to 250 paths and 256 KiB. The ledger keeps
 original counts/sizes and explicit truncation flags, which the renderer
@@ -314,14 +348,15 @@ The backend currently:
   read-only with no elevated authorization;
 - blocks task text containing a bounded list of privileged, package, power,
   mount, permission, and system-control command patterns;
-- resolves the selected workspace and constrains Codex with a Codex sandbox;
+- resolves the selected workspace and constrains Codex with an explicit Codex
+  sandbox plus Linux process-lifecycle containment;
 - constrains Ollama tools to paths below the selected workspace.
 
 These controls include backend-issued exact approvals with native resolution,
 expiry, policy/workspace invalidation, and atomic one-use consumption. Imported
 or renderer-origin records cannot authorize actions. Heuristic task-text
-classification and provider-specific process/transport cleanup remain prototype
-limits.
+classification, the limits of the current Codex CLI sandbox projection, and
+Ollama-specific transport/tool cleanup remain prototype limits.
 [SECURITY_MODEL.md](SECURITY_MODEL.md) owns the full boundary and gap list.
 
 Production CSP permits local application resources and Tauri IPC only, blocks
@@ -337,9 +372,10 @@ legacy migration, serialization, revision, fail-closed writer behavior,
 authoritative run projection, provider binding, readiness, and model
 eligibility.
 
-The Rust library contains 62 passing tests. They add provider registry,
-fake-adapter dispatch, exact identity, typed failure, run-state, concurrent
-admission, idempotency, approval-boundary, cancellation, timeout,
+The Rust library contains 74 passing tests. They add Codex compatibility,
+command-isolation, bounded protocol, fake-process descendant cleanup, provider
+registry, fake-adapter dispatch, exact identity, typed failure, run-state,
+concurrent admission, idempotency, approval-boundary, cancellation, timeout,
 crash/restart, stale completion/event, truncation, and retention coverage to
 the earlier provider, workspace, run-safety, voice, state-validation,
 persistence, authorization, corruption, concurrency, and rollback tests.
@@ -354,12 +390,14 @@ The repository-root entry points are:
   Clippy, shell/Python/strict-JSON syntax checks, npm/Cargo dependency trees,
   and production plus full npm audits.
 
-TASK-0006 focused checks passed on 2026-08-23: 8 task-specific Rust tests, 18
-focused frontend tests, all 33 frontend tests, TypeScript, and rustfmt. The
-complete <code>npm run verify:full</code> route passed with 33 frontend tests,
-62 Rust tests, a production build, Clippy with warnings denied,
-shell/Python/JSON checks, dependency trees, and both npm audits reporting zero
-vulnerabilities.
+TASK-0007 focused checks passed on 2026-08-23: 12 task-specific Rust tests, 5
+provider-runtime tests, the complete 74-test locked/offline Rust suite, shell
+fixture syntax, rustfmt, and Clippy with warnings denied. The full repository
+<code>npm run verify:fast</code> and <code>npm run verify:full</code> routes
+passed with 33 frontend tests, 74 Rust tests, a 37-module production build,
+Clippy with warnings denied, shell/Python/JSON checks, dependency trees, and
+both npm audits reporting zero vulnerabilities. Exact task evidence is recorded
+in [planning/TASK_STATUS.md](planning/TASK_STATUS.md).
 
 <code>cargo-audit</code> is not installed in the inspected environment. The
 full route therefore reports the Rust advisory result as **indeterminate** and
@@ -371,7 +409,8 @@ belongs to TASK-0019.
 | Gap | Owning task |
 | --- | --- |
 | Mandatory installed/CI Rust advisory tooling | TASK-0019 |
-| Codex process and Ollama transport/tool hardening | TASK-0007–TASK-0008 |
+| Ollama transport/tool hardening | TASK-0008 |
+| Live Codex compatibility, authentication, model, and packaged-platform acceptance | TASK-0020 |
 | Dynamic hierarchy, routing, review, and workspace evidence | TASK-0009–TASK-0012 |
 | Frontend modularity, strict backup, and full data lifecycle | TASK-0013–TASK-0014 |
 | Voice/system policy and KDE/XDG integration | TASK-0015–TASK-0016 |

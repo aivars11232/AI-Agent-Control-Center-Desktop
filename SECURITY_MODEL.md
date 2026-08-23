@@ -6,9 +6,10 @@
 > backend-authoritative approval, action-policy, privileged IPC, and WebView
 > boundary. TASK-0005 establishes authoritative single-run coordination,
 > lifecycle recovery, and bounded ledger evidence. TASK-0006 establishes exact
-> provider/model identity and no-fallback registry dispatch; later tasks still
-> own provider-specific hardening, voice semantics, packaging, and live
-> acceptance.
+> provider/model identity and no-fallback registry dispatch. TASK-0007 adds
+> capability-gated Codex isolation, bounded protocol handling, and deterministic
+> Linux descendant cleanup; later tasks still own Ollama hardening, voice
+> semantics, packaging, and live acceptance.
 
 ## Security objective
 
@@ -75,8 +76,20 @@ Static inspection and deterministic tests found these implemented controls:
 - rejection of a bounded list of privileged, package, power, permission, mount,
   and system-control patterns in task text;
 - selected-workspace resolution;
-- Codex <code>read-only</code> or <code>workspace-write</code> sandbox
-  selection;
+- bounded Codex executable/version/flag/feature/login probes, sanitized
+  readiness reporting, and executable-identity revalidation before launch;
+- explicit ephemeral Codex configuration that ignores user config/rules,
+  disables MCP, multi-agent, plugins/apps/hooks and shell network, streams the
+  private prompt over standard input, and selects only <code>read-only</code> or
+  <code>workspace-write</code> from backend policy;
+- Linux Codex lifecycle containment with a Bubblewrap user/PID namespace,
+  parent-death handling, dropped capabilities, private <code>/proc</code>,
+  process-group signalling, bounded TERM/KILL escalation, and required cleanup
+  before terminal completion;
+- incremental bounded Codex JSONL parsing that accepts only completed agent
+  messages as final output, derives response/usage evidence, curates progress,
+  and assigns distinct protocol, output-limit, compatibility, and cleanup
+  failures;
 - Ollama workspace-tool containment, including absolute path, parent traversal,
   and <code>.git</code> rejection;
 - per-run cancellation flags and bounded timeouts;
@@ -110,8 +123,9 @@ Static inspection and deterministic tests found these implemented controls:
   listen/unlisten core permissions.
 
 These controls establish the TASK-0004 authorization boundary, TASK-0005
-run-coordination boundary, and TASK-0006 provider-identity boundary. They do
-not establish production readiness or the later provider/platform guarantees.
+run-coordination boundary, TASK-0006 provider-identity boundary, and TASK-0007
+Codex process/protocol boundary. They do not establish production readiness or
+the later provider/platform guarantees.
 
 ## Known current gaps
 
@@ -151,26 +165,35 @@ authorize normalized operations and arguments at the point of use.
 The executable registry contains Codex and Ollama only. OpenAI catalog entries
 map to Codex, Ollama entries map to Ollama, and Anthropic, Google, and Custom
 are explicitly unavailable. Exact backend identity and active-provider
-matching now prevent silent substitution. Live readiness was not exercised,
-Codex descendant-process cleanup remains with TASK-0007, and Ollama transport
-cancellation plus workspace-tool hardening remain with TASK-0008.
+matching now prevent silent substitution. Codex compatibility, JSONL evidence,
+cancellation/timeout escalation, and normal/session-detached descendant cleanup
+are covered by a fake CLI under Linux Bubblewrap. The outer namespace
+bind-mounts the host tree and therefore supplies lifecycle containment rather
+than filesystem authority; the inner Codex sandbox supplies that authority.
+The inspected CLI cannot enforce a zero-file-access mode or separate safe from
+user terminal access, write/full file levels both use workspace-write, and an
+absolute alternate Codex executable cannot be universally excluded. Live
+Codex authentication/model behavior and non-Linux support remain unverified for
+TASK-0020. Ollama transport cancellation and workspace-tool hardening remain
+with TASK-0008.
 
 ### Verification coverage
 
-The checked-in non-live suite contains 33 frontend tests and 62 Rust tests. It
+The checked-in non-live suite contains 33 frontend tests and 74 Rust tests. It
 covers frontend characterization plus backend policy, authorization, run
-coordination/recovery/bounds, provider identity/fake-adapter dispatch, strict
-IPC, CSP/capability, persistence validation, migration, corruption,
-concurrency, and rollback cases. These checks do not establish end-to-end,
-packaging, upgrade, or live acceptance. Rust advisory status remains
-indeterminate when <code>cargo-audit</code> is unavailable.
+coordination/recovery/bounds, provider identity/fake-adapter dispatch, Codex
+compatibility/command/protocol/descendant-process cases, strict IPC,
+CSP/capability, persistence validation, migration, corruption, concurrency,
+and rollback cases. These checks do not establish end-to-end, packaging,
+upgrade, or live acceptance. Rust advisory status remains indeterminate when
+<code>cargo-audit</code> is unavailable.
 
 ## Target security invariants
 
 The approval/action subset of invariants 2 through 5, the coordinator subset
-of invariant 6, and the provider-identity/no-substitution subset of invariant 8
-are implemented for the current command surface. The full integrated
-invariants remain the release target:
+of invariant 6, and the provider-identity/no-substitution plus Codex-isolation
+subsets of invariant 8 are implemented for the current command surface. The
+full integrated invariants remain the release target:
 
 1. The backend is the sole authority for durable domain state and action
    authorization.
@@ -244,6 +267,9 @@ least-privilege workarounds before any code change.
 - Persist terminal run/approval state before releasing authority.
 - Make cancellation idempotent and distinguish user cancellation, timeout,
   provider failure, policy denial, and application restart.
+- Do not report Codex cancellation, timeout, or success until bounded process
+  and namespace cleanup is established; cleanup uncertainty is an interrupted
+  outcome requiring review.
 - Never infer success from a missing process or UI state.
 - Preserve approval records and workspace evidence needed for audit while
   applying explicit retention and redaction rules.

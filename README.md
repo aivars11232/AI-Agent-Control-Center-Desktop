@@ -21,7 +21,9 @@ The current checkout contains:
   ledger;
 - a truthful Codex/Ollama provider registry with exact model/runtime dispatch
   and no silent fallback;
-- execution paths for the installed Codex CLI and a local Ollama server;
+- a Linux Codex execution path with capability checks, explicit configuration
+  isolation, bounded JSONL evidence, cancellation, and descendant cleanup;
+- an execution path for a local Ollama server;
 - local workspace, task, agent, approval, reminder, and model-management UI;
 - an included Python voice runtime and KDE-oriented install/remove scripts.
 
@@ -30,9 +32,10 @@ Important limits are documented in [CURRENT_STATE.md](CURRENT_STATE.md) and
 through typed Tauri commands and a schema-versioned backend database. Run
 admission, task/run lifecycle projection, cancellation state, recovery, and
 bounded evidence retention are backend-authoritative. Provider identity and
-dispatch use a common backend contract; routing, provider-specific process and
-transport hardening, and multi-level review orchestration remain prototype
-boundaries.
+dispatch use a common backend contract. Codex process/protocol hardening is
+implemented for the current Linux path; routing, Ollama transport/tool
+hardening, live provider acceptance, and multi-level review orchestration remain
+prototype boundaries.
 Approval issuance, matching, expiry, trusted resolution, reservation, and
 single-use consumption are backend-authoritative; imported legacy approval
 rows remain non-authoritative history.
@@ -58,8 +61,10 @@ Other platforms are not current release targets.
 The locked frontend toolchain requires Node.js <code>^20.19.0</code> or
 <code>>=22.12.0</code>. The verification routes also require npm, Bash,
 Python 3, Cargo, rustfmt, Clippy, <code>pkg-config</code>, and the platform
-SQLite development files. Install JavaScript dependencies without package
-lifecycle scripts:
+SQLite development files. Linux Codex execution additionally requires
+<code>bwrap</code> (Bubblewrap); absence or incompatibility fails closed rather
+than launching an uncontained Codex process. Install JavaScript dependencies
+without package lifecycle scripts:
 
 ```bash
 npm ci --ignore-scripts
@@ -72,7 +77,7 @@ npm run verify:fast
 ```
 
 It runs 33 frontend characterization/persistence/coordinator/provider tests,
-the TypeScript check, the Rust format check, and 62 locked/offline Rust tests.
+the TypeScript check, the Rust format check, and 74 locked/offline Rust tests.
 The full gate adds the
 frontend build, Clippy, shell/Python/JSON checks, dependency-tree checks, and
 production plus development npm audits:

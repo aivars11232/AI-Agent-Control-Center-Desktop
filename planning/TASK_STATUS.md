@@ -28,7 +28,7 @@ ready merely because its predecessor's code was edited.
 | TASK-0004 | TASK-0003 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Authoritative approvals, capability policy, IPC, and CSP boundary |
 | TASK-0005 | TASK-0004 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Single-run coordinator, task lifecycle, ledger, and bounded output |
 | TASK-0006 | TASK-0005 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Truthful provider registry and common runtime contract |
-| TASK-0007 | TASK-0006 | NOT STARTED | NO | NOT STARTED | — | — | Codex runtime isolation, cancellation, and evidence hardening |
+| TASK-0007 | TASK-0006 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Codex runtime isolation, cancellation, and evidence hardening |
 | TASK-0008 | TASK-0007 | NOT STARTED | NO | NOT STARTED | — | — | Ollama discovery, transport, cancellation, and safe workspace tools |
 | TASK-0009 | TASK-0008 | NOT STARTED | NO | NOT STARTED | — | — | Dynamic agent registry and valid organizational hierarchy |
 | TASK-0010 | TASK-0009 | NOT STARTED | NO | NOT STARTED | — | — | Deterministic routing, queueing, workload, and sequential scheduling |
@@ -276,9 +276,78 @@ ready merely because its predecessor's code was edited.
   desktop package, and desktop/system-control actions: not run
 - Git closure: user implementation commit
   <code>eb2421634b1e202a85fcd1890ba7f1073c137269</code>
-  (<code>task6</code>). At the TASK-0007 preflight, checked-out
-  <code>main</code> and <code>origin/main</code> both resolved to that commit,
-  with zero ahead/behind and a clean working tree on 2026-08-23.
+  (<code>task6</code>) is an ancestor of and reachable from
+  <code>origin/main</code>. At the TASK-0007 preflight, checked-out
+  <code>main</code> and <code>origin/main</code> both resolved to governance-only
+  closure-record commit
+  <code>82b0035f3ec4e369dda40bb1f1fe12b450b5af52</code>
+  (<code>task7.1</code>), with zero ahead/behind and a clean working tree on
+  2026-08-23. Its scope did not conflict with TASK-0007 implementation.
+
+## TASK-0007 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>82b0035f3ec4e369dda40bb1f1fe12b450b5af52</code>
+  (<code>task7.1</code>)
+- Starting status: clean; <code>main</code> matched <code>origin/main</code> with
+  zero ahead/behind
+- Dependency: TASK-0006 implementation commit
+  <code>eb2421634b1e202a85fcd1890ba7f1073c137269</code> was an ancestor of and
+  reachable from <code>origin/main</code>; its verified closure was recorded by
+  the checked-out governance-only commit, whose scope did not conflict
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0007 AS PLANNED.</code>
+- Added a dedicated Linux Codex runtime that resolves canonical Codex and
+  Bubblewrap executables; runs bounded version, flag, feature, and sanitized
+  login probes; and revalidates executable identity immediately before launch
+- Replaced inherited CLI behavior with explicit ephemeral, approval-never,
+  sandbox, web-search, environment, no-MCP, no-plugin/app/hook, no-multi-agent,
+  ignored-user-config/rules, strict-config, and JSONL arguments. Private prompts
+  are streamed on standard input rather than exposed in the process argument
+  list
+- Added lifecycle-only Bubblewrap user/PID namespace containment, capability
+  drop, private <code>/proc</code>, parent-death behavior, process-group
+  signalling, bounded TERM/KILL escalation, and cleanup verification for normal
+  and session-detached descendants. The inner Codex sandbox remains the
+  filesystem authority
+- Added incremental bounded JSONL parsing for completed agent output, response
+  identity, usage, curated progress, malformed/incomplete protocol, nonzero
+  exit, and explicit prompt/line/stdout/stderr/event limits
+- Added stable runtime-incompatible, output-limit, and cleanup-failed provider
+  error classes plus bounded failure evidence. Cleanup uncertainty overrides a
+  misleading cancelled/timed-out terminal state and becomes interrupted
+- Preserved provider registry dispatch, backend run coordination, one-use
+  approval timing, workspace snapshots/diffs, durable ledger evidence, and the
+  compatibility status IPC projection; no schema, migration, frontend, state
+  seed, or IPC-shape change was made
+- Declared the already-locked <code>libc 0.2.186</code> package as a direct
+  Linux dependency for nonblocking polling, process groups, and signals. No
+  package resolution or installed dependency was changed; Linux execution now
+  requires an existing compatible <code>bwrap</code>
+- Focused verification passed: 12 TASK-0007 Rust tests, 5 provider-runtime
+  tests, all 74 locked/offline Rust tests, fake-CLI shell syntax, rustfmt, and
+  Clippy with warnings denied
+- Full non-live gates: <code>npm run verify:fast</code> and
+  <code>npm run verify:full</code> passed on 2026-08-23 with 33 frontend tests,
+  74 Rust tests, a 37-module production build, Clippy with warnings denied,
+  shell/Python/JSON checks, dependency trees, and two npm audits reporting zero
+  vulnerabilities
+- Rust advisory result: **indeterminate** because <code>cargo-audit</code> is
+  not installed; this explicit environmental limitation is not a pass
+- Live Codex/Ollama generation, provider authentication, microphone/listener,
+  portal, install/remove, desktop package, and desktop/system-control actions:
+  not run
+- Remaining limits: no live Codex model evidence; the outer Bubblewrap layer is
+  lifecycle rather than filesystem isolation; current CLI capability levels
+  collapse write/full and safe/user, reject file-none, cannot universally block
+  an absolute alternate Codex executable, and are unsupported outside Linux.
+  Live and packaged-platform acceptance remains with TASK-0020; Ollama
+  transport/tool hardening remains with TASK-0008
+- Git closure: **PENDING USER** review, commit, push, and clean-tree evidence
 
 ## Successor-preflight closure rule
 

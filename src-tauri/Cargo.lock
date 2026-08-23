@@ -46,6 +46,7 @@ version = "0.5.1"
 dependencies = [
  "ashpd",
  "keyring",
+ "libc",
  "log",
  "rusqlite",
  "serde",
