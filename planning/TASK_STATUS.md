@@ -23,7 +23,7 @@ ready merely because its predecessor's code was edited.
 | TASK-0001 | None | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Authoritative project baseline and development contract |
 | TASK-0002 | TASK-0001 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Reproducible verification and characterization baseline |
 | TASK-0003 | TASK-0002 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Backend persistence and state-migration foundation |
-| TASK-0004 | TASK-0003 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Authoritative approvals, capability policy, IPC, and CSP boundary |
+| TASK-0004 | TASK-0003 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Authoritative approvals, capability policy, IPC, and CSP boundary |
 | TASK-0005 | TASK-0004 | NOT STARTED | NO | NOT STARTED | — | — | Single-run coordinator, task lifecycle, ledger, and bounded output |
 | TASK-0006 | TASK-0005 | NOT STARTED | NO | NOT STARTED | — | — | Truthful provider registry and common runtime contract |
 | TASK-0007 | TASK-0006 | NOT STARTED | NO | NOT STARTED | — | — | Codex runtime isolation, cancellation, and evidence hardening |
@@ -167,7 +167,11 @@ ready merely because its predecessor's code was edited.
   not installed; this explicit environmental limitation is not a pass
 - Live provider, microphone, listener, portal, install/remove, desktop package,
   and desktop/system-control actions: not run
-- Git closure: <code>PENDING USER</code>; Codex did not stage, commit, or push
+- Git closure: user commit
+  <code>ac90346da32426f0ab97f5d3a0f9f7ea92969881</code> with commit message
+  <code>task4</code> is the checked-out <code>main</code> HEAD;
+  <code>main</code> matches <code>origin/main</code>. The TASK-0005 preflight
+  confirmed zero ahead/behind and a clean working tree on 2026-08-23.
 
 ## Closure rule
 
