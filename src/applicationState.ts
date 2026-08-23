@@ -66,7 +66,7 @@ export type AppPreferences = {
   density: InterfaceDensity;
   reducedMotion: boolean;
   defaultModel: string;
-  activeAiProvider: AiProvider;
+  activeAiProvider: RuntimeProviderId;
   defaultAgentStatus: AgentStatus;
   defaultTaskCategory: TaskCategory;
   defaultTaskPriority: TaskPriority;
@@ -156,7 +156,7 @@ export type ModelProvider =
   | "Google"
   | "Ollama"
   | "Custom";
-export type AiProvider = "codex" | "ollama";
+export type RuntimeProviderId = "codex" | "ollama";
 
 export type ModelDefinition = {
   id: number;

@@ -1,8 +1,11 @@
-use crate::app_state::{Agent, AgentTask, ApplicationState, WorkspaceDefinition};
+use crate::{
+    app_state::{Agent, AgentTask, ApplicationState, WorkspaceDefinition},
+    provider_runtime::resolve_model_identity,
+};
 use serde::{Deserialize, Serialize};
 
 const MAX_INTENT_TEXT: usize = 4 * 1024;
-const POLICY_FINGERPRINT_VERSION: &str = "policy-v2";
+const POLICY_FINGERPRINT_VERSION: &str = "policy-v3";
 const INTENT_FINGERPRINT_VERSION: &str = "intent-v1";
 const WORKSPACE_FINGERPRINT_VERSION: &str = "workspace-v2";
 
@@ -694,20 +697,28 @@ impl<'a> EvaluationContext<'a> {
             )
         })?;
         let model = if self.task.is_some() {
+            let identity = resolve_model_identity(
+                &self.state.models,
+                &self.agent.model,
+                &self.state.preferences.active_ai_provider,
+            )
+            .map_err(|error| PolicyDenial::new(error.code.as_str(), error.message))?;
             let model = self
                 .state
                 .models
                 .iter()
-                .find(|model| model.name == self.agent.model)
+                .find(|model| model.id == identity.catalog_model_id)
                 .ok_or_else(|| {
                     PolicyDenial::new(
                         "MODEL_NOT_FOUND",
-                        "The selected agent model is not registered in backend state.",
+                        "The resolved model identity is no longer registered in backend state.",
                     )
                 })?;
             Some(serde_json::json!({
+                "catalogModelId": identity.catalog_model_id,
                 "name": model.name,
-                "provider": model.provider,
+                "catalogProvider": model.provider,
+                "runtimeProvider": identity.provider_id,
             }))
         } else {
             None
@@ -748,6 +759,7 @@ impl<'a> EvaluationContext<'a> {
                 "safetyMode": self.state.preferences.safety_mode,
                 "approvalExpiryMinutes": self.state.preferences.approval_expiry_minutes,
                 "agentTimeoutMinutes": self.state.preferences.agent_timeout_minutes,
+                "activeAiProvider": self.state.preferences.active_ai_provider,
             },
             "effective": {
                 "requiredScopes": required_scopes,
@@ -888,6 +900,7 @@ mod tests {
         });
         state.preferences.active_workspace_id = Some("workspace-1".to_string());
         state.preferences.workspace_path = "/tmp/fixture".to_string();
+        state.preferences.active_ai_provider = "ollama".to_string();
         state.agents[1].tasks.push(AgentTask {
             id: 41,
             title: "Run cargo test and edit the parser".to_string(),
@@ -936,8 +949,27 @@ mod tests {
         assert_eq!(evaluation.task_id, Some(41));
         assert_eq!(evaluation.workspace_id.as_deref(), Some("workspace-1"));
         assert!(evaluation.scopes.contains(&Scope::Files));
-        assert!(evaluation.policy_fingerprint.starts_with("policy-v2|"));
+        assert!(evaluation.policy_fingerprint.starts_with("policy-v3|"));
         assert!(evaluation.intent_fingerprint.starts_with("intent-v1|"));
+    }
+
+    #[test]
+    fn task_0006_run_policy_rejects_inactive_and_unsupported_model_providers() {
+        let mut inactive = state_with_task();
+        inactive.preferences.active_ai_provider = "codex".to_string();
+        assert_eq!(
+            evaluate_policy(&inactive, &run_intent()).unwrap_err().code,
+            "PROVIDER_MODEL_MISMATCH"
+        );
+
+        let mut unsupported = state_with_task();
+        unsupported.agents[1].model = "claude-sonnet".to_string();
+        assert_eq!(
+            evaluate_policy(&unsupported, &run_intent())
+                .unwrap_err()
+                .code,
+            "UNSUPPORTED_PROVIDER"
+        );
     }
 
     #[test]

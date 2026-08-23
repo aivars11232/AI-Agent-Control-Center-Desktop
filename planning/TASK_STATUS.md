@@ -25,7 +25,7 @@ ready merely because its predecessor's code was edited.
 | TASK-0003 | TASK-0002 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Backend persistence and state-migration foundation |
 | TASK-0004 | TASK-0003 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Authoritative approvals, capability policy, IPC, and CSP boundary |
 | TASK-0005 | TASK-0004 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Single-run coordinator, task lifecycle, ledger, and bounded output |
-| TASK-0006 | TASK-0005 | NOT STARTED | NO | NOT STARTED | — | — | Truthful provider registry and common runtime contract |
+| TASK-0006 | TASK-0005 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Truthful provider registry and common runtime contract |
 | TASK-0007 | TASK-0006 | NOT STARTED | NO | NOT STARTED | — | — | Codex runtime isolation, cancellation, and evidence hardening |
 | TASK-0008 | TASK-0007 | NOT STARTED | NO | NOT STARTED | — | — | Ollama discovery, transport, cancellation, and safe workspace tools |
 | TASK-0009 | TASK-0008 | NOT STARTED | NO | NOT STARTED | — | — | Dynamic agent registry and valid organizational hierarchy |
@@ -215,14 +215,69 @@ ready merely because its predecessor's code was edited.
   Ollama transport cancellation remain with TASK-0006 through TASK-0008
 - Git closure: user implementation commit
   <code>ceaf01deb55c7d3ef7304dea2f84f97aa85043d0</code>
-  (<code>task5</code>). At the TASK-0006 preflight, checked-out
-  <code>main</code> and <code>origin/main</code> both resolved to that commit,
-  with zero ahead/behind and a clean working tree on 2026-08-23.
+  (<code>task5</code>) plus user closure-record commit
+  <code>2f55546e6ddf42d87d0985d7084018ef0604a630</code>
+  (<code>task5.1</code>). At the TASK-0006 preflight, checked-out
+  <code>main</code> and <code>origin/main</code> both resolved to the latter
+  commit, with zero ahead/behind and a clean working tree on 2026-08-23.
+
+## TASK-0006 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>2f55546e6ddf42d87d0985d7084018ef0604a630</code>
+  (<code>task5.1</code>)
+- Starting status: clean; <code>main</code> matched <code>origin/main</code> with
+  zero ahead/behind
+- Dependency: TASK-0005 implementation and chosen Git closure were recorded by
+  the two user commits above
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0006 AS PLANNED.</code>
+- Added a provider-neutral Rust contract for identity, capability, request,
+  events, cancellation, results, evidence, typed errors, adapters, status, and
+  exact registry dispatch; production registers only Codex and Ollama
+- OpenAI catalog models bind to Codex, Ollama models bind to Ollama, and
+  Anthropic, Google, and Custom are explicitly non-executable; missing,
+  duplicate, unsupported, inactive-provider, and adapter-mismatch identities
+  fail closed without fallback
+- Made persisted <code>activeAiProvider</code> authoritative in backend policy
+  and dispatch. Policy fingerprints are now <code>policy-v3</code> and bind the
+  catalog model ID/provider plus runtime and active provider, so older or
+  mismatched approvals cannot authorize a changed provider decision
+- Added one common provider-registry status IPC and a typed renderer projection
+  used by the provider selector, model catalog, model/default assignment,
+  automatic routing, review selection, and pre-run checks. Existing unsupported
+  catalog entries/assignments remain stored but are shown and blocked as
+  unavailable
+- New ledger rows use canonical <code>codex</code>/<code>ollama</code> runtime
+  IDs; historical rows and persisted catalog data remain unchanged. Existing
+  Codex/Ollama status commands remain as compatibility surfaces
+- No dependency, schema, migration, seed, or package-lock change was required
+- Minor in-scope deviation: one persistence test helper that assigns the
+  Ollama-backed Coding Agent was changed to select Ollama as the active provider
+  after the new hard gate exposed 11 stale fixture failures. Production data
+  and persistence behavior were not changed
+- Focused verification passed: 8 TASK-0006 Rust tests, 18 focused frontend
+  tests, all 33 frontend tests, TypeScript, and rustfmt. The complete Rust suite
+  passed with 62 tests after the single test-fixture correction
+- Full non-live gates: <code>npm run verify:fast</code> and
+  <code>npm run verify:full</code> passed on 2026-08-23 with 33 frontend tests,
+  62 Rust tests, a production build, Clippy with warnings denied,
+  shell/Python/JSON checks, dependency trees, and two npm audits reporting zero
+  vulnerabilities
+- Rust advisory result: **indeterminate** because <code>cargo-audit</code> is
+  not installed; this explicit environmental limitation is not a pass
+- Live Codex/Ollama generation, microphone/listener, portal, install/remove,
+  desktop package, and desktop/system-control actions: not run
+- Git closure: **PENDING USER** review, commit, push, and clean-tree evidence
 
 ## Closure rule
 
-TASK-0006 must not begin automatically. Before successor work, the user reviews
-the TASK-0005 diff and either:
+TASK-0007 must not begin automatically. Before successor work, the user reviews
+the TASK-0006 diff and either:
 
 1. commits and pushes the approved task and records the commit plus clean
    worktree; or

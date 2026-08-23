@@ -1,15 +1,14 @@
 # Current State
 
 > **Classification: Current static and fresh non-live evidence.** This snapshot
-> was refreshed for TASK-0005 on 2026-08-23 from starting commit
-> <code>0d7ade46ee7407d5feb0f43e3d52b6fe56abcba7</code> on branch
-> <code>main</code>. TASK-0005 implementation was committed as
-> <code>ceaf01deb55c7d3ef7304dea2f84f97aa85043d0</code>
-> (<code>task5</code>). The TASK-0006 preflight confirmed that checked-out
-> <code>main</code> and <code>origin/main</code> both resolved to that
-> implementation commit, with zero ahead/behind and a clean working tree on
-> 2026-08-23. Reverify details that may drift before relying on them in a later
-> task.
+> was refreshed for TASK-0006 on 2026-08-23 from starting commit
+> <code>2f55546e6ddf42d87d0985d7084018ef0604a630</code> on branch
+> <code>main</code>. That commit records TASK-0005 Git closure after its
+> implementation commit
+> <code>ceaf01deb55c7d3ef7304dea2f84f97aa85043d0</code>. At the TASK-0006
+> preflight, checked-out <code>main</code> and <code>origin/main</code> matched,
+> with zero ahead/behind and a clean working tree. Reverify details that may
+> drift before relying on them in a later task.
 
 This document owns statements about what is implemented now. Planned behavior
 belongs in [ARCHITECTURE.md](ARCHITECTURE.md) and
@@ -23,11 +22,12 @@ TASK-0004 adds schema-v2 authoritative approvals, unified action policy,
 narrowed privileged IPC, protected security-setting changes, and WebView
 hardening. TASK-0005 adds schema-v3 authoritative single-run coordination,
 task/run lifecycle projection, a durable bounded ledger, cancellation, and
-restart reconciliation. Fresh deterministic checks establish the non-live
-verification baseline described below; they do not establish live runtime
-readiness.
+restart reconciliation. TASK-0006 adds an explicit provider registry, a common
+runtime contract, exact active-provider/model resolution, and truthful renderer
+availability. Fresh deterministic checks establish the non-live verification
+baseline described below; they do not establish live runtime readiness.
 
-TASK-0005 did **not** run Codex, Ollama, or another model/provider; capture
+TASK-0006 did **not** run Codex, Ollama, or another model/provider; capture
 microphone input; import or start the Python listener; authorize a KDE/XDG
 portal; execute install/remove scripts; build a desktop package; or perform a
 desktop/system-control action. Earlier audit observations remain historical
@@ -54,11 +54,13 @@ unless this document identifies a fresh TASK-0002 result.
 | --- | --- |
 | <code>src/App.tsx</code> | Main renderer UI, browser-preview compatibility, routing/review presentation, approval display, and typed intent IPC callers |
 | <code>src/applicationState.ts</code> / <code>src/application-state-seed.json</code> | Shared renderer state types and the canonical fresh-state seed |
+| <code>src/providerRegistry.ts</code> | Typed renderer projection of backend provider status, catalog bindings, and fail-closed model eligibility |
 | <code>src/runCoordinator.ts</code> | Typed renderer projection of authoritative run snapshots/events, stale-event rejection, and global stop state |
 | <code>src/persistence.ts</code> | Typed desktop bootstrap, one-time legacy cleanup, serialized writes, backup import, and reset adapter |
 | <code>src/App.css</code> | Main application styling and responsive behavior |
 | <code>src/voiceCommand.ts</code> | Renderer voice-command interpretation |
 | <code>src-tauri/src/lib.rs</code> | Tauri command/startup composition, provider execution, workspace operations, native desktop control, and voice process management |
+| <code>src-tauri/src/provider_runtime.rs</code> | Provider-neutral identity, capability, request, event, cancellation, result, error, adapter, registry, and fake-test contracts |
 | <code>src-tauri/src/app_state.rs</code> | Backend application-state types, validation, canonical seed loading, and legacy normalization |
 | <code>src-tauri/src/policy.rs</code> / <code>src-tauri/src/authorization.rs</code> | Normalized action intents, capability evaluation, native confirmation, and approval IPC contracts |
 | <code>src-tauri/src/run_coordinator.rs</code> | Run states, legal transitions, ledger projections, and explicit evidence/retention bounds |
@@ -193,16 +195,39 @@ change evidence. Its tool path checks reject absolute and parent-traversal
 paths and prevent access to the selected workspace's <code>.git</code>
 directory.
 
-### Model labels versus integrations
+### Registry, identity, and availability
 
-The persisted model catalog can label models as OpenAI, Anthropic,
-Google, Ollama, or Custom. That catalog is not evidence of five provider
-integrations. The backend derives the selected agent's model/provider and
-selects Ollama only when that stored provider is <code>Ollama</code>; every
-other label currently uses the Codex execution
-path. TASK-0006 owns a truthful provider registry and runtime contract.
+The executable registry contains exactly two runtime identities:
+<code>codex</code> and <code>ollama</code>. OpenAI catalog entries bind to the
+Codex adapter and Ollama catalog entries bind to the Ollama adapter. Anthropic,
+Google, and Custom remain valid persisted catalog labels, but their bindings
+explicitly expose no executable adapter and the UI marks them unavailable.
 
-No live provider connectivity or model output was checked in TASK-0005.
+The persisted <code>activeAiProvider</code> is an authoritative hard gate. The
+backend resolves exactly one catalog row by model name, rejects missing or
+duplicate identities, rejects unsupported provider labels, and rejects a model
+whose adapter does not match the active provider. It does not silently switch
+providers or fall back. The policy fingerprint now includes catalog model ID,
+catalog provider, runtime provider, and active provider under
+<code>policy-v3</code>; an older approval therefore fails exact matching rather
+than authorizing a changed provider decision.
+
+<code>provider_registry_status</code> returns common provider descriptors,
+capabilities, readiness, versions, discovered runtime models, and all catalog
+bindings. The renderer uses that one snapshot for the provider selector,
+model catalog, assignments, defaults, automatic routing, and senior-review
+selection. Codex catalog models are eligible only when Codex reports ready and
+remain subject to CLI model validation at run start. Ollama models additionally
+must be discovered locally and report tool support. Existing unavailable
+catalog entries and assignments are preserved rather than rewritten.
+
+Both adapters implement the same typed request, progress, cancellation,
+result, evidence, and error contract. Orchestration dispatches through the
+registry by the resolved runtime ID, stores canonical runtime IDs on new ledger
+rows, and classifies terminal failures from typed error codes rather than
+provider-specific message text. Historical ledger rows are retained unchanged.
+
+No live provider connectivity or model output was checked in TASK-0006.
 
 ## Current run, routing, and review behavior
 
@@ -224,10 +249,11 @@ No live provider connectivity or model output was checked in TASK-0005.
   <code>startup_failed</code>, <code>failed</code>, and
   <code>interrupted</code>.
 - The backend derives task, workspace, model/provider, capabilities, prompt,
-  and timeout from current state. An exact approval is reserved at admission,
-  consumed once only after the provider startup boundary succeeds, and
-  released when cancellation or failure occurs before dispatch. Once dispatch
-  may have occurred, recovery never restores that approval for replay.
+  and timeout from current state, then applies exact catalog/runtime/active
+  provider resolution before dispatch. An exact approval is reserved at
+  admission, consumed once only after the provider startup boundary succeeds,
+  and released when cancellation or failure occurs before dispatch. Once
+  dispatch may have occurred, recovery never restores that approval for replay.
 - The backend keeps only the live cancellation handle in memory. Admission,
   cancellation requests, task projections, events, outcomes, usage, changed
   paths, diffs, errors, and recovery disposition are durable in SQLite.
@@ -275,6 +301,8 @@ and KDE/XDG live integration acceptance.
 The backend currently:
 
 - validates typed action intents and rejects unknown run IPC fields;
+- rejects missing, ambiguous, unsupported, inactive, or unavailable provider
+  and model identities without fallback;
 - admits at most one execute or review attempt system-wide and protects
   backend-owned task lifecycle fields from renderer overwrites;
 - derives maximum capabilities and approval modes from backend state;
@@ -289,7 +317,8 @@ The backend currently:
 These controls include backend-issued exact approvals with native resolution,
 expiry, policy/workspace invalidation, and atomic one-use consumption. Imported
 or renderer-origin records cannot authorize actions. Heuristic task-text
-classification and current provider adapters remain prototype limits.
+classification and provider-specific process/transport cleanup remain prototype
+limits.
 [SECURITY_MODEL.md](SECURITY_MODEL.md) owns the full boundary and gap list.
 
 Production CSP permits local application resources and Tauri IPC only, blocks
@@ -300,11 +329,13 @@ and WebSocket endpoints.
 
 ## Verification inventory
 
-Four Vitest files contain 27 deterministic frontend tests for renderer, voice,
-legacy migration, serialization, revision, fail-closed writer behavior, and
-authoritative run projection.
+Five Vitest files contain 33 deterministic frontend tests for renderer, voice,
+legacy migration, serialization, revision, fail-closed writer behavior,
+authoritative run projection, provider binding, readiness, and model
+eligibility.
 
-The Rust library contains 55 passing tests. They add run-state, concurrent
+The Rust library contains 62 passing tests. They add provider registry,
+fake-adapter dispatch, exact identity, typed failure, run-state, concurrent
 admission, idempotency, approval-boundary, cancellation, timeout,
 crash/restart, stale completion/event, truncation, and retention coverage to
 the earlier provider, workspace, run-safety, voice, state-validation,
@@ -320,13 +351,12 @@ The repository-root entry points are:
   Clippy, shell/Python/strict-JSON syntax checks, npm/Cargo dependency trees,
   and production plus full npm audits.
 
-TASK-0005 focused checks passed on 2026-08-23: 14 task-specific Rust tests,
-all 27 frontend tests, TypeScript, rustfmt, and Clippy. The complete
-<code>npm run verify:full</code> route passed with 27 frontend tests, 55 Rust
-tests, a 36-module production build, Clippy with warnings denied,
+TASK-0006 focused checks passed on 2026-08-23: 8 task-specific Rust tests, 18
+focused frontend tests, all 33 frontend tests, TypeScript, and rustfmt. The
+complete <code>npm run verify:full</code> route passed with 33 frontend tests,
+62 Rust tests, a production build, Clippy with warnings denied,
 shell/Python/JSON checks, dependency trees, and both npm audits reporting zero
-vulnerabilities. Dependency-tree output exceeded the captured console view,
-but the command completed with exit status 0.
+vulnerabilities.
 
 <code>cargo-audit</code> is not installed in the inspected environment. The
 full route therefore reports the Rust advisory result as **indeterminate** and
@@ -338,7 +368,7 @@ belongs to TASK-0019.
 | Gap | Owning task |
 | --- | --- |
 | Mandatory installed/CI Rust advisory tooling | TASK-0019 |
-| Truthful provider registry and hardened Codex/Ollama paths | TASK-0006–TASK-0008 |
+| Codex process and Ollama transport/tool hardening | TASK-0007–TASK-0008 |
 | Dynamic hierarchy, routing, review, and workspace evidence | TASK-0009–TASK-0012 |
 | Frontend modularity, strict backup, and full data lifecycle | TASK-0013–TASK-0014 |
 | Voice/system policy and KDE/XDG integration | TASK-0015–TASK-0016 |

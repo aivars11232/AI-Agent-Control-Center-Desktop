@@ -5,8 +5,10 @@
 > controls from planned security invariants. TASK-0004 establishes the
 > backend-authoritative approval, action-policy, privileged IPC, and WebView
 > boundary. TASK-0005 establishes authoritative single-run coordination,
-> lifecycle recovery, and bounded ledger evidence; later tasks still own
-> provider hardening, voice semantics, packaging, and live acceptance.
+> lifecycle recovery, and bounded ledger evidence. TASK-0006 establishes exact
+> provider/model identity and no-fallback registry dispatch; later tasks still
+> own provider-specific hardening, voice semantics, packaging, and live
+> acceptance.
 
 ## Security objective
 
@@ -35,7 +37,7 @@ when stored locally.
 | React renderer/WebView | Untrusted for authorization; may be compromised or hold stale/tampered state |
 | Imported backup and <code>localStorage</code> | Untrusted serialized input requiring validation and migration |
 | Tauri IPC | Untrusted request boundary; backend must authenticate semantics, not just types |
-| Rust backend | Authoritative approval/action-policy, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
+| Rust backend | Authoritative approval/action-policy, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
 | Codex/Ollama output | Untrusted content and action proposals |
 | Selected workspace | Sensitive bounded filesystem root |
 | External/local provider process | Separate process/service with its own failure and trust model |
@@ -51,6 +53,15 @@ Static inspection and deterministic tests found these implemented controls:
   review agents;
 - backend derivation of run workspace, model/provider, capabilities, timeout,
   prompt context, scopes, and destructive classification from persisted state;
+- exact backend resolution of one catalog model to one registered runtime,
+  with missing, duplicate, unsupported, active-provider mismatch, and missing
+  adapter cases rejected without fallback;
+- a common typed provider request, event, cancellation, result, evidence,
+  capability, and error contract implemented by the Codex and Ollama adapters;
+- one provider-registry status projection whose catalog bindings explicitly
+  mark Anthropic, Google, and Custom as non-executable;
+- policy-v3 provider/model fingerprints that invalidate older or mismatched run
+  approvals instead of inheriting authority across a provider decision;
 - a schema-v2 request/approve/deny/expire/validate/consume lifecycle bound to
   exact agent, task, workspace, intent, and policy fingerprints;
 - trusted native confirmation that identifies the exact normalized action or
@@ -98,9 +109,9 @@ Static inspection and deterministic tests found these implemented controls:
   JavaScript prototypes, and a main-window capability containing only event
   listen/unlisten core permissions.
 
-These controls establish the TASK-0004 authorization boundary and TASK-0005
-run-coordination boundary. They do not establish production readiness or the
-later provider/platform guarantees.
+These controls establish the TASK-0004 authorization boundary, TASK-0005
+run-coordination boundary, and TASK-0006 provider-identity boundary. They do
+not establish production readiness or the later provider/platform guarantees.
 
 ## Known current gaps
 
@@ -137,27 +148,29 @@ authorize normalized operations and arguments at the point of use.
 
 ### Provider and run truth
 
-Renderer model labels do not map to five distinct provider implementations.
-Backend dispatch treats only Ollama specially and sends all other labels to
-Codex. Single-run admission and lifecycle are now backend-authoritative and
-durable, but provider readiness/identity, Codex descendant-process cleanup,
-and Ollama transport cancellation remain owned by TASK-0006 through TASK-0008.
+The executable registry contains Codex and Ollama only. OpenAI catalog entries
+map to Codex, Ollama entries map to Ollama, and Anthropic, Google, and Custom
+are explicitly unavailable. Exact backend identity and active-provider
+matching now prevent silent substitution. Live readiness was not exercised,
+Codex descendant-process cleanup remains with TASK-0007, and Ollama transport
+cancellation plus workspace-tool hardening remain with TASK-0008.
 
 ### Verification coverage
 
-The checked-in non-live suite contains 27 frontend tests and 55 Rust tests. It
+The checked-in non-live suite contains 33 frontend tests and 62 Rust tests. It
 covers frontend characterization plus backend policy, authorization, run
-coordination/recovery/bounds, strict IPC, CSP/capability, persistence
-validation, migration, corruption, concurrency, and rollback cases. These
-checks do not establish end-to-end, packaging, upgrade, or live acceptance.
-Rust advisory status remains indeterminate when <code>cargo-audit</code> is
-unavailable.
+coordination/recovery/bounds, provider identity/fake-adapter dispatch, strict
+IPC, CSP/capability, persistence validation, migration, corruption,
+concurrency, and rollback cases. These checks do not establish end-to-end,
+packaging, upgrade, or live acceptance. Rust advisory status remains
+indeterminate when <code>cargo-audit</code> is unavailable.
 
 ## Target security invariants
 
-The approval/action subset of invariants 2 through 5 and the coordinator
-subset of invariant 6 are implemented for the current command surface. The
-full integrated invariants remain the release target:
+The approval/action subset of invariants 2 through 5, the coordinator subset
+of invariant 6, and the provider-identity/no-substitution subset of invariant 8
+are implemented for the current command surface. The full integrated
+invariants remain the release target:
 
 1. The backend is the sole authority for durable domain state and action
    authorization.

@@ -4860,6 +4860,7 @@ mod tests {
         });
         state.preferences.active_workspace_id = Some("workspace-authorization".to_string());
         state.preferences.workspace_path = "/tmp/authorization-fixture".to_string();
+        state.preferences.active_ai_provider = "ollama".to_string();
         state.agents[1].tasks.push(AgentTask {
             id: 41,
             title: "Run cargo test and edit the parser".to_string(),

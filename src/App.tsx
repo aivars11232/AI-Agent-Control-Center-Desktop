@@ -9,7 +9,6 @@ import type {
   AgentRole,
   AgentStatus,
   AgentTask,
-  AiProvider,
   AppPreferences,
   ApprovalMode,
   ApprovalRequest,
@@ -27,6 +26,7 @@ import type {
   ReviewStatus,
   RiskLevel,
   RoutingMode,
+  RuntimeProviderId,
   SafetyMode,
   SafetyScope,
   TaskCategory,
@@ -70,32 +70,18 @@ import {
   type RunCoordinatorSnapshot,
   type RunCoordinatorUiState,
 } from "./runCoordinator";
+import {
+  executableModels,
+  providerRuntimeStatus,
+  resolveModelAvailability,
+  unknownProviderRegistrySnapshot,
+  type ProviderRegistrySnapshot,
+} from "./providerRegistry";
 import logoUrl from "../AI-Agents.png";
 import "./App.css";
 
-type CodexRuntimeStatus = {
-  installed: boolean;
-  authenticated: boolean;
-  version: string | null;
-  binaryPath: string | null;
-  message: string;
-};
-
-type OllamaModelRuntime = {
-  name: string;
-  capabilities: string[];
-  contextLength: number | null;
-};
-
-type OllamaRuntimeStatus = {
-  connected: boolean;
-  version: string | null;
-  endpoint: string;
-  models: OllamaModelRuntime[];
-  message: string;
-};
-
 type AgentRunResult = {
+  providerId: RuntimeProviderId | null;
   output: string;
   responseId: string | null;
   model: string;
@@ -742,14 +728,20 @@ export function executionRouteForTask(
   models: ModelDefinition[],
   category: TaskCategory,
   preferredAgentId: number,
+  activeProvider: RuntimeProviderId,
+  providerRegistry: ProviderRegistrySnapshot,
 ) {
-  const registeredModels = new Set(models.map((model) => model.name));
   const candidates = agents
     .filter(
       (agent) =>
         agent.status !== "Paused" &&
         agent.model.trim().toLowerCase() !== "none" &&
-        registeredModels.has(agent.model),
+        resolveModelAvailability(
+          models,
+          agent.model,
+          providerRegistry,
+          activeProvider,
+        ).eligible,
     )
     .map((agent) => {
       let score = agent.status === "Waiting" ? 18 : 10;
@@ -804,6 +796,9 @@ export function reviewAgentForTask(
   agents: Agent[],
   ownerAgentId: number,
   category: TaskCategory,
+  models: ModelDefinition[],
+  activeProvider: RuntimeProviderId,
+  providerRegistry: ProviderRegistrySnapshot,
 ) {
   return (
     agents
@@ -812,6 +807,12 @@ export function reviewAgentForTask(
           agent.id !== ownerAgentId &&
           agent.status !== "Paused" &&
           agent.model.trim().toLowerCase() !== "none" &&
+          resolveModelAvailability(
+            models,
+            agent.model,
+            providerRegistry,
+            activeProvider,
+          ).eligible &&
           agent.capabilities.files !== "none" &&
           (agent.role === "Senior Agent" ||
             agent.role === "Team Leader" ||
@@ -1066,6 +1067,7 @@ function AgentsPage({
   agents,
   setAgents,
   models,
+  providerRegistry,
   preferences,
   runCoordinator,
   setRunCoordinator,
@@ -1076,6 +1078,7 @@ function AgentsPage({
   agents: Agent[];
   setAgents: React.Dispatch<React.SetStateAction<Agent[]>>;
   models: ModelDefinition[];
+  providerRegistry: ProviderRegistrySnapshot;
   preferences: AppPreferences;
   runCoordinator: RunCoordinatorUiState;
   setRunCoordinator: React.Dispatch<
@@ -1128,6 +1131,11 @@ function AgentsPage({
   const activeRunKind = activeRun?.runMode === "review" ? "review" : "execution";
   const runtimeProgress = runCoordinator.progress;
   const cancelRequested = runCoordinator.stopRequested;
+  const availableModels = executableModels(
+    models,
+    providerRegistry,
+    preferences.activeAiProvider,
+  );
 
   const selectedAgentTasks = selectedAgent?.tasks ?? [];
   const completedTaskCount = selectedAgentTasks.filter(
@@ -1247,6 +1255,24 @@ function AgentsPage({
 
     if (!trimmedName || !trimmedDescription) {
       return;
+    }
+
+    if (
+      editingAgentId === null &&
+      preferences.defaultModel.toLowerCase() !== "none"
+    ) {
+      const defaultAvailability = resolveModelAvailability(
+        models,
+        preferences.defaultModel,
+        providerRegistry,
+        preferences.activeAiProvider,
+      );
+      if (!defaultAvailability.eligible) {
+        setRuntimeError(
+          `The default model is unavailable: ${defaultAvailability.reason}`,
+        );
+        return;
+      }
     }
 
     if (editingAgentId !== null) {
@@ -1476,11 +1502,13 @@ function AgentsPage({
             models,
             newTaskCategory,
             selectedAgentId,
+            preferences.activeAiProvider,
+            providerRegistry,
           )
         : null;
     if (newTaskRoutingMode === "automatic" && !route) {
       setRuntimeError(
-        "No active agent with a registered model is available for automatic routing.",
+        "No active agent has a model executable through the active provider for automatic routing.",
       );
       return;
     }
@@ -1553,10 +1581,12 @@ function AgentsPage({
       models,
       task.category,
       selectedAgent.id,
+      preferences.activeAiProvider,
+      providerRegistry,
     );
     if (!route) {
       setRuntimeError(
-        "No active agent with a registered model is available for automatic routing.",
+        "No active agent has a model executable through the active provider for automatic routing.",
       );
       return;
     }
@@ -1711,6 +1741,9 @@ function AgentsPage({
       agents,
       selectedAgent.id,
       task.category,
+      models,
+      preferences.activeAiProvider,
+      providerRegistry,
     );
     if (!workspace) {
       setRuntimeError("The task workspace is no longer available.");
@@ -1718,12 +1751,8 @@ function AgentsPage({
     }
     if (!reviewer) {
       setRuntimeError(
-        "No active senior reviewer is available. Start a Senior Agent, Team Leader, or Supervisor with file-read access.",
+        "No active senior reviewer has file-read access and a model executable through the active provider.",
       );
-      return;
-    }
-    if (models.length === 0) {
-      setRuntimeError("Add a registered model to the catalog before starting a senior review.");
       return;
     }
     let reviewAuthorization: AuthorizationReadiness;
@@ -1788,12 +1817,15 @@ function AgentsPage({
       return;
     }
 
-    const selectedModel = models.find(
-      (model) => model.name === selectedAgent.model,
+    const selectedModelAvailability = resolveModelAvailability(
+      models,
+      selectedAgent.model,
+      providerRegistry,
+      preferences.activeAiProvider,
     );
-    if (!selectedModel) {
+    if (!selectedModelAvailability.eligible) {
       setRuntimeError(
-        `The model assigned to ${selectedAgent.name} is no longer in the model catalog. Choose a registered model in Overview first.`,
+        `The model assigned to ${selectedAgent.name} is unavailable: ${selectedModelAvailability.reason}`,
       );
       return;
     }
@@ -2081,13 +2113,23 @@ function AgentsPage({
                   style={{ marginTop: "12px", width: "100%" }}
                 >
                   <option value="None">None</option>
-                  {models.map((model) => (
+                  {selectedAgent.model.toLowerCase() !== "none" &&
+                    !availableModels.some(
+                      (model) => model.name === selectedAgent.model,
+                    ) && (
+                      <option value={selectedAgent.model} disabled>
+                        {selectedAgent.model} · unavailable
+                      </option>
+                    )}
+                  {availableModels.map((model) => (
                     <option value={model.name} key={model.id}>
                       {model.name} · {model.provider}
                     </option>
                   ))}
                 </select>
-                <small>Assigned AI model</small>
+                <small>
+                  Executable through {preferences.activeAiProvider}
+                </small>
               </article>
 
               <article className="summary-card">
@@ -5586,47 +5628,28 @@ function RemindersPage({
 function ModelsPage({
   models,
   setModels,
+  providerRegistry,
+  activeProvider,
+  registryBusy,
+  registryMessage,
+  onRefreshRegistry,
 }: {
   models: ModelDefinition[];
   setModels: React.Dispatch<React.SetStateAction<ModelDefinition[]>>;
+  providerRegistry: ProviderRegistrySnapshot;
+  activeProvider: RuntimeProviderId;
+  registryBusy: boolean;
+  registryMessage: string;
+  onRefreshRegistry: () => Promise<void>;
 }) {
   const [modelName, setModelName] = useState("");
   const [provider, setProvider] = useState<ModelProvider>("OpenAI");
-  const [ollamaStatus, setOllamaStatus] =
-    useState<OllamaRuntimeStatus | null>(null);
-  const [ollamaBusy, setOllamaBusy] = useState(false);
-  const [ollamaMessage, setOllamaMessage] = useState("");
-  const [ollamaMessageKind, setOllamaMessageKind] = useState<
-    "success" | "error"
-  >("success");
-
-  async function refreshOllamaStatus() {
-    if (!isDesktopRuntime()) {
-      setOllamaMessageKind("error");
-      setOllamaMessage("Open the installed desktop app to inspect local Ollama models.");
-      return;
-    }
-
-    setOllamaBusy(true);
-    setOllamaMessage("");
-    try {
-      const status = await invoke<OllamaRuntimeStatus>(
-        "ollama_runtime_status",
-      );
-      setOllamaStatus(status);
-      setOllamaMessageKind(status.connected ? "success" : "error");
-      setOllamaMessage(status.message);
-    } catch (error) {
-      setOllamaMessageKind("error");
-      setOllamaMessage(errorMessage(error));
-    } finally {
-      setOllamaBusy(false);
-    }
-  }
-
-  useEffect(() => {
-    void refreshOllamaStatus();
-  }, []);
+  const ollamaStatus = providerRuntimeStatus(providerRegistry, "ollama");
+  const ollamaReady = ollamaStatus?.availability === "ready";
+  const ollamaMessage = registryMessage || ollamaStatus?.message || "";
+  const selectedBinding = providerRegistry.catalogBindings.find(
+    (binding) => binding.catalogProvider === provider,
+  );
 
   function addModel() {
     const trimmedName = modelName.trim();
@@ -5699,7 +5722,8 @@ function ModelsPage({
           <span className="eyebrow">MODEL CATALOG</span>
           <h1>Models</h1>
           <p className="page-message">
-            Register the AI models that agents can use.
+            Manage catalog entries and see which active runtime can execute
+            them.
           </p>
         </div>
       </header>
@@ -5717,10 +5741,10 @@ function ModelsPage({
 
           <span
             className={`connection-badge ${
-              ollamaStatus?.connected ? "connected" : "disconnected"
+              ollamaReady ? "connected" : "disconnected"
             }`}
           >
-            {ollamaStatus?.connected ? "Connected" : "Not connected"}
+            {ollamaReady ? "Ready" : "Unavailable"}
           </span>
         </div>
 
@@ -5728,10 +5752,10 @@ function ModelsPage({
           <div className="provider-actions">
             <button
               className="primary-button"
-              disabled={ollamaBusy}
-              onClick={refreshOllamaStatus}
+              disabled={registryBusy}
+              onClick={() => void onRefreshRegistry()}
             >
-              {ollamaBusy ? "Checking…" : "Refresh Ollama"}
+              {registryBusy ? "Checking…" : "Refresh provider registry"}
             </button>
           </div>
         </div>
@@ -5743,8 +5767,8 @@ function ModelsPage({
               {ollamaStatus.version ?? "Unavailable"}
             </span>
             <span>
-              <strong>Endpoint</strong>
-              {ollamaStatus.endpoint}
+              <strong>Registry adapter</strong>
+              {ollamaStatus.provider.displayName}
             </span>
             <span>
               <strong>Installed models</strong>
@@ -5754,7 +5778,10 @@ function ModelsPage({
         )}
 
         {ollamaMessage && (
-          <div className={`runtime-message ${ollamaMessageKind}`} role="status">
+          <div
+            className={`runtime-message ${ollamaReady && !registryMessage ? "success" : "error"}`}
+            role="status"
+          >
             {ollamaMessage}
           </div>
         )}
@@ -5841,6 +5868,10 @@ function ModelsPage({
               <option value="Ollama">Ollama</option>
               <option value="Custom">Custom</option>
             </select>
+            <small>
+              {selectedBinding?.message ??
+                "This catalog provider has no registry binding."}
+            </small>
           </label>
 
           <button className="primary-button" onClick={addModel}>
@@ -5863,21 +5894,39 @@ function ModelsPage({
           </p>
         ) : (
           <div className="agent-list">
-            {models.map((model) => (
-              <article className="agent-card" key={model.id}>
-                <div>
-                  <h3>{model.name}</h3>
-                  <p>{model.provider}</p>
-                </div>
+            {models.map((model) => {
+              const availability = resolveModelAvailability(
+                models,
+                model.name,
+                providerRegistry,
+                activeProvider,
+              );
+              return (
+                <article className="agent-card" key={model.id}>
+                  <div>
+                    <h3>{model.name}</h3>
+                    <p>
+                      {model.provider} · {availability.providerId ?? "no adapter"}
+                    </p>
+                    <small>{availability.reason}</small>
+                  </div>
 
-                <button
-                  className="danger-button"
-                  onClick={() => deleteModel(model.id)}
-                >
-                  Delete
-                </button>
-              </article>
-            ))}
+                  <div className="task-card-actions">
+                    <span
+                      className={`connection-badge ${availability.eligible ? "connected" : "disconnected"}`}
+                    >
+                      {availability.eligible ? "Executable" : "Unavailable"}
+                    </span>
+                    <button
+                      className="danger-button"
+                      onClick={() => deleteModel(model.id)}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
           </div>
         )}
       </section>
@@ -5943,8 +5992,10 @@ function SettingsPage({
   setActivityRetentionDays,
   preferences,
   setPreferences,
-  providerConnected,
-  setProviderConnected,
+  providerRegistry,
+  registryBusy,
+  registryMessage,
+  onRefreshRegistry,
   onImportBackup,
   onResetApplication,
 }: {
@@ -5970,8 +6021,10 @@ function SettingsPage({
   setPreferences: React.Dispatch<
     React.SetStateAction<AppPreferences>
   >;
-  providerConnected: boolean;
-  setProviderConnected: React.Dispatch<React.SetStateAction<boolean>>;
+  providerRegistry: ProviderRegistrySnapshot;
+  registryBusy: boolean;
+  registryMessage: string;
+  onRefreshRegistry: () => Promise<void>;
   onImportBackup: (backupJson: string) => Promise<void>;
   onResetApplication: (confirmation: string) => Promise<void>;
 }) {
@@ -5981,10 +6034,7 @@ function SettingsPage({
 
   const managedAgent =
     agents.find((agent) => agent.id === managedAgentId) ?? agents[0] ?? null;
-  const [providerBusy, setProviderBusy] = useState(false);
   const [providerMessage, setProviderMessage] = useState("");
-  const [runtimeStatus, setRuntimeStatus] =
-    useState<CodexRuntimeStatus | null>(null);
   const [providerMessageKind, setProviderMessageKind] =
     useState<"success" | "error">("success");
   const [editingWorkspaceId, setEditingWorkspaceId] = useState<string | null>(
@@ -5993,35 +6043,25 @@ function SettingsPage({
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspacePath, setWorkspacePath] = useState("");
   const [workspaceBusy, setWorkspaceBusy] = useState(false);
+  const codexStatus = providerRuntimeStatus(providerRegistry, "codex");
+  const codexReady = codexStatus?.availability === "ready";
+  const codexMessage =
+    providerMessage || registryMessage || codexStatus?.message || "";
+  const codexMessageKind = providerMessage
+    ? providerMessageKind
+    : codexReady && !registryMessage
+      ? "success"
+      : "error";
+  const availableModels = executableModels(
+    models,
+    providerRegistry,
+    preferences.activeAiProvider,
+  );
 
-  async function refreshCodexStatus() {
-    if (!isDesktopRuntime()) {
-      setProviderMessageKind("error");
-      setProviderMessage("Open the installed desktop app to inspect Codex.");
-      return;
-    }
-
-    setProviderBusy(true);
+  async function refreshRegistryFromSettings() {
     setProviderMessage("");
-
-    try {
-      const status = await invoke<CodexRuntimeStatus>("codex_runtime_status");
-      const connected = status.installed && status.authenticated;
-      setRuntimeStatus(status);
-      setProviderConnected(connected);
-      setProviderMessageKind(connected ? "success" : "error");
-      setProviderMessage(status.message);
-    } catch (error) {
-      setProviderMessageKind("error");
-      setProviderMessage(errorMessage(error));
-    } finally {
-      setProviderBusy(false);
-    }
+    await onRefreshRegistry();
   }
-
-  useEffect(() => {
-    refreshCodexStatus();
-  }, []);
 
   function suggestedWorkspaceName(path: string) {
     return path.split("/").filter(Boolean).slice(-1)[0] ?? "Workspace";
@@ -6496,9 +6536,9 @@ function SettingsPage({
           </div>
 
           <span
-            className={`connection-badge ${providerConnected ? "connected" : "disconnected"}`}
+            className={`connection-badge ${codexReady ? "connected" : "disconnected"}`}
           >
-            {providerConnected ? "Connected" : "Not connected"}
+            {codexReady ? "Ready" : "Unavailable"}
           </span>
         </div>
 
@@ -6528,34 +6568,39 @@ function SettingsPage({
           <div className="provider-actions">
             <button
               className="primary-button"
-              disabled={providerBusy}
-              onClick={refreshCodexStatus}
+              disabled={registryBusy}
+              onClick={() => void refreshRegistryFromSettings()}
             >
-              {providerBusy ? "Checking…" : "Refresh status"}
+              {registryBusy ? "Checking…" : "Refresh provider registry"}
             </button>
           </div>
         </div>
 
-        {runtimeStatus && (
+        {codexStatus && (
           <div className="runtime-facts" aria-label="Codex runtime details">
             <span>
               <strong>Version</strong>
-              {runtimeStatus.version ?? "Unavailable"}
+              {codexStatus.version ?? "Unavailable"}
             </span>
             <span>
-              <strong>Authentication</strong>
-              {runtimeStatus.authenticated ? "ChatGPT signed in" : "Sign-in required"}
+              <strong>Availability</strong>
+              {codexStatus.availability}
             </span>
             <span>
-              <strong>Executable</strong>
-              {runtimeStatus.binaryPath ?? "Not found"}
+              <strong>Workspace access</strong>
+              {codexStatus.provider.capabilities.workspaceWrite
+                ? "Read and write"
+                : "Read only"}
             </span>
           </div>
         )}
 
-        {providerMessage && (
-          <div className={`runtime-message ${providerMessageKind}`} role="status">
-            {providerMessage}
+        {codexMessage && (
+          <div
+            className={`runtime-message ${codexMessageKind}`}
+            role="status"
+          >
+            {codexMessage}
           </div>
         )}
       </section>
@@ -6950,7 +6995,15 @@ function SettingsPage({
               }
             >
               <option value="None">None</option>
-              {models.map((model) => (
+              {preferences.defaultModel.toLowerCase() !== "none" &&
+                !availableModels.some(
+                  (model) => model.name === preferences.defaultModel,
+                ) && (
+                  <option value={preferences.defaultModel} disabled>
+                    {preferences.defaultModel} · unavailable
+                  </option>
+                )}
+              {availableModels.map((model) => (
                 <option value={model.name} key={model.id}>
                   {model.name} · {model.provider}
                 </option>
@@ -7380,9 +7433,14 @@ function PlaceholderPage({ page }: { page: Page }) {
 function App() {
   const desktopRuntime = isDesktopRuntime();
   const [activePage, setActivePage] = useState<Page>("Dashboard");
-  const [providerConnected, setProviderConnected] = useState(false);
-  const [ollamaRuntimeStatus, setOllamaRuntimeStatus] =
-    useState<OllamaRuntimeStatus | null>(null);
+  const [providerRegistry, setProviderRegistry] =
+    useState<ProviderRegistrySnapshot>(() =>
+      unknownProviderRegistrySnapshot(
+        desktopRuntime
+          ? "Provider readiness has not been inspected."
+          : "Open the installed desktop app to inspect provider readiness.",
+      ),
+    );
   const [aiProviderBusy, setAiProviderBusy] = useState(false);
   const [aiProviderMessage, setAiProviderMessage] = useState("");
   const [runCoordinator, setRunCoordinator] =
@@ -8388,25 +8446,58 @@ function App() {
   }
 
   const activeAiProvider = preferences.activeAiProvider;
+  const activeAiProviderStatus = providerRuntimeStatus(
+    providerRegistry,
+    activeAiProvider,
+  );
   const activeAiProviderName =
-    activeAiProvider === "ollama" ? "Ollama" : "Codex";
+    activeAiProviderStatus?.provider.displayName ??
+    (activeAiProvider === "ollama" ? "Ollama" : "Codex");
   const activeAiProviderConnected =
-    activeAiProvider === "ollama"
-      ? Boolean(ollamaRuntimeStatus?.connected)
-      : providerConnected;
+    activeAiProviderStatus?.availability === "ready";
+  const activeAiProviderModelCount = activeAiProviderStatus?.models.length ?? 0;
   const activeAiProviderHint =
-    activeAiProvider === "ollama"
-      ? ollamaRuntimeStatus?.connected
-        ? ollamaRuntimeStatus.models.length === 1
+    activeAiProviderConnected
+      ? activeAiProvider === "ollama"
+        ? activeAiProviderModelCount === 1
           ? "1 local model available"
-          : `${ollamaRuntimeStatus.models.length} local models available`
-        : "Check Ollama"
-      : providerConnected
-        ? "Plus agents ready"
-        : "Check Codex in Settings";
+          : `${activeAiProviderModelCount} local models available`
+        : "Configured catalog models can run through Codex"
+      : activeAiProviderStatus?.message ??
+        "The active provider registry entry is missing.";
 
-  async function selectAiProvider(nextProvider: AiProvider) {
+  async function refreshProviderRegistry() {
+    if (!isDesktopRuntime()) {
+      setAiProviderMessage(
+        "Open the installed desktop app to inspect provider readiness.",
+      );
+      return;
+    }
+
+    setAiProviderBusy(true);
+    setAiProviderMessage("");
+    try {
+      const snapshot = await invoke<ProviderRegistrySnapshot>(
+        "provider_registry_status",
+      );
+      setProviderRegistry(snapshot);
+    } catch (error) {
+      const message = errorMessage(error);
+      setProviderRegistry(unknownProviderRegistrySnapshot(message));
+      setAiProviderMessage(message);
+    } finally {
+      setAiProviderBusy(false);
+    }
+  }
+
+  async function selectAiProvider(nextProvider: RuntimeProviderId) {
     if (aiProviderBusy || nextProvider === activeAiProvider) {
+      return;
+    }
+    if (runCoordinator.snapshot.activeAttempt) {
+      setAiProviderMessage(
+        "Stop the active run before changing the authoritative AI provider.",
+      );
       return;
     }
     if (!isDesktopRuntime()) {
@@ -8422,62 +8513,14 @@ function App() {
       ...current,
       activeAiProvider: nextProvider,
     }));
-
-    try {
-      if (nextProvider === "codex") {
-        const status = await invoke<CodexRuntimeStatus>("codex_runtime_status");
-        const connected = status.installed && status.authenticated;
-        setProviderConnected(connected);
-        if (!connected) {
-          setAiProviderMessage(status.message);
-        }
-      } else {
-        const status = await invoke<OllamaRuntimeStatus>(
-          "ollama_runtime_status",
-        );
-        setOllamaRuntimeStatus(status);
-        if (!status.connected) {
-          setAiProviderMessage(status.message);
-        }
-      }
-    } catch (error) {
-      if (nextProvider === "codex") {
-        setProviderConnected(false);
-      } else {
-        setOllamaRuntimeStatus(null);
-      }
-      setAiProviderMessage(errorMessage(error));
-    } finally {
-      setAiProviderBusy(false);
-    }
+    await refreshProviderRegistry();
   }
 
   useEffect(() => {
-    if (!isDesktopRuntime()) {
+    if (!desktopRuntime) {
       return;
     }
-
-    let mounted = true;
-    void Promise.allSettled([
-      invoke<CodexRuntimeStatus>("codex_runtime_status"),
-      invoke<OllamaRuntimeStatus>("ollama_runtime_status"),
-    ]).then(([codexResult, ollamaResult]) => {
-      if (!mounted) {
-        return;
-      }
-      setProviderConnected(
-        codexResult.status === "fulfilled" &&
-          codexResult.value.installed &&
-          codexResult.value.authenticated,
-      );
-      setOllamaRuntimeStatus(
-        ollamaResult.status === "fulfilled" ? ollamaResult.value : null,
-      );
-    });
-
-    return () => {
-      mounted = false;
-    };
+    void refreshProviderRegistry();
   }, []);
 
   useEffect(() => {
@@ -8727,9 +8770,15 @@ function App() {
               <select
                 aria-label="AI provider"
                 value={activeAiProvider}
-                disabled={!isDesktopRuntime() || aiProviderBusy}
+                disabled={
+                  !isDesktopRuntime() ||
+                  aiProviderBusy ||
+                  Boolean(globalActiveRun)
+                }
                 onChange={(event) =>
-                  void selectAiProvider(event.target.value as AiProvider)
+                  void selectAiProvider(
+                    event.target.value as RuntimeProviderId,
+                  )
                 }
               >
                 <option value="codex">Codex</option>
@@ -8761,6 +8810,9 @@ function App() {
                   ? "Senior review"
                   : "Task execution"}
                 {` · ${globalActiveRun.status.replace(/_/g, " ")}`}
+                {globalActiveRun.provider
+                  ? ` · ${globalActiveRun.provider}`
+                  : ""}
                 {globalActiveRun.model ? ` · ${globalActiveRun.model}` : ""}
               </small>
               {latestRunProgress && (
@@ -8791,6 +8843,7 @@ function App() {
             agents={agents}
             setAgents={setAgents}
             models={models}
+            providerRegistry={providerRegistry}
             preferences={preferences}
             runCoordinator={runCoordinator}
             setRunCoordinator={setRunCoordinator}
@@ -8837,7 +8890,15 @@ function App() {
             setRetentionDays={setActivityRetentionDays}
           />
         ) : activePage === "Models" ? (
-          <ModelsPage models={models} setModels={setModels} />
+          <ModelsPage
+            models={models}
+            setModels={setModels}
+            providerRegistry={providerRegistry}
+            activeProvider={activeAiProvider}
+            registryBusy={aiProviderBusy}
+            registryMessage={aiProviderMessage}
+            onRefreshRegistry={refreshProviderRegistry}
+          />
         ) : activePage === "Settings" ? (
           <SettingsPage
             models={models}
@@ -8854,8 +8915,10 @@ function App() {
             setActivityRetentionDays={setActivityRetentionDays}
             preferences={preferences}
             setPreferences={setPreferences}
-            providerConnected={providerConnected}
-            setProviderConnected={setProviderConnected}
+            providerRegistry={providerRegistry}
+            registryBusy={aiProviderBusy}
+            registryMessage={aiProviderMessage}
+            onRefreshRegistry={refreshProviderRegistry}
             onImportBackup={importApplicationBackup}
             onResetApplication={resetPersistedApplication}
           />

@@ -2,6 +2,7 @@ mod app_state;
 mod authorization;
 mod persistence;
 mod policy;
+mod provider_runtime;
 mod run_coordinator;
 
 use app_state::{ApplicationState, LegacyRendererState};
@@ -21,6 +22,14 @@ use persistence::{
     PersistenceError, PersistenceService, SaveReceipt, StateEnvelope, StateRepository,
 };
 use policy::{ActionIntent, RunMode};
+use provider_runtime::{
+    catalog_provider_bindings, codex_descriptor, ollama_descriptor, resolve_model_identity,
+    ProviderAdapter, ProviderAvailability, ProviderCancellation, ProviderError, ProviderErrorCode,
+    ProviderEventKind, ProviderRegistry, ProviderRegistrySnapshot, ProviderRunContext,
+    ProviderRunEvent, ProviderRunEvidence, ProviderRunMode, ProviderRunObserver,
+    ProviderRunRequest, ProviderRunResult, ProviderRunUsage, ProviderRuntimeModel,
+    ProviderRuntimeStatus, RuntimeProviderId,
+};
 use run_coordinator::{
     bound_diff, bound_paths, validate_request_id, BoundedText, RunAttemptProjection,
     RunAttemptStatus, RunCompletion, RunCoordinatorSnapshot, RunTruncationEvidence, RunUsage,
@@ -142,28 +151,6 @@ struct AgentRunRequest {
     run_mode: String,
 }
 
-struct AuthorizedAgentRun {
-    run_mode: String,
-    agent_name: String,
-    description: String,
-    role: String,
-    category: String,
-    memory: String,
-    review_feedback: Option<String>,
-    task_title: String,
-    model: String,
-    model_provider: String,
-    strength: u8,
-    focus: String,
-    enable_web_search: bool,
-    workspace_path: String,
-    file_access: String,
-    terminal_access: String,
-    authorized_scopes: Vec<String>,
-    destructive_actions_approved: bool,
-    timeout_seconds: u64,
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct OpenWorkspaceItemRequest {
@@ -203,14 +190,6 @@ struct ImportLegacyBackupRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AcknowledgeLegacyCleanupRequest {
     expected_revision: i64,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CodexRunEvent {
-    run_id: String,
-    kind: String,
-    message: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -255,6 +234,7 @@ struct AgentRunUsage {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentRunResult {
+    provider_id: Option<String>,
     output: String,
     response_id: Option<String>,
     model: String,
@@ -265,18 +245,10 @@ struct AgentRunResult {
 }
 
 #[derive(Clone)]
-struct RuntimeRunContext {
+struct RunCoordinatorProviderObserver {
     app: AppHandle,
     persistence: PersistenceService,
     attempt_id: i64,
-    request_id: String,
-    cancel_flag: Arc<AtomicBool>,
-}
-
-struct RuntimeRunResult {
-    result: AgentRunResult,
-    stderr_excerpt: Option<String>,
-    truncation: RunTruncationEvidence,
 }
 
 struct CapturedText {
@@ -884,11 +856,7 @@ fn resolve_model(model: &str) -> String {
     }
 }
 
-fn is_ollama_provider(provider: &str) -> bool {
-    provider.trim().eq_ignore_ascii_case("ollama")
-}
-
-fn agent_prompt(request: &AuthorizedAgentRun, local_ollama: bool) -> String {
+fn agent_prompt(request: &ProviderRunRequest, local_ollama: bool) -> String {
     let memory = if request.memory.trim().is_empty() {
         "No persistent agent memory has been provided.".to_string()
     } else {
@@ -961,10 +929,7 @@ fn contains_any(text: &str, patterns: &[&str]) -> bool {
     patterns.iter().any(|pattern| normalized.contains(pattern))
 }
 
-fn validate_run_safety(request: &AuthorizedAgentRun) -> Result<(), String> {
-    if !matches!(request.run_mode.as_str(), "execute" | "review") {
-        return Err("The requested agent run mode is invalid.".to_string());
-    }
+fn validate_run_safety(request: &ProviderRunRequest) -> Result<(), String> {
     if !matches!(
         request.file_access.as_str(),
         "none" | "read" | "write" | "full"
@@ -991,7 +956,7 @@ fn validate_run_safety(request: &AuthorizedAgentRun) -> Result<(), String> {
     {
         return Err("The run contains an unknown authorization scope.".to_string());
     }
-    if request.run_mode == "review" {
+    if request.run_mode == ProviderRunMode::Review {
         if !matches!(request.file_access.as_str(), "none" | "read")
             || request.terminal_access != "none"
             || !request.authorized_scopes.is_empty()
@@ -1095,7 +1060,7 @@ fn build_authorized_agent_run(
     request: AgentRunRequest,
     state: &ApplicationState,
     grant: &AuthorizationGrant,
-) -> Result<AuthorizedAgentRun, String> {
+) -> Result<ProviderRunRequest, String> {
     let run_mode = match request.run_mode.as_str() {
         "execute" => RunMode::Execute,
         "review" => RunMode::Review,
@@ -1127,13 +1092,12 @@ fn build_authorized_agent_run(
         .iter()
         .find(|workspace| &workspace.id == workspace_id)
         .ok_or_else(|| "The task workspace no longer exists.".to_string())?;
-    let model = state
-        .models
-        .iter()
-        .find(|model| model.name == agent.model)
-        .ok_or_else(|| {
-            "The selected agent model is not registered in backend state.".to_string()
-        })?;
+    let model = resolve_model_identity(
+        &state.models,
+        &agent.model,
+        &state.preferences.active_ai_provider,
+    )
+    .map_err(|error| error.to_string())?;
 
     let task_text = format!("{} {}", task.title, task.category).to_ascii_lowercase();
     let destructive = run_mode == RunMode::Execute
@@ -1227,8 +1191,11 @@ fn build_authorized_agent_run(
         "Perform an independent, read-only senior review of task {}.\n\nOriginal task: {}\n\nSpecialist summary:\n{}\n\nReported changed files: {}\n\n{}\n\nCheck correctness, completeness, regressions, safety, and whether the requested result was actually verified. Do not modify files or run commands. End with exactly one verdict line: VERDICT: APPROVED or VERDICT: CHANGES REQUESTED.",
         task.id, task.title, specialist_output, changed_files, diff_evidence
     );
-    let execution = AuthorizedAgentRun {
-        run_mode: request.run_mode,
+    let execution = ProviderRunRequest {
+        run_mode: match run_mode {
+            RunMode::Execute => ProviderRunMode::Execute,
+            RunMode::Review => ProviderRunMode::Review,
+        },
         agent_name: agent.name.clone(),
         description: agent.description.clone(),
         role: agent.role.clone(),
@@ -1246,8 +1213,7 @@ fn build_authorized_agent_run(
         } else {
             task.title.clone()
         },
-        model: model.name.clone(),
-        model_provider: model.provider.clone(),
+        model,
         strength: u8::try_from(agent.performance.strength)
             .unwrap_or(5)
             .clamp(1, 10),
@@ -1278,32 +1244,34 @@ fn build_authorized_agent_run(
     Ok(execution)
 }
 
-impl RuntimeRunContext {
-    fn emit(&self, kind: &str, message: impl Into<String>) -> Result<(), String> {
-        let message = message.into();
+impl ProviderRunObserver for RunCoordinatorProviderObserver {
+    fn emit(&self, event: ProviderRunEvent) -> Result<(), ProviderError> {
         let event = self
             .persistence
-            .record_run_event_blocking(self.attempt_id, kind, &message)
-            .map_err(authorization_error_message)?;
+            .record_run_event_blocking(self.attempt_id, event.kind.as_str(), &event.message)
+            .map_err(|error| {
+                ProviderError::new(
+                    ProviderErrorCode::EventSinkFailed,
+                    authorization_error_message(error),
+                    true,
+                )
+            })?;
         let _ = self.app.emit("run-coordinator-event", event);
-        let _ = self.app.emit(
-            "codex-run-event",
-            CodexRunEvent {
-                run_id: self.request_id.clone(),
-                kind: kind.to_string(),
-                message,
-            },
-        );
         Ok(())
     }
 
-    fn mark_started(&self) -> Result<RunAttemptProjection, String> {
-        let attempt = self
-            .persistence
+    fn mark_started(&self) -> Result<(), ProviderError> {
+        self.persistence
             .mark_run_started_blocking(self.attempt_id)
-            .map_err(authorization_error_message)?;
+            .map_err(|error| {
+                ProviderError::new(
+                    ProviderErrorCode::EventSinkFailed,
+                    authorization_error_message(error),
+                    true,
+                )
+            })?;
         emit_run_snapshot(&self.app, &self.persistence);
-        Ok(attempt)
+        Ok(())
     }
 }
 
@@ -1813,7 +1781,7 @@ fn tool_string_argument<'a>(arguments: &'a Value, name: &str) -> Result<&'a str,
 
 fn execute_ollama_workspace_tool(
     workspace: &Path,
-    request: &AuthorizedAgentRun,
+    request: &ProviderRunRequest,
     tool_call: &OllamaToolCall,
 ) -> Result<String, String> {
     match tool_call.name.as_str() {
@@ -1868,10 +1836,11 @@ fn ollama_chat_with_cancellation(
     model: String,
     messages: Vec<Value>,
     tools: Vec<Value>,
-    cancel_flag: Arc<AtomicBool>,
+    cancellation: ProviderCancellation,
     started: Instant,
     timeout_seconds: u64,
-) -> Result<Value, String> {
+) -> Result<Value, ProviderError> {
+    let error_model = model.clone();
     let request = json!({
       "model": model,
       "messages": messages,
@@ -1885,407 +1854,667 @@ fn ollama_chat_with_cancellation(
     });
 
     loop {
-        if cancel_flag.load(Ordering::SeqCst) {
-            return Err("Agent run cancelled by the user.".to_string());
+        if cancellation.is_cancelled() {
+            return Err(ProviderError::new(
+                ProviderErrorCode::Cancelled,
+                "Agent run cancelled by the user.",
+                true,
+            )
+            .with_provider(RuntimeProviderId::Ollama)
+            .with_model(error_model.clone()));
         }
         if started.elapsed() >= Duration::from_secs(timeout_seconds) {
-            return Err(format!(
-                "Agent run stopped after reaching the {timeout_seconds}-second timeout."
-            ));
+            return Err(ProviderError::new(
+                ProviderErrorCode::TimedOut,
+                format!("Agent run stopped after reaching the {timeout_seconds}-second timeout."),
+                true,
+            )
+            .with_provider(RuntimeProviderId::Ollama)
+            .with_model(error_model.clone()));
         }
         match receiver.recv_timeout(Duration::from_millis(120)) {
-            Ok(response) => return response,
+            Ok(response) => {
+                return response.map_err(|message| {
+                    ProviderError::new(ProviderErrorCode::ProtocolError, message, true)
+                        .with_provider(RuntimeProviderId::Ollama)
+                        .with_model(error_model.clone())
+                })
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("The Ollama request worker stopped unexpectedly.".to_string());
+                return Err(ProviderError::new(
+                    ProviderErrorCode::ProtocolError,
+                    "The Ollama request worker stopped unexpectedly.",
+                    true,
+                )
+                .with_provider(RuntimeProviderId::Ollama)
+                .with_model(error_model.clone()));
             }
         }
     }
 }
 
 fn run_ollama_task(
-    context: RuntimeRunContext,
-    request: AuthorizedAgentRun,
-) -> Result<RuntimeRunResult, String> {
+    context: ProviderRunContext,
+    request: ProviderRunRequest,
+) -> Result<ProviderRunResult, ProviderError> {
     let started = Instant::now();
-    let cancel_flag = context.cancel_flag.clone();
-    if cancel_flag.load(Ordering::SeqCst) {
-        return Err("Agent run cancelled by the user.".to_string());
+    let provider_id = RuntimeProviderId::Ollama;
+    let selected_model = request.model.runtime_model.clone();
+    if request.model.provider_id != provider_id {
+        return Err(ProviderError::new(
+            ProviderErrorCode::ProviderModelMismatch,
+            "The resolved model does not belong to the Ollama adapter.",
+            false,
+        )
+        .with_provider(provider_id)
+        .with_model(selected_model));
     }
-    (|| {
-        validate_run_safety(&request)?;
-        if request.enable_web_search {
-            return Err("The local Ollama coding agent has no web-search tool. Disable internet access for this run or choose a Codex model.".to_string());
-        }
-        let workspace = resolve_workspace(&request.workspace_path)?;
-        let model = resolve_model(&request.model);
-        let runtime_status = inspect_ollama_runtime();
-        if !runtime_status.connected {
-            return Err(runtime_status.message);
-        }
-        let installed_model = runtime_status
-            .models
-            .iter()
-            .find(|item| item.name.eq_ignore_ascii_case(&model))
-            .ok_or_else(|| {
-                format!("The Ollama model `{model}` is not installed at {OLLAMA_ENDPOINT}.")
-            })?;
-        if !installed_model
-            .capabilities
-            .iter()
-            .any(|capability| capability.eq_ignore_ascii_case("tools"))
-        {
-            return Err(format!(
-        "The Ollama model `{model}` does not report tool support, which is required for workspace coding tasks."
-      ));
-        }
-
-        let timeout_seconds = request.timeout_seconds.clamp(60, 7_200);
-        let prompt = agent_prompt(&request, true);
-        context.emit(
-            "status",
-            format!("Starting local Ollama model {model} in the selected workspace"),
-        )?;
-        let before_snapshot = workspace_snapshot(&workspace);
-        let tools = ollama_workspace_tools(&request.file_access);
-        let mut messages = vec![json!({ "role": "system", "content": prompt })];
-        let mut input_tokens = 0_u64;
-        let mut output_tokens = 0_u64;
-        let mut used_usage = false;
-        context.mark_started()?;
-
-        for turn in 0..MAX_OLLAMA_TOOL_TURNS {
-            let response = ollama_chat_with_cancellation(
-                model.clone(),
-                messages.clone(),
-                tools.clone(),
-                cancel_flag.clone(),
-                started,
-                timeout_seconds,
-            )?;
-            let runtime_model = response
-                .get("model")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| model.clone());
-            if let Some(tokens) = response.get("prompt_eval_count").and_then(Value::as_u64) {
-                input_tokens = input_tokens.saturating_add(tokens);
-                used_usage = true;
-            }
-            if let Some(tokens) = response.get("eval_count").and_then(Value::as_u64) {
-                output_tokens = output_tokens.saturating_add(tokens);
-                used_usage = true;
-            }
-
-            let message = response
-                .get("message")
-                .cloned()
-                .filter(Value::is_object)
-                .ok_or_else(|| "Ollama returned no assistant message.".to_string())?;
-            let content = message
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let mut tool_calls = native_ollama_tool_calls(&message);
-            if tool_calls.is_empty() {
-                if let Some(tool_call) = content_ollama_tool_call(&content) {
-                    tool_calls.push(tool_call);
-                }
-            }
-            messages.push(message);
-
-            if tool_calls.is_empty() {
-                if content.is_empty() {
-                    return Err("Ollama completed without returning a final response.".to_string());
-                }
-                context.emit("status", "Checking workspace changes…")?;
-                let after_snapshot = workspace_snapshot(&workspace);
-                let bounded_paths =
-                    bound_paths(compare_snapshots(&before_snapshot, &after_snapshot));
-                let diff_capture = git_working_tree_diff(&workspace);
-                let (diff, original_diff_bytes, diff_truncated) =
-                    bound_diff(diff_capture.as_ref().map(|capture| capture.text.clone()));
-                context.emit(
-                    "complete",
-                    format!(
-                        "Completed with {} changed file(s).",
-                        bounded_paths.original_count
-                    ),
-                )?;
-                return Ok(RuntimeRunResult {
-                    result: AgentRunResult {
-                        output: content,
-                        response_id: None,
-                        model: runtime_model,
-                        usage: AgentRunUsage {
-                            input_tokens: used_usage.then_some(input_tokens),
-                            output_tokens: used_usage.then_some(output_tokens),
-                            total_tokens: used_usage
-                                .then_some(input_tokens.saturating_add(output_tokens)),
-                        },
-                        changed_files: bounded_paths.paths,
-                        diff,
-                        duration_seconds: started.elapsed().as_secs(),
-                    },
-                    stderr_excerpt: None,
-                    truncation: RunTruncationEvidence {
-                        diff_truncated: diff_truncated
-                            || diff_capture
-                                .as_ref()
-                                .is_some_and(|capture| capture.truncated),
-                        changed_files_truncated: bounded_paths.truncated,
-                        before_snapshot_truncated: before_snapshot.truncated,
-                        after_snapshot_truncated: after_snapshot.truncated,
-                        original_diff_bytes: diff_capture
-                            .as_ref()
-                            .map_or(original_diff_bytes as u64, |capture| capture.original_bytes),
-                        original_changed_file_count: bounded_paths.original_count as u64,
-                        ..RunTruncationEvidence::default()
-                    },
-                });
-            }
-
-            if turn + 1 == MAX_OLLAMA_TOOL_TURNS {
-                return Err("The local Ollama coding agent reached its 16-tool-turn limit before finishing.".to_string());
-            }
-            for tool_call in tool_calls {
-                context.emit("progress", format!("Ollama requested {}…", tool_call.name))?;
-                let tool_result = execute_ollama_workspace_tool(&workspace, &request, &tool_call)
-                    .unwrap_or_else(|error| format!("Tool error: {error}"));
-                messages.push(json!({
-                  "role": "tool",
-                  "tool_name": tool_call.name,
-                  "content": tool_result,
-                }));
-            }
-        }
-
-        Err("The local Ollama coding agent stopped without a final response.".to_string())
-    })()
-}
-
-fn run_codex_task(
-    context: RuntimeRunContext,
-    request: AuthorizedAgentRun,
-) -> Result<RuntimeRunResult, String> {
-    let started = Instant::now();
-    let cancel_flag = context.cancel_flag.clone();
-    if cancel_flag.load(Ordering::SeqCst) {
-        return Err("Agent run cancelled by the user.".to_string());
+    if context.is_cancelled() {
+        return Err(ProviderError::new(
+            ProviderErrorCode::Cancelled,
+            "Agent run cancelled by the user.",
+            true,
+        )
+        .with_provider(provider_id)
+        .with_model(selected_model));
     }
-    (|| {
-        let status = inspect_codex_runtime();
-        if !status.installed || !status.authenticated {
-            return Err(status.message);
-        }
-
-        let binary = PathBuf::from(
-            status
-                .binary_path
-                .ok_or_else(|| "The Codex executable path is unavailable.".to_string())?,
-        );
-        validate_run_safety(&request)?;
-        let workspace = resolve_workspace(&request.workspace_path)?;
-        let model = resolve_model(&request.model);
-        let reasoning_effort = if request.focus == "speed" || request.strength <= 3 {
-            "low"
-        } else if request.focus == "strength" || request.strength >= 8 {
-            "high"
-        } else {
-            "medium"
-        };
-        let sandbox = if request.file_access == "write" || request.file_access == "full" {
-            "workspace-write"
-        } else {
-            "read-only"
-        };
-        let timeout_seconds = request.timeout_seconds.clamp(60, 7_200);
-        let prompt = agent_prompt(&request, false);
-
-        context.emit(
-            "status",
-            format!("Starting {model} in the selected workspace"),
-        )?;
-        let before_snapshot = workspace_snapshot(&workspace);
-
-        let mut command = Command::new(binary);
-        if request.enable_web_search {
-            command.arg("--search");
-        }
-        command
-            .arg("exec")
-            .arg("--ephemeral")
-            .arg("--skip-git-repo-check")
-            .arg("--sandbox")
-            .arg(sandbox)
-            .arg("--model")
-            .arg(&model)
-            .arg("-c")
-            .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""))
-            .arg("-C")
-            .arg(&workspace)
-            .arg(prompt)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        if cancel_flag.load(Ordering::SeqCst) {
-            return Err("Agent run cancelled by the user.".to_string());
-        }
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("Could not start Codex: {error}"))?;
-        if let Err(error) = context.mark_started() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "Could not capture the Codex result.".to_string())?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "Could not capture Codex progress.".to_string())?;
-
-        let stdout_reader =
-            thread::spawn(move || read_bounded_capture(stdout, MAX_STDOUT_CAPTURE_BYTES));
-        let (progress_sender, progress_receiver) = mpsc::sync_channel::<String>(64);
-        let stderr_reader = thread::spawn(move || {
-            read_bounded_progress(stderr, MAX_STDERR_CAPTURE_BYTES, progress_sender)
-        });
-
-        let exit_status = loop {
-            while let Ok(message) = progress_receiver.try_recv() {
-                if let Err(error) = context.emit("progress", message) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    drop(progress_receiver);
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err(error);
-                }
-            }
-
-            if cancel_flag.load(Ordering::SeqCst) {
-                let _ = context.emit("status", "Stopping the Codex process…");
-                let _ = child.kill();
-                let _ = child.wait();
-                drop(progress_receiver);
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err("Agent run cancelled by the user.".to_string());
-            }
-
-            if started.elapsed() >= Duration::from_secs(timeout_seconds) {
-                let _ = child.kill();
-                let _ = child.wait();
-                drop(progress_receiver);
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(format!(
-                    "Agent run stopped after reaching the {timeout_seconds}-second timeout."
-                ));
-            }
-
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => thread::sleep(Duration::from_millis(80)),
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    drop(progress_receiver);
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err(format!("Could not monitor the Codex process: {error}"));
-                }
-            }
-        };
-
-        while let Ok(message) = progress_receiver.recv() {
-            context.emit("progress", message)?;
-        }
-        let mut stdout = stdout_reader.join().unwrap_or(CapturedText {
-            text: String::new(),
-            original_bytes: 0,
-            truncated: false,
-        });
-        let stderr = stderr_reader.join().unwrap_or(CapturedText {
-            text: String::new(),
-            original_bytes: 0,
-            truncated: false,
-        });
-        stdout.text = stdout.text.trim().to_string();
-
-        if !exit_status.success() {
-            let detail = if !stderr.text.is_empty() {
-                stderr.text
-            } else {
-                stdout.text
-            };
-            return Err(if detail.is_empty() {
-                format!("Codex exited with status {exit_status}.")
-            } else {
-                format!("Codex could not complete the task:\n{detail}")
-            });
-        }
-
-        if stdout.text.is_empty() {
-            return Err("Codex completed without returning a final response.".to_string());
-        }
-
-        context.emit("status", "Checking workspace changes…")?;
-        let after_snapshot = workspace_snapshot(&workspace);
-        let bounded_paths = bound_paths(compare_snapshots(&before_snapshot, &after_snapshot));
-        let diff_capture = git_working_tree_diff(&workspace);
-        let (diff, original_diff_bytes, diff_truncated) =
-            bound_diff(diff_capture.as_ref().map(|capture| capture.text.clone()));
-        context.emit(
-            "complete",
+    validate_run_safety(&request).map_err(|message| {
+        ProviderError::new(ProviderErrorCode::StartupFailed, message, false)
+            .with_provider(provider_id)
+            .with_model(selected_model.clone())
+    })?;
+    if request.enable_web_search {
+        return Err(ProviderError::new(
+            ProviderErrorCode::CapabilityUnsupported,
+            "The local Ollama coding agent has no web-search tool. Disable internet access for this run or choose a Codex model.",
+            false,
+        )
+        .with_provider(provider_id)
+        .with_model(selected_model));
+    }
+    let workspace = resolve_workspace(&request.workspace_path).map_err(|message| {
+        ProviderError::new(ProviderErrorCode::StartupFailed, message, false)
+            .with_provider(provider_id)
+            .with_model(selected_model.clone())
+    })?;
+    let model = resolve_model(&selected_model);
+    let runtime_status = inspect_ollama_runtime();
+    if !runtime_status.connected {
+        return Err(ProviderError::new(
+            ProviderErrorCode::ProviderUnavailable,
+            runtime_status.message,
+            true,
+        )
+        .with_provider(provider_id)
+        .with_model(model));
+    }
+    let installed_model = runtime_status
+        .models
+        .iter()
+        .find(|item| item.name.eq_ignore_ascii_case(&model))
+        .ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorCode::ModelUnavailable,
+                format!("The Ollama model `{model}` is not installed at {OLLAMA_ENDPOINT}."),
+                true,
+            )
+            .with_provider(provider_id)
+            .with_model(model.clone())
+        })?;
+    if !installed_model
+        .capabilities
+        .iter()
+        .any(|capability| capability.eq_ignore_ascii_case("tools"))
+    {
+        return Err(ProviderError::new(
+            ProviderErrorCode::CapabilityUnsupported,
             format!(
-                "Completed with {} changed file(s).",
-                bounded_paths.original_count
-            ),
-        )?;
+        "The Ollama model `{model}` does not report tool support, which is required for workspace coding tasks."
+      ),
+            false,
+        )
+        .with_provider(provider_id)
+        .with_model(model));
+    }
 
-        Ok(RuntimeRunResult {
-            result: AgentRunResult {
-                output: stdout.text,
+    let timeout_seconds = request.timeout_seconds.clamp(60, 7_200);
+    let prompt = agent_prompt(&request, true);
+    context.emit(
+        ProviderEventKind::Status,
+        format!("Starting local Ollama model {model} in the selected workspace"),
+    )?;
+    let before_snapshot = workspace_snapshot(&workspace);
+    let tools = ollama_workspace_tools(&request.file_access);
+    let mut messages = vec![json!({ "role": "system", "content": prompt })];
+    let mut input_tokens = 0_u64;
+    let mut output_tokens = 0_u64;
+    let mut used_usage = false;
+    context.mark_started()?;
+
+    for turn in 0..MAX_OLLAMA_TOOL_TURNS {
+        let response = ollama_chat_with_cancellation(
+            model.clone(),
+            messages.clone(),
+            tools.clone(),
+            context.cancellation(),
+            started,
+            timeout_seconds,
+        )?;
+        let runtime_model = response
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| model.clone());
+        if let Some(tokens) = response.get("prompt_eval_count").and_then(Value::as_u64) {
+            input_tokens = input_tokens.saturating_add(tokens);
+            used_usage = true;
+        }
+        if let Some(tokens) = response.get("eval_count").and_then(Value::as_u64) {
+            output_tokens = output_tokens.saturating_add(tokens);
+            used_usage = true;
+        }
+
+        let message = response
+            .get("message")
+            .cloned()
+            .filter(Value::is_object)
+            .ok_or_else(|| {
+                ProviderError::new(
+                    ProviderErrorCode::ProtocolError,
+                    "Ollama returned no assistant message.",
+                    true,
+                )
+                .with_provider(provider_id)
+                .with_model(model.clone())
+            })?;
+        let content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let mut tool_calls = native_ollama_tool_calls(&message);
+        if tool_calls.is_empty() {
+            if let Some(tool_call) = content_ollama_tool_call(&content) {
+                tool_calls.push(tool_call);
+            }
+        }
+        messages.push(message);
+
+        if tool_calls.is_empty() {
+            if content.is_empty() {
+                return Err(ProviderError::new(
+                    ProviderErrorCode::ProtocolError,
+                    "Ollama completed without returning a final response.",
+                    true,
+                )
+                .with_provider(provider_id)
+                .with_model(model));
+            }
+            context.emit(ProviderEventKind::Status, "Checking workspace changes…")?;
+            let after_snapshot = workspace_snapshot(&workspace);
+            let bounded_paths = bound_paths(compare_snapshots(&before_snapshot, &after_snapshot));
+            let diff_capture = git_working_tree_diff(&workspace);
+            let (diff, original_diff_bytes, diff_truncated) =
+                bound_diff(diff_capture.as_ref().map(|capture| capture.text.clone()));
+            context.emit(
+                ProviderEventKind::Complete,
+                format!(
+                    "Completed with {} changed file(s).",
+                    bounded_paths.original_count
+                ),
+            )?;
+            return Ok(ProviderRunResult {
+                provider_id,
+                output: content,
                 response_id: None,
-                model,
-                usage: AgentRunUsage {
-                    input_tokens: None,
-                    output_tokens: None,
-                    total_tokens: None,
+                model: runtime_model,
+                usage: ProviderRunUsage {
+                    input_tokens: used_usage.then_some(input_tokens),
+                    output_tokens: used_usage.then_some(output_tokens),
+                    total_tokens: used_usage.then_some(input_tokens.saturating_add(output_tokens)),
                 },
                 changed_files: bounded_paths.paths,
                 diff,
                 duration_seconds: started.elapsed().as_secs(),
-            },
-            stderr_excerpt: (!stderr.text.is_empty()).then_some(stderr.text),
-            truncation: RunTruncationEvidence {
-                stdout_truncated: stdout.truncated,
-                stderr_truncated: stderr.truncated,
-                diff_truncated: diff_truncated
-                    || diff_capture
+                evidence: ProviderRunEvidence {
+                    diff_truncated: diff_truncated
+                        || diff_capture
+                            .as_ref()
+                            .is_some_and(|capture| capture.truncated),
+                    changed_files_truncated: bounded_paths.truncated,
+                    before_snapshot_truncated: before_snapshot.truncated,
+                    after_snapshot_truncated: after_snapshot.truncated,
+                    original_diff_bytes: diff_capture
                         .as_ref()
-                        .is_some_and(|capture| capture.truncated),
-                changed_files_truncated: bounded_paths.truncated,
-                before_snapshot_truncated: before_snapshot.truncated,
-                after_snapshot_truncated: after_snapshot.truncated,
-                original_stdout_bytes: stdout.original_bytes,
-                original_stderr_bytes: stderr.original_bytes,
-                original_diff_bytes: diff_capture
+                        .map_or(original_diff_bytes as u64, |capture| capture.original_bytes),
+                    original_changed_file_count: bounded_paths.original_count as u64,
+                    ..ProviderRunEvidence::default()
+                },
+            });
+        }
+
+        if turn + 1 == MAX_OLLAMA_TOOL_TURNS {
+            return Err(ProviderError::new(
+                ProviderErrorCode::ExecutionFailed,
+                "The local Ollama coding agent reached its 16-tool-turn limit before finishing.",
+                true,
+            )
+            .with_provider(provider_id)
+            .with_model(model));
+        }
+        for tool_call in tool_calls {
+            context.emit(
+                ProviderEventKind::Progress,
+                format!("Ollama requested {}…", tool_call.name),
+            )?;
+            let tool_result = execute_ollama_workspace_tool(&workspace, &request, &tool_call)
+                .unwrap_or_else(|error| format!("Tool error: {error}"));
+            messages.push(json!({
+              "role": "tool",
+              "tool_name": tool_call.name,
+              "content": tool_result,
+            }));
+        }
+    }
+
+    Err(ProviderError::new(
+        ProviderErrorCode::ExecutionFailed,
+        "The local Ollama coding agent stopped without a final response.",
+        true,
+    )
+    .with_provider(provider_id)
+    .with_model(model))
+}
+
+fn run_codex_task(
+    context: ProviderRunContext,
+    request: ProviderRunRequest,
+) -> Result<ProviderRunResult, ProviderError> {
+    let started = Instant::now();
+    let provider_id = RuntimeProviderId::Codex;
+    let selected_model = request.model.runtime_model.clone();
+    if request.model.provider_id != provider_id {
+        return Err(ProviderError::new(
+            ProviderErrorCode::ProviderModelMismatch,
+            "The resolved model does not belong to the Codex adapter.",
+            false,
+        )
+        .with_provider(provider_id)
+        .with_model(selected_model));
+    }
+    if context.is_cancelled() {
+        return Err(ProviderError::new(
+            ProviderErrorCode::Cancelled,
+            "Agent run cancelled by the user.",
+            true,
+        )
+        .with_provider(provider_id)
+        .with_model(selected_model));
+    }
+    let status = inspect_codex_runtime();
+    if !status.installed || !status.authenticated {
+        return Err(ProviderError::new(
+            ProviderErrorCode::ProviderUnavailable,
+            status.message,
+            true,
+        )
+        .with_provider(provider_id)
+        .with_model(selected_model));
+    }
+
+    let binary = PathBuf::from(status.binary_path.ok_or_else(|| {
+        ProviderError::new(
+            ProviderErrorCode::StartupFailed,
+            "The Codex executable path is unavailable.",
+            true,
+        )
+        .with_provider(provider_id)
+        .with_model(selected_model.clone())
+    })?);
+    validate_run_safety(&request).map_err(|message| {
+        ProviderError::new(ProviderErrorCode::StartupFailed, message, false)
+            .with_provider(provider_id)
+            .with_model(selected_model.clone())
+    })?;
+    let workspace = resolve_workspace(&request.workspace_path).map_err(|message| {
+        ProviderError::new(ProviderErrorCode::StartupFailed, message, false)
+            .with_provider(provider_id)
+            .with_model(selected_model.clone())
+    })?;
+    let model = resolve_model(&selected_model);
+    let reasoning_effort = if request.focus == "speed" || request.strength <= 3 {
+        "low"
+    } else if request.focus == "strength" || request.strength >= 8 {
+        "high"
+    } else {
+        "medium"
+    };
+    let sandbox = if request.file_access == "write" || request.file_access == "full" {
+        "workspace-write"
+    } else {
+        "read-only"
+    };
+    let timeout_seconds = request.timeout_seconds.clamp(60, 7_200);
+    let prompt = agent_prompt(&request, false);
+
+    context.emit(
+        ProviderEventKind::Status,
+        format!("Starting {model} in the selected workspace"),
+    )?;
+    let before_snapshot = workspace_snapshot(&workspace);
+
+    let mut command = Command::new(binary);
+    if request.enable_web_search {
+        command.arg("--search");
+    }
+    command
+        .arg("exec")
+        .arg("--ephemeral")
+        .arg("--skip-git-repo-check")
+        .arg("--sandbox")
+        .arg(sandbox)
+        .arg("--model")
+        .arg(&model)
+        .arg("-c")
+        .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""))
+        .arg("-C")
+        .arg(&workspace)
+        .arg(prompt)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if context.is_cancelled() {
+        return Err(ProviderError::new(
+            ProviderErrorCode::Cancelled,
+            "Agent run cancelled by the user.",
+            true,
+        )
+        .with_provider(provider_id)
+        .with_model(model));
+    }
+    let mut child = command.spawn().map_err(|error| {
+        ProviderError::new(
+            ProviderErrorCode::StartupFailed,
+            format!("Could not start Codex: {error}"),
+            true,
+        )
+        .with_provider(provider_id)
+        .with_model(model.clone())
+    })?;
+    if let Err(error) = context.mark_started() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let stdout = child.stdout.take().ok_or_else(|| {
+        ProviderError::new(
+            ProviderErrorCode::ExecutionFailed,
+            "Could not capture the Codex result.",
+            true,
+        )
+        .with_provider(provider_id)
+        .with_model(model.clone())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        ProviderError::new(
+            ProviderErrorCode::ExecutionFailed,
+            "Could not capture Codex progress.",
+            true,
+        )
+        .with_provider(provider_id)
+        .with_model(model.clone())
+    })?;
+
+    let stdout_reader =
+        thread::spawn(move || read_bounded_capture(stdout, MAX_STDOUT_CAPTURE_BYTES));
+    let (progress_sender, progress_receiver) = mpsc::sync_channel::<String>(64);
+    let stderr_reader = thread::spawn(move || {
+        read_bounded_progress(stderr, MAX_STDERR_CAPTURE_BYTES, progress_sender)
+    });
+
+    let exit_status = loop {
+        while let Ok(message) = progress_receiver.try_recv() {
+            if let Err(error) = context.emit(ProviderEventKind::Progress, message) {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(progress_receiver);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(error);
+            }
+        }
+
+        if context.is_cancelled() {
+            let _ = context.emit(ProviderEventKind::Status, "Stopping the Codex process…");
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(progress_receiver);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(ProviderError::new(
+                ProviderErrorCode::Cancelled,
+                "Agent run cancelled by the user.",
+                true,
+            )
+            .with_provider(provider_id)
+            .with_model(model));
+        }
+
+        if started.elapsed() >= Duration::from_secs(timeout_seconds) {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(progress_receiver);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(ProviderError::new(
+                ProviderErrorCode::TimedOut,
+                format!("Agent run stopped after reaching the {timeout_seconds}-second timeout."),
+                true,
+            )
+            .with_provider(provider_id)
+            .with_model(model));
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(80)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(progress_receiver);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(ProviderError::new(
+                    ProviderErrorCode::ExecutionFailed,
+                    format!("Could not monitor the Codex process: {error}"),
+                    true,
+                )
+                .with_provider(provider_id)
+                .with_model(model));
+            }
+        }
+    };
+
+    while let Ok(message) = progress_receiver.recv() {
+        context.emit(ProviderEventKind::Progress, message)?;
+    }
+    let mut stdout = stdout_reader.join().unwrap_or(CapturedText {
+        text: String::new(),
+        original_bytes: 0,
+        truncated: false,
+    });
+    let stderr = stderr_reader.join().unwrap_or(CapturedText {
+        text: String::new(),
+        original_bytes: 0,
+        truncated: false,
+    });
+    stdout.text = stdout.text.trim().to_string();
+
+    if !exit_status.success() {
+        let detail = if !stderr.text.is_empty() {
+            stderr.text
+        } else {
+            stdout.text
+        };
+        let message = if detail.is_empty() {
+            format!("Codex exited with status {exit_status}.")
+        } else {
+            format!("Codex could not complete the task:\n{detail}")
+        };
+        return Err(
+            ProviderError::new(ProviderErrorCode::ExecutionFailed, message, true)
+                .with_provider(provider_id)
+                .with_model(model),
+        );
+    }
+
+    if stdout.text.is_empty() {
+        return Err(ProviderError::new(
+            ProviderErrorCode::ProtocolError,
+            "Codex completed without returning a final response.",
+            true,
+        )
+        .with_provider(provider_id)
+        .with_model(model));
+    }
+
+    context.emit(ProviderEventKind::Status, "Checking workspace changes…")?;
+    let after_snapshot = workspace_snapshot(&workspace);
+    let bounded_paths = bound_paths(compare_snapshots(&before_snapshot, &after_snapshot));
+    let diff_capture = git_working_tree_diff(&workspace);
+    let (diff, original_diff_bytes, diff_truncated) =
+        bound_diff(diff_capture.as_ref().map(|capture| capture.text.clone()));
+    context.emit(
+        ProviderEventKind::Complete,
+        format!(
+            "Completed with {} changed file(s).",
+            bounded_paths.original_count
+        ),
+    )?;
+
+    Ok(ProviderRunResult {
+        provider_id,
+        output: stdout.text,
+        response_id: None,
+        model,
+        usage: ProviderRunUsage {
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+        },
+        changed_files: bounded_paths.paths,
+        diff,
+        duration_seconds: started.elapsed().as_secs(),
+        evidence: ProviderRunEvidence {
+            stderr_excerpt: (!stderr.text.is_empty()).then_some(stderr.text),
+            stdout_truncated: stdout.truncated,
+            stderr_truncated: stderr.truncated,
+            diff_truncated: diff_truncated
+                || diff_capture
                     .as_ref()
-                    .map_or(original_diff_bytes as u64, |capture| capture.original_bytes),
-                original_changed_file_count: bounded_paths.original_count as u64,
-                ..RunTruncationEvidence::default()
+                    .is_some_and(|capture| capture.truncated),
+            changed_files_truncated: bounded_paths.truncated,
+            before_snapshot_truncated: before_snapshot.truncated,
+            after_snapshot_truncated: after_snapshot.truncated,
+            original_stdout_bytes: stdout.original_bytes,
+            original_stderr_bytes: stderr.original_bytes,
+            original_diff_bytes: diff_capture
+                .as_ref()
+                .map_or(original_diff_bytes as u64, |capture| capture.original_bytes),
+            original_changed_file_count: bounded_paths.original_count as u64,
+        },
+    })
+}
+
+struct CodexProviderAdapter;
+
+impl ProviderAdapter for CodexProviderAdapter {
+    fn descriptor(&self) -> provider_runtime::ProviderDescriptor {
+        codex_descriptor()
+    }
+
+    fn inspect(&self) -> ProviderRuntimeStatus {
+        let status = inspect_codex_runtime();
+        ProviderRuntimeStatus {
+            provider: codex_descriptor(),
+            availability: if status.installed && status.authenticated {
+                ProviderAvailability::Ready
+            } else {
+                ProviderAvailability::Unavailable
             },
-        })
-    })()
+            version: status.version,
+            models: Vec::new(),
+            message: status.message,
+        }
+    }
+
+    fn run(
+        &self,
+        context: ProviderRunContext,
+        request: ProviderRunRequest,
+    ) -> Result<ProviderRunResult, ProviderError> {
+        run_codex_task(context, request)
+    }
+}
+
+struct OllamaProviderAdapter;
+
+impl ProviderAdapter for OllamaProviderAdapter {
+    fn descriptor(&self) -> provider_runtime::ProviderDescriptor {
+        ollama_descriptor()
+    }
+
+    fn inspect(&self) -> ProviderRuntimeStatus {
+        let status = inspect_ollama_runtime();
+        ProviderRuntimeStatus {
+            provider: ollama_descriptor(),
+            availability: if status.connected {
+                ProviderAvailability::Ready
+            } else {
+                ProviderAvailability::Unavailable
+            },
+            version: status.version,
+            models: status
+                .models
+                .into_iter()
+                .map(|model| ProviderRuntimeModel {
+                    name: model.name,
+                    capabilities: model.capabilities,
+                    context_length: model.context_length,
+                })
+                .collect(),
+            message: status.message,
+        }
+    }
+
+    fn run(
+        &self,
+        context: ProviderRunContext,
+        request: ProviderRunRequest,
+    ) -> Result<ProviderRunResult, ProviderError> {
+        run_ollama_task(context, request)
+    }
+}
+
+fn production_provider_registry() -> Result<ProviderRegistry, ProviderError> {
+    ProviderRegistry::new([
+        Arc::new(CodexProviderAdapter) as Arc<dyn ProviderAdapter>,
+        Arc::new(OllamaProviderAdapter) as Arc<dyn ProviderAdapter>,
+    ])
+}
+
+fn unknown_provider_registry_snapshot(message: impl Into<String>) -> ProviderRegistrySnapshot {
+    let message = message.into();
+    ProviderRegistrySnapshot {
+        providers: vec![
+            ProviderRuntimeStatus::unknown(codex_descriptor(), message.clone()),
+            ProviderRuntimeStatus::unknown(ollama_descriptor(), message),
+        ],
+        catalog_bindings: catalog_provider_bindings(),
+    }
 }
 
 fn choose_workspace_folder_sync() -> Result<Option<String>, String> {
@@ -2337,6 +2566,19 @@ async fn ollama_runtime_status() -> OllamaRuntimeStatus {
             models: Vec::new(),
             message: "Could not inspect the local Ollama runtime.".to_string(),
         })
+}
+
+#[tauri::command]
+async fn provider_registry_status() -> ProviderRegistrySnapshot {
+    tauri::async_runtime::spawn_blocking(|| {
+        production_provider_registry()
+            .map(|registry| registry.snapshot())
+            .unwrap_or_else(|error| unknown_provider_registry_snapshot(error.to_string()))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        unknown_provider_registry_snapshot("Could not inspect the provider registry.")
+    })
 }
 
 #[tauri::command]
@@ -3758,6 +4000,7 @@ fn run_result_from_attempt(attempt: &RunAttemptProjection) -> Result<AgentRunRes
         ));
     }
     Ok(AgentRunResult {
+        provider_id: attempt.provider.clone(),
         output: attempt.output_summary.clone().unwrap_or_default(),
         response_id: attempt.response_id.clone(),
         model: attempt.model.clone().unwrap_or_default(),
@@ -3772,22 +4015,55 @@ fn run_result_from_attempt(attempt: &RunAttemptProjection) -> Result<AgentRunRes
     })
 }
 
-fn terminal_status_for_runtime_error(
+fn agent_run_result_from_provider(result: &ProviderRunResult) -> AgentRunResult {
+    AgentRunResult {
+        provider_id: Some(result.provider_id.to_string()),
+        output: result.output.clone(),
+        response_id: result.response_id.clone(),
+        model: result.model.clone(),
+        usage: AgentRunUsage {
+            input_tokens: result.usage.input_tokens,
+            output_tokens: result.usage.output_tokens,
+            total_tokens: result.usage.total_tokens,
+        },
+        changed_files: result.changed_files.clone(),
+        diff: result.diff.clone(),
+        duration_seconds: result.duration_seconds,
+    }
+}
+
+fn run_truncation_from_provider(evidence: &ProviderRunEvidence) -> RunTruncationEvidence {
+    RunTruncationEvidence {
+        stdout_truncated: evidence.stdout_truncated,
+        stderr_truncated: evidence.stderr_truncated,
+        diff_truncated: evidence.diff_truncated,
+        changed_files_truncated: evidence.changed_files_truncated,
+        before_snapshot_truncated: evidence.before_snapshot_truncated,
+        after_snapshot_truncated: evidence.after_snapshot_truncated,
+        original_stdout_bytes: evidence.original_stdout_bytes,
+        original_stderr_bytes: evidence.original_stderr_bytes,
+        original_diff_bytes: evidence.original_diff_bytes,
+        original_changed_file_count: evidence.original_changed_file_count,
+        ..RunTruncationEvidence::default()
+    }
+}
+
+fn terminal_status_for_provider_error(
     attempt: Option<&RunAttemptProjection>,
     cancel_requested: bool,
-    message: &str,
+    error: &ProviderError,
 ) -> RunAttemptStatus {
-    if cancel_requested
+    if error.code == ProviderErrorCode::Cancelled
+        || cancel_requested
         || attempt.is_some_and(|attempt| attempt.status == RunAttemptStatus::CancelRequested)
     {
         return RunAttemptStatus::Cancelled;
     }
+    if error.code == ProviderErrorCode::TimedOut {
+        return RunAttemptStatus::TimedOut;
+    }
     if attempt.map_or(true, |attempt| attempt.started_at_unix_ms.is_none()) {
         return RunAttemptStatus::StartupFailed;
-    }
-    let normalized = message.to_ascii_lowercase();
-    if normalized.contains("timeout") || normalized.contains("timed out") {
-        return RunAttemptStatus::TimedOut;
     }
     RunAttemptStatus::Failed
 }
@@ -3840,8 +4116,8 @@ async fn run_agent_task(
     if let Err(error) = persistence
         .prepare_run_attempt(
             attempt_id,
-            authorized.model_provider.clone(),
-            authorized.model.clone(),
+            authorized.model.provider_id.to_string(),
+            authorized.model.runtime_model.clone(),
             admission.attempt.workspace_id.clone(),
         )
         .await
@@ -3890,29 +4166,36 @@ async fn run_agent_task(
         return Err("RUN_REGISTRY_CONFLICT: The run registry rejected the request.".to_string());
     }
 
-    let context = RuntimeRunContext {
+    let observer = Arc::new(RunCoordinatorProviderObserver {
         app: app.clone(),
         persistence: persistence.clone(),
         attempt_id,
-        request_id: request_id.clone(),
-        cancel_flag: cancel_flag.clone(),
-    };
-    let provider = authorized.model_provider.clone();
+    });
+    let context = ProviderRunContext::new(observer, ProviderCancellation::new(cancel_flag.clone()));
+    let provider_id = authorized.model.provider_id;
+    let worker_persistence = persistence.clone();
     let worker = tauri::async_runtime::spawn_blocking(move || {
-        let dispatching = context
-            .persistence
-            .mark_run_dispatching_blocking(context.attempt_id)
-            .map_err(authorization_error_message)?;
-        if dispatching.status == RunAttemptStatus::CancelRequested
-            || context.cancel_flag.load(Ordering::SeqCst)
-        {
-            return Err("Agent run cancelled by the user.".to_string());
+        let dispatching = worker_persistence
+            .mark_run_dispatching_blocking(attempt_id)
+            .map_err(|error| {
+                ProviderError::new(
+                    ProviderErrorCode::StartupFailed,
+                    authorization_error_message(error),
+                    true,
+                )
+                .with_provider(provider_id)
+                .with_model(authorized.model.runtime_model.clone())
+            })?;
+        if dispatching.status == RunAttemptStatus::CancelRequested || context.is_cancelled() {
+            return Err(ProviderError::new(
+                ProviderErrorCode::Cancelled,
+                "Agent run cancelled by the user.",
+                true,
+            )
+            .with_provider(provider_id)
+            .with_model(authorized.model.runtime_model.clone()));
         }
-        if is_ollama_provider(&provider) {
-            run_ollama_task(context, authorized)
-        } else {
-            run_codex_task(context, authorized)
-        }
+        production_provider_registry()?.run(provider_id, context, authorized)
     })
     .await;
 
@@ -3929,21 +4212,21 @@ async fn run_agent_task(
         Ok(Ok(runtime)) => {
             let completion = RunCompletion {
                 status: RunAttemptStatus::Succeeded,
-                output_summary: Some(runtime.result.output.clone()),
-                stderr_excerpt: runtime.stderr_excerpt,
-                response_id: runtime.result.response_id.clone(),
-                runtime_model: Some(runtime.result.model.clone()),
+                output_summary: Some(runtime.output.clone()),
+                stderr_excerpt: runtime.evidence.stderr_excerpt.clone(),
+                response_id: runtime.response_id.clone(),
+                runtime_model: Some(runtime.model.clone()),
                 usage: RunUsage {
-                    input_tokens: runtime.result.usage.input_tokens,
-                    output_tokens: runtime.result.usage.output_tokens,
-                    total_tokens: runtime.result.usage.total_tokens,
+                    input_tokens: runtime.usage.input_tokens,
+                    output_tokens: runtime.usage.output_tokens,
+                    total_tokens: runtime.usage.total_tokens,
                 },
-                changed_files: runtime.result.changed_files.clone(),
-                diff: runtime.result.diff.clone(),
-                duration_seconds: runtime.result.duration_seconds,
+                changed_files: runtime.changed_files.clone(),
+                diff: runtime.diff.clone(),
+                duration_seconds: runtime.duration_seconds,
                 error_code: None,
                 error_message: None,
-                truncation: runtime.truncation,
+                truncation: run_truncation_from_provider(&runtime.evidence),
                 recovery_disposition: None,
             };
             let completed = persistence
@@ -3952,12 +4235,12 @@ async fn run_agent_task(
                 .map_err(authorization_error_message)?;
             emit_run_snapshot(&app, &persistence);
             if completed.status == RunAttemptStatus::Succeeded {
-                Ok(runtime.result)
+                Ok(agent_run_result_from_provider(&runtime))
             } else {
                 run_result_from_attempt(&completed)
             }
         }
-        Ok(Err(message)) => {
+        Ok(Err(error)) => {
             let snapshot = persistence
                 .run_snapshot()
                 .await
@@ -3966,21 +4249,16 @@ async fn run_agent_task(
                 .active_attempt
                 .as_ref()
                 .filter(|attempt| attempt.id == attempt_id);
-            let terminal_status = terminal_status_for_runtime_error(
+            let terminal_status = terminal_status_for_provider_error(
                 active,
                 cancel_flag.load(Ordering::SeqCst),
-                &message,
+                &error,
             );
-            let code = match terminal_status {
-                RunAttemptStatus::Cancelled => "RUN_CANCELLED",
-                RunAttemptStatus::TimedOut => "RUN_TIMED_OUT",
-                RunAttemptStatus::StartupFailed => "RUN_STARTUP_FAILED",
-                _ => "RUN_FAILED",
-            };
+            let code = error.code.as_str();
             let completion = RunCompletion::terminal_error(
                 terminal_status,
                 code,
-                &message,
+                &error.message,
                 started.elapsed().as_secs(),
             );
             persistence
@@ -3988,7 +4266,7 @@ async fn run_agent_task(
                 .await
                 .map_err(authorization_error_message)?;
             emit_run_snapshot(&app, &persistence);
-            Err(format!("{code}: {message}"))
+            Err(error.to_string())
         }
         Err(_) => {
             let snapshot = persistence
@@ -4105,6 +4383,7 @@ pub fn run() {
             resolve_approval,
             codex_runtime_status,
             ollama_runtime_status,
+            provider_registry_status,
             run_coordinator_snapshot,
             choose_workspace_folder,
             cancel_agent_run,
@@ -4202,6 +4481,14 @@ mod tests {
     }
 
     #[test]
+    fn task_0006_production_registry_contains_only_codex_and_ollama_adapters() {
+        assert_eq!(
+            production_provider_registry().unwrap().provider_ids(),
+            vec![RuntimeProviderId::Codex, RuntimeProviderId::Ollama]
+        );
+    }
+
+    #[test]
     fn every_privileged_ipc_handler_routes_through_backend_authority() {
         let source = include_str!("lib.rs");
         let handlers = [
@@ -4277,11 +4564,13 @@ mod tests {
         assert!(run_body.contains("admit_run"));
         assert!(run_body.contains("prepare_run_attempt"));
         assert!(run_body.contains("complete_run"));
+        assert!(run_body.contains("production_provider_registry()?.run"));
+        assert!(!run_body.contains("is_ollama_provider"));
     }
 
-    fn agent_run_request_fixture() -> AuthorizedAgentRun {
-        AuthorizedAgentRun {
-            run_mode: "execute".to_string(),
+    fn agent_run_request_fixture() -> ProviderRunRequest {
+        ProviderRunRequest {
+            run_mode: ProviderRunMode::Execute,
             agent_name: "Fixture Agent".to_string(),
             description: "Deterministic characterization fixture".to_string(),
             role: "Specialist".to_string(),
@@ -4289,8 +4578,11 @@ mod tests {
             memory: String::new(),
             review_feedback: None,
             task_title: "Inspect the workspace".to_string(),
-            model: "fixture-model".to_string(),
-            model_provider: "codex".to_string(),
+            model: provider_runtime::ProviderModelIdentity {
+                catalog_model_id: 1,
+                provider_id: RuntimeProviderId::Codex,
+                runtime_model: "fixture-model".to_string(),
+            },
             strength: 5,
             focus: "balanced".to_string(),
             enable_web_search: false,
@@ -4303,16 +4595,12 @@ mod tests {
         }
     }
 
-    fn assert_safety_error(request: &AuthorizedAgentRun, expected: &str) {
+    fn assert_safety_error(request: &ProviderRunRequest, expected: &str) {
         assert_eq!(validate_run_safety(request).unwrap_err(), expected);
     }
 
     #[test]
-    fn run_safety_rejects_invalid_modes_and_access_levels() {
-        let mut request = agent_run_request_fixture();
-        request.run_mode = "background".to_string();
-        assert_safety_error(&request, "The requested agent run mode is invalid.");
-
+    fn run_safety_rejects_invalid_access_levels() {
         let mut request = agent_run_request_fixture();
         request.file_access = "owner".to_string();
         assert_safety_error(&request, "The requested file-access policy is invalid.");
@@ -4377,23 +4665,31 @@ mod tests {
     }
 
     #[test]
-    fn task_0005_non_live_runtime_failure_classification_is_deterministic() {
+    fn task_0006_typed_runtime_failure_classification_is_deterministic() {
         let starting = run_attempt_fixture(RunAttemptStatus::Dispatching, None);
+        let startup = ProviderError::new(ProviderErrorCode::StartupFailed, "spawn failed", true);
         assert_eq!(
-            terminal_status_for_runtime_error(Some(&starting), false, "spawn failed"),
+            terminal_status_for_provider_error(Some(&starting), false, &startup),
             RunAttemptStatus::StartupFailed
         );
         let running = run_attempt_fixture(RunAttemptStatus::Running, Some(2));
-        assert_eq!(
-            terminal_status_for_runtime_error(Some(&running), false, "request timed out"),
-            RunAttemptStatus::TimedOut
+        let timeout = ProviderError::new(
+            ProviderErrorCode::TimedOut,
+            "the text need not contain a timeout keyword",
+            true,
         );
         assert_eq!(
-            terminal_status_for_runtime_error(Some(&running), false, "provider failed"),
+            terminal_status_for_provider_error(Some(&running), false, &timeout),
+            RunAttemptStatus::TimedOut
+        );
+        let failed =
+            ProviderError::new(ProviderErrorCode::ExecutionFailed, "provider failed", true);
+        assert_eq!(
+            terminal_status_for_provider_error(Some(&running), false, &failed),
             RunAttemptStatus::Failed
         );
         assert_eq!(
-            terminal_status_for_runtime_error(Some(&running), true, "provider failed"),
+            terminal_status_for_provider_error(Some(&running), true, &failed),
             RunAttemptStatus::Cancelled
         );
     }
@@ -4410,7 +4706,7 @@ mod tests {
     #[test]
     fn run_safety_keeps_reviews_read_only_and_unprivileged() {
         let mut request = agent_run_request_fixture();
-        request.run_mode = "review".to_string();
+        request.run_mode = ProviderRunMode::Review;
         assert!(validate_run_safety(&request).is_ok());
 
         request.file_access = "write".to_string();

@@ -31,6 +31,7 @@ The binding decision record is
       v
     React renderer (src/App.tsx)
       |-- typed state/IPC adapter (src/applicationState.ts, src/persistence.ts)
+      |-- provider availability/model projection (src/providerRegistry.ts)
       |-- run snapshot/event projection (src/runCoordinator.ts)
       |-- browser-preview localStorage (non-authoritative compatibility only)
       |-- renderer presentation: routing/reviewer selection and task view state
@@ -41,8 +42,9 @@ The binding decision record is
       |-- application state validation + SQLite repository/migrations
       |-- capability policy + authoritative one-use approvals
       |-- authoritative single-run coordinator + durable bounded ledger
-      |-- Codex CLI process
-      |-- local Ollama HTTP + workspace tools
+      |-- provider registry/common contract (provider_runtime.rs)
+      |     |-- Codex CLI adapter
+      |     |-- local Ollama HTTP + workspace-tools adapter
       |-- filesystem/Git inspection
       |-- application/window/input control
       |-- Python voice listener process
@@ -61,7 +63,10 @@ on a typed backend load, serializes whole-state saves, and uses revision-based
 compare-and-swap. Browser preview persistence remains a non-authoritative
 compatibility path. <code>src/runCoordinator.ts</code> projects ordered backend
 snapshots/events, discards stale or cross-attempt events, and holds only
-transient progress/stop presentation state.
+transient progress/stop presentation state. <code>src/providerRegistry.ts</code>
+projects the common backend registry into truthful provider status and
+fail-closed model eligibility for assignment, defaults, routing, and review;
+it is presentation and preflight logic, not the dispatch authority.
 
 ### Rust backend
 
@@ -70,13 +75,15 @@ processes/transports, workspace resolution and tool access, run cancellation,
 diff/change capture, desktop actions, and voice process management. It
 also composes <code>app_state.rs</code>, <code>policy.rs</code>,
 <code>authorization.rs</code>, <code>run_coordinator.rs</code>, and
-<code>persistence.rs</code>. Those modules own the versioned state contract,
-normalized action intents, fail-closed capability evaluation, authoritative
-approval lifecycle, legal run transitions and evidence bounds, SQLite
-schema/repository, legacy migration, and typed state IPC. Non-run privileged
-command handlers consume backend authorization before their first side effect;
-run approvals are reserved at admission and consumed at successful provider
-startup.
+<code>provider_runtime.rs</code>, and <code>persistence.rs</code>. Those modules
+own the versioned state contract, normalized action intents, fail-closed
+capability evaluation, authoritative approval lifecycle, legal run transitions
+and evidence bounds, provider identity/contracts/dispatch, SQLite
+schema/repository, legacy migration, and typed state IPC. The registry exposes
+only Codex and Ollama adapters and rejects provider/model mismatch without
+fallback. Non-run privileged command handlers consume backend authorization
+before their first side effect; run approvals are reserved at admission and
+consumed at successful provider startup.
 
 ### Persistence and migration
 
@@ -140,9 +147,11 @@ behavior were not exercised in TASK-0001.
    dispatch releases it, while uncertain post-dispatch recovery prevents
    replay.
 5. The backend projects the task into its active lifecycle, derives workspace,
-   model/provider, capability limits, timeout, prompt, and sandbox from
-   persisted state, then dispatches Ollama only for an Ollama provider label;
-   otherwise it dispatches Codex.
+   capability limits, timeout, prompt, and sandbox from persisted state. It
+   resolves exactly one catalog model, maps only OpenAI to Codex and Ollama to
+   Ollama, requires that adapter to equal the persisted active provider, and
+   dispatches exactly that registry adapter. Unsupported, missing, ambiguous,
+   inactive, or unavailable identities fail closed without fallback.
 6. The backend persists bounded ordered events, cancellation state, terminal
    outcome, output summary, usage, and workspace evidence. Terminal attempts
    cannot be updated.
@@ -182,7 +191,8 @@ state.
   bounded ledger. This boundary is implemented by TASK-0005; later tasks may
   extract adapters without moving authority back to the renderer.
 - **Provider registry** — provider identity, model capability, readiness, and
-  truthful dispatch contracts.
+  truthful dispatch contracts. The common registry and contract are
+  implemented by TASK-0006; later tasks harden adapter internals.
 - **Codex adapter** — isolated CLI invocation and evidence parsing.
 - **Ollama adapter** — local discovery, transport, tool loop, and workspace
   tools.
@@ -206,7 +216,7 @@ task must choose the smallest structure supported by the code at that time.
 | Approval match/consume | Backend exact-match transaction | Backend exact-match transaction |
 | Routing and review | Renderer | Backend scheduler/orchestrator |
 | Active run | Backend system-wide coordinator and SQLite ledger; only live cancellation handles are in memory | Backend system-wide coordinator |
-| Provider/model truth | Renderer labels plus backend branch | Backend provider registry |
+| Provider/model truth | Backend registry and exact active-provider/catalog-model resolution; renderer projects availability | Backend provider registry |
 | Workspace evidence | Backend bounded evidence persisted per attempt | Backend durable evidence record |
 | Reminders | Backend SQLite; renderer manages behavior | Backend passive reminder service |
 | UI preferences | Backend SQLite for desktop; preview storage in browsers | Local settings store, with UI ownership where safe |
@@ -255,7 +265,8 @@ The planned system-wide execution flow is sequential:
 ## Roadmap ownership
 
 TASK-0003 through TASK-0005 establish backend state, policy, and coordination.
-TASK-0006 through TASK-0008 establish provider contracts. TASK-0009 through
+TASK-0006 establishes provider identity and the common contract; TASK-0007 and
+TASK-0008 harden the Codex and Ollama adapters. TASK-0009 through
 TASK-0012 establish hierarchy and orchestration. TASK-0013 and TASK-0014
 modularize UI/data lifecycle. TASK-0015 and TASK-0016 own system actions and
 KDE/voice integration. TASK-0017 through TASK-0020 complete bounded roles,

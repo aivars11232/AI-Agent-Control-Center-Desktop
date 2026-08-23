@@ -10,10 +10,15 @@ import {
   type ModelDefinition,
 } from "./App";
 import { agentFixture, taskFixture } from "./test/fixtures";
+import { unknownProviderRegistrySnapshot } from "./providerRegistry";
 
 const registeredModels: ModelDefinition[] = [
-  { id: 1, name: "fixture-model", provider: "Custom" },
+  { id: 1, name: "fixture-model", provider: "OpenAI" },
 ];
+const readyProviderRegistry = unknownProviderRegistrySnapshot();
+readyProviderRegistry.providers = readyProviderRegistry.providers.map(
+  (status) => ({ ...status, availability: "ready" }),
+);
 
 describe("task safety characterization", () => {
   it("requires one-run approval for requested write and terminal scopes", () => {
@@ -152,6 +157,8 @@ describe("routing characterization", () => {
       registeredModels,
       "Development",
       preferredManager.id,
+      "codex",
+      readyProviderRegistry,
     );
 
     expect(route?.agent.id).toBe(developmentAgent.id);
@@ -169,6 +176,8 @@ describe("routing characterization", () => {
       registeredModels,
       "General",
       1,
+      "codex",
+      readyProviderRegistry,
     );
 
     expect(route).toBeNull();
@@ -183,6 +192,8 @@ describe("routing characterization", () => {
       registeredModels,
       "General",
       99,
+      "codex",
+      readyProviderRegistry,
     );
 
     expect(route?.agent.id).toBe(2);
@@ -210,8 +221,14 @@ describe("review routing characterization", () => {
     });
 
     expect(
-      reviewAgentForTask([owner, teamLeader, senior], owner.id, "Development")
-        ?.id,
+      reviewAgentForTask(
+        [owner, teamLeader, senior],
+        owner.id,
+        "Development",
+        registeredModels,
+        "codex",
+        readyProviderRegistry,
+      )?.id,
     ).toBe(senior.id);
   });
 
@@ -224,7 +241,14 @@ describe("review routing characterization", () => {
     });
 
     expect(
-      reviewAgentForTask([owner, pausedSenior], owner.id, "Development"),
+      reviewAgentForTask(
+        [owner, pausedSenior],
+        owner.id,
+        "Development",
+        registeredModels,
+        "codex",
+        readyProviderRegistry,
+      ),
     ).toBeNull();
   });
 });
