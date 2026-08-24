@@ -25,7 +25,7 @@ class MemoryStorage implements StorageReader {
 
 function envelope(revision = 1): StateEnvelope {
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     revision,
     state: createDefaultApplicationState(),
     migration: {
@@ -161,7 +161,7 @@ describe("serialized application-state writes", () => {
     expect(
       (saves[0].args?.request as { expectedRevision: number }).expectedRevision,
     ).toBe(1);
-    saves[0].resolve({ schemaVersion: 4, revision: 2 });
+    saves[0].resolve({ schemaVersion: 5, revision: 2 });
     await Promise.resolve();
     await Promise.resolve();
     expect(saves).toHaveLength(2);
@@ -171,7 +171,7 @@ describe("serialized application-state writes", () => {
     };
     expect(secondRequest.expectedRevision).toBe(2);
     expect(secondRequest.state.preferences.theme).toBe("system");
-    saves[1].resolve({ schemaVersion: 4, revision: 3 });
+    saves[1].resolve({ schemaVersion: 5, revision: 3 });
 
     await writer.flush();
     expect(failure).not.toHaveBeenCalled();
@@ -206,7 +206,7 @@ describe("serialized application-state writes", () => {
     ) => {
       calls.push({ command, args });
       if (command === "save_application_state") {
-        return { schemaVersion: 4, revision: 6 } as T;
+        return { schemaVersion: 5, revision: 6 } as T;
       }
       return envelope(7) as T;
     };
@@ -232,5 +232,54 @@ describe("serialized application-state writes", () => {
     ]);
     expect(calls[1].args?.request).toMatchObject({ expectedRevision: 6 });
     expect(calls[2].args?.request).toMatchObject({ expectedRevision: 7 });
+  });
+
+  it("serializes task-orchestration commands behind pending state and adopts their revisions", async () => {
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const invoke: InvokeFunction = async <T>(
+      command: string,
+      args?: Record<string, unknown>,
+    ) => {
+      calls.push({ command, args });
+      if (command === "save_application_state") {
+        return { schemaVersion: 5, revision: 12 } as T;
+      }
+      return envelope(command === "create_routed_task" ? 13 : 14) as T;
+    };
+    const writer = new ApplicationStateWriter(invoke, 11, vi.fn());
+    writer.enqueue(createDefaultApplicationState());
+
+    await writer.mutateTaskOrchestration("create_routed_task", {
+      taskOwnerAgentId: 1,
+      title: "Build the queue",
+    });
+    await writer.mutateTaskOrchestration("set_task_queue_disposition", {
+      taskOwnerAgentId: 1,
+      taskId: 101,
+      disposition: "hold",
+    });
+
+    expect(calls.map((call) => call.command)).toEqual([
+      "save_application_state",
+      "create_routed_task",
+      "set_task_queue_disposition",
+    ]);
+    expect(calls[1].args?.request).toMatchObject({ expectedRevision: 12 });
+    expect(calls[2].args?.request).toMatchObject({ expectedRevision: 13 });
+  });
+
+  it("adopts a freshly loaded authoritative revision before the next write", async () => {
+    const invoke = vi.fn(async () => envelope(22)) as unknown as InvokeFunction;
+    const writer = new ApplicationStateWriter(invoke, 20, vi.fn());
+
+    writer.adoptRevision(21);
+    await writer.mutateTaskOrchestration("reroute_task", {
+      taskOwnerAgentId: 1,
+      taskId: 101,
+    });
+
+    expect(invoke).toHaveBeenCalledWith("reroute_task", {
+      request: expect.objectContaining({ expectedRevision: 21 }),
+    });
   });
 });

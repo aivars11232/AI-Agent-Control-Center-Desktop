@@ -33,15 +33,17 @@ The binding decision record is
       |-- typed state/IPC adapter (src/applicationState.ts, src/persistence.ts)
       |-- provider availability/model projection (src/providerRegistry.ts)
       |-- dynamic agent/group/hierarchy projection (src/agentRegistry.ts)
+      |-- task queue/routing evidence projection (src/taskOrchestration.ts)
       |-- run snapshot/event projection (src/runCoordinator.ts)
       |-- browser-preview localStorage (non-authoritative compatibility only)
-      |-- renderer presentation: routing/reviewer selection and task view state
+      |-- renderer presentation: reviewer selection and task view state
       |
       | Tauri invoke/events
       v
     Rust backend (src-tauri/src/lib.rs)
       |-- application state validation + SQLite repository/migrations
       |-- authoritative agent registry/hierarchy (agent_registry.rs)
+      |-- authoritative task routing/queue contract (task_orchestration.rs)
       |-- capability policy + authoritative one-use approvals
       |-- authoritative single-run coordinator + durable bounded ledger
       |-- provider registry/common contract (provider_runtime.rs)
@@ -57,7 +59,8 @@ The binding decision record is
 ### Renderer
 
 <code>src/App.tsx</code> currently combines page composition, import/export,
-routing, review, approval presentation, run orchestration, and most
+routing requests/evidence presentation, review, approval presentation, run
+orchestration, and most
 presentation logic.
 Persisted renderer types and the canonical seed are separated into
 <code>src/applicationState.ts</code> and
@@ -73,7 +76,9 @@ it is presentation and preflight logic, not the dispatch authority.
 <code>src/agentRegistry.ts</code> projects active agents, dynamic category
 groups, ancestor context, repair rows, role-derived authority, compatible
 manager choices, and stable template identities. It does not authorize or
-persist registry mutations.
+persist registry mutations. <code>src/taskOrchestration.ts</code> projects the
+backend queue snapshot, positions, states, and routing evidence; it does not
+score candidates or decide admission.
 
 ### Rust backend
 
@@ -82,6 +87,7 @@ processes/transports, workspace resolution and tool access, run cancellation,
 diff/change capture, desktop actions, and voice process management. It
 also composes <code>app_state.rs</code>, <code>policy.rs</code>,
 <code>agent_registry.rs</code>,
+<code>task_orchestration.rs</code>,
 <code>authorization.rs</code>, <code>run_coordinator.rs</code>,
 <code>provider_runtime.rs</code>, <code>codex_runtime.rs</code>,
 <code>ollama_runtime.rs</code>, <code>workspace_tools.rs</code>, and
@@ -91,7 +97,8 @@ capability evaluation, authoritative approval lifecycle, legal run transitions
 and evidence bounds, provider identity/contracts/dispatch, isolated Codex
 compatibility/process/protocol handling, bounded fixed-loopback Ollama
 transport/discovery, descriptor-confined conflict-safe workspace edits,
-validated agent identity/lifecycle/hierarchy operations, SQLite
+validated agent identity/lifecycle/hierarchy operations, deterministic routing
+and queue evidence, SQLite
 schema/repository, legacy migration, and typed state IPC. The provider registry
 exposes only Codex and Ollama adapters and rejects provider/model mismatch
 without fallback. Non-run
@@ -102,12 +109,12 @@ provider startup.
 ### Persistence and migration
 
 The desktop database is <code>application-state.sqlite3</code> below Tauri's
-platform application-data directory. Migrations 0001 through 0004 establish
-schema version 4 plus a migration ledger. Repository writes replace one validated
-aggregate inside an immediate transaction and use a monotonically increasing
-revision to reject stale writers. Startup refuses corrupt or unsupported newer
-databases and retains the typed error for the renderer instead of silently
-creating replacement state.
+platform application-data directory. Migrations 0001 through 0005 establish
+schema version 5 plus a migration ledger. Repository writes replace one
+validated aggregate inside an immediate transaction and use a monotonically
+increasing revision to reject stale writers. Startup refuses corrupt or
+unsupported newer databases and retains the typed error for the renderer
+instead of silently creating replacement state.
 
 Schema v2 adds authoritative approval intent, policy, and workspace bindings
 plus backend timestamps. Generic renderer state saves cannot insert, approve,
@@ -143,6 +150,15 @@ incompatible authority fail validation. Legacy invalid relationships are
 paused and detached for explicit repair, and absent/deleted defaults are not
 silently recreated.
 
+Schema v5 adds bounded routing inputs and evidence, queue state and enqueue
+sequence on tasks, per-agent queue thresholds and overflow policy, plus durable
+JavaScript-safe task/enqueue allocators and an orchestration revision. Dedicated
+compare-and-swap commands create, reroute, hold, resume, or reset tasks. Generic
+whole-state saves cannot create, remove, or relocate tasks; change routing
+inputs or the assigned executor; or forge queue, lifecycle, or routing
+evidence. Queue order is global and deterministic by priority, enqueue
+sequence, owner ID, and task ID.
+
 ### Voice runtime
 
 <code>voice-runtime/listener.py</code> is a bundled local Python listener. Setup
@@ -164,36 +180,43 @@ behavior were not exercised in TASK-0001.
 
 ## Current run flow
 
-1. The user creates or selects a task in the renderer.
-2. The renderer sends a typed run intent containing only the run locator,
+1. The renderer requests task creation or rerouting through typed IPC. The
+   backend filters candidates by active state, workspace, capability, and exact
+   provider/model readiness, applies deterministic scores, workload, and
+   overflow policy, and persists candidate evidence plus the selected executor.
+2. Execute tasks enter one durable global queue. The backend snapshot orders
+   them by priority, enqueue sequence, owner ID, and task ID; held tasks retain
+   their queue age, while a terminal task reset receives a new sequence.
+3. The renderer sends a typed run intent containing only the run locator,
    agent, task owner, task, and run mode.
-3. The backend loads current state, rejects invalid or paused subjects, derives
-   policy, and atomically admits exactly one execute/review attempt or returns
-   a deterministic busy/pending-approval result. There is no run queue.
-4. An exact approved record is reserved by admission. It is consumed once only
+4. For execute mode, the backend admits only the current queue head and
+   atomically acquires the shared single-run slot. Review bypasses execute-queue
+   order but uses the same run coordinator. Invalid, busy, non-head, or
+   pending-approval requests fail deterministically.
+5. An exact approved record is reserved by admission. It is consumed once only
    after successful provider startup; cancellation or startup failure before
    dispatch releases it, while uncertain post-dispatch recovery prevents
    replay.
-5. The backend projects the task into its active lifecycle, derives workspace,
+6. The backend projects the task into its active lifecycle, derives workspace,
    capability limits, timeout, prompt, and sandbox from persisted state. It
    resolves exactly one catalog model, maps only OpenAI to Codex and Ollama to
    Ollama, requires that adapter to equal the persisted active provider, and
    dispatches exactly that registry adapter. Unsupported, missing, ambiguous,
    inactive, or unavailable identities fail closed without fallback.
-6. Codex dispatch revalidates its executable, streams the prompt on standard
+7. Codex dispatch revalidates its executable, streams the prompt on standard
    input, runs in an outer lifecycle-only Bubblewrap namespace plus an explicit
    inner Codex sandbox, parses bounded JSONL incrementally, and refuses a
    terminal outcome until descendant cleanup is established.
-7. Ollama dispatch resolves names through <code>/api/tags</code> and metadata
+8. Ollama dispatch resolves names through <code>/api/tags</code> and metadata
    through <code>/api/show</code>, holds one cancellable async session and task
    deadline across its bounded tool loop, and exposes only descriptor-confined
    paginated/read/hash/create/patch workspace operations.
-8. The backend persists bounded ordered events, cancellation state, terminal
+9. The backend persists bounded ordered events, cancellation state, terminal
    outcome, output summary, usage, and workspace evidence. Terminal attempts
    cannot be updated.
-9. The renderer displays authoritative snapshots/events and a global Stop
-   control across navigation; generic state saves cannot overwrite run-owned
-   task fields.
+10. The renderer displays authoritative queue/run snapshots, routing evidence,
+    and a global Stop control across navigation; generic state saves cannot
+    overwrite run-owned task fields.
 
 ## Directional architecture
 
@@ -222,7 +245,10 @@ state.
   recovery, retention, and migration evidence.
 - **Policy/authorization** — normalized capabilities, approval matching,
   expiry, one-use consumption, replay resistance, and denial reasons.
-- **Run coordinator** — one active run, deterministic no-queue admission,
+- **Task orchestrator** — deterministic hard eligibility, scoring, workload and
+  overflow decisions, durable global execute-queue ordering, and backend queue
+  admission. This boundary is implemented by TASK-0010.
+- **Run coordinator** — one active run, atomic admission,
   lifecycle transitions, cancellation, timeout, recovery, and a durable
   bounded ledger. This boundary is implemented by TASK-0005; later tasks may
   extract adapters without moving authority back to the renderer.
@@ -253,10 +279,10 @@ task must choose the smallest structure supported by the code at that time.
 | Data or decision | Current owner | Planned authoritative owner |
 | --- | --- | --- |
 | Agents and hierarchy | Validated backend registry with transactional CRUD, lifecycle, role-derived authority, and reporting constraints; renderer projects views | Backend agent registry |
-| Tasks and results | Backend SQLite aggregate plus run-ledger-owned lifecycle/results; renderer still manages broader task semantics | Backend domain store and run ledger |
+| Tasks and results | Backend SQLite aggregate plus authoritative task creation/rerouting/queue state and run-ledger-owned lifecycle/results | Backend domain store and run ledger |
 | Approval records | Backend SQLite; backend-issued rows are authoritative and imported rows are expired history | Backend policy/approval store |
 | Approval match/consume | Backend exact-match transaction | Backend exact-match transaction |
-| Routing and review | Renderer | Backend scheduler/orchestrator |
+| Routing and review | Backend owns routing and execute-queue admission; renderer still chooses reviewer candidates for the prototype review flow | Backend scheduler/orchestrator |
 | Active run | Backend system-wide coordinator and SQLite ledger; only live cancellation handles are in memory | Backend system-wide coordinator |
 | Provider/model truth | Backend registry and exact active-provider/catalog-model resolution; renderer projects availability | Backend provider registry |
 | Workspace evidence | Backend bounded evidence persisted per attempt | Backend durable evidence record |
@@ -282,8 +308,8 @@ The planned system-wide execution flow is sequential:
 1. accept and persist intent;
 2. normalize and route it;
 3. assess policy and obtain any exact approval;
-4. atomically acquire the single-run slot with deterministic no-queue
-   admission;
+4. persist the execute task in the deterministic global queue and admit only
+   its head to the single-run slot;
 5. execute through one provider adapter;
 6. capture output and workspace evidence;
 7. review or request bounded revision;
@@ -310,7 +336,8 @@ TASK-0003 through TASK-0005 establish backend state, policy, and coordination.
 TASK-0006 establishes provider identity and the common contract; TASK-0007
 hardens the Codex adapter and TASK-0008 hardens the Ollama adapter.
 TASK-0009 establishes the dynamic agent registry and valid hierarchy;
-TASK-0010 through TASK-0012 establish the remaining orchestration. TASK-0013
+TASK-0010 establishes deterministic routing and sequential queueing; TASK-0011
+and TASK-0012 establish the remaining review/evidence orchestration. TASK-0013
 and TASK-0014 modularize UI/data lifecycle. TASK-0015 and TASK-0016 own system actions and
 KDE/voice integration. TASK-0017 through TASK-0020 complete bounded roles,
 packaging, acceptance, and release.

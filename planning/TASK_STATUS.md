@@ -30,8 +30,8 @@ ready merely because its predecessor's code was edited.
 | TASK-0006 | TASK-0005 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Truthful provider registry and common runtime contract |
 | TASK-0007 | TASK-0006 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Codex runtime isolation, cancellation, and evidence hardening |
 | TASK-0008 | TASK-0007 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Ollama discovery, transport, cancellation, and safe workspace tools |
-| TASK-0009 | TASK-0008 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Dynamic agent registry and valid organizational hierarchy |
-| TASK-0010 | TASK-0009 | NOT STARTED | NO | NOT STARTED | — | — | Deterministic routing, queueing, workload, and sequential scheduling |
+| TASK-0009 | TASK-0008 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Dynamic agent registry and valid organizational hierarchy |
+| TASK-0010 | TASK-0009 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Deterministic routing, queueing, workload, and sequential scheduling |
 | TASK-0011 | TASK-0010 | NOT STARTED | NO | NOT STARTED | — | — | Structured multi-level review, revisions, and recovery |
 | TASK-0012 | TASK-0011 | NOT STARTED | NO | NOT STARTED | — | — | Complete workspace change evidence and Git/non-Git inspection |
 | TASK-0013 | TASK-0012 | NOT STARTED | NO | NOT STARTED | — | — | Frontend modularization, accessibility, and responsive operation |
@@ -490,10 +490,90 @@ ready merely because its predecessor's code was edited.
   are preserved during legacy-backup normalization, and the renderer consumes
   its persistence-write suppression immediately after authoritative hydration
   so the next ordinary change is not skipped
-- Remaining limits: TASK-0010 owns deterministic routing/queue scheduling;
-  TASK-0011 owns structured multi-level review/revision; TASK-0014 owns the
+- Remaining limits: TASK-0011 owns structured multi-level review/revision;
+  TASK-0014 owns the
   strict future backup format and full lifecycle UX; installed/live acceptance
   remains with TASK-0020
+- Git closure: implementation commit
+  <code>fbf7108c0ea69c4634f83a4080027899021f90a9</code>
+  (<code>task9</code>) was identified from actual Git history and was the
+  checked-out <code>main</code> HEAD at the TASK-0010 preflight. It was reachable
+  from <code>origin/main</code>; checked-out <code>main</code> and
+  <code>origin/main</code> resolved to the same commit with zero ahead/behind and
+  a clean working tree. Its actual scope matched the retained TASK-0009 report
+  with no unexplained intervening state, so all seven successor-preflight
+  closure conditions passed.
+
+## TASK-0010 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>fbf7108c0ea69c4634f83a4080027899021f90a9</code>
+  (<code>task9</code>)
+- Starting status: clean; <code>main</code> matched <code>origin/main</code> with
+  zero ahead/behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0009 as
+  recorded above; its implementation commit and actual scope were verified
+  rather than inferred from the stale tracker label
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0010 AS PLANNED.</code>
+- Added schema version 5 and migration 0005 for task queue state and enqueue
+  sequence, routing inputs/evidence, queue thresholds and overflow policy,
+  validation indexes/triggers, JavaScript-safe monotonic task/enqueue
+  allocators, and an orchestration revision
+- Added backend-authoritative revision-checked task create, reroute,
+  hold/resume/reset, and queue-snapshot IPC. Generic whole-state saves cannot
+  create, remove, relocate, reroute, or forge executor, queue, lifecycle, and
+  routing-evidence state
+- Added deterministic routing with hard active/paused, workspace,
+  capability/policy, provider/model, and Ollama-tool eligibility. Candidate
+  evidence records disqualifications, score components, workload, winner,
+  reason, overflow result, and selected-agent override; stable ties use score,
+  workload, and agent ID
+- Added one durable global execute queue ordered by priority, enqueue sequence,
+  owner ID, and task ID. Only its head can enter the existing single-run
+  coordinator; review bypasses execute ordering but shares the coordinator.
+  Hold and reroute preserve queue age; terminal reset allocates new age
+- Integrated run completion, cancellation/recovery, and agent deletion with
+  queue state: pre-dispatch failure returns the original head, uncertain
+  post-dispatch recovery holds it, and terminal outcomes leave the queue
+- Replaced renderer-computed routing, task lifecycle mutations, manual terminal
+  controls, task deletion, local priority sorting, and legacy CPU/GPU queue
+  sliders with authoritative queue/routing IPC, backend positions/evidence,
+  truthful queue-threshold/overflow controls, owner/executor display, and
+  queue-head run gating
+- Retained serialized legacy CPU/GPU values only for compatibility; they do not
+  influence scheduling. No dependency, package-lock, Cargo manifest/lock,
+  provider runtime, platform integration, installer, or release-version change
+  was required
+- Focused verification passed on 2026-08-24: 6 routing Rust tests, 6
+  persistence/concurrency/restart Rust tests, 3 frontend files/21 tests,
+  TypeScript, and rustfmt
+- Complete fast gate: <code>npm run verify:fast</code> passed with 7 frontend
+  files/41 tests and 105 locked/offline Rust tests
+- Full non-live gate: <code>npm run verify:full</code> passed on 2026-08-24 with
+  7 frontend files/41 tests, TypeScript, rustfmt, 105 locked/offline Rust tests,
+  a 41-module production build, Clippy with warnings denied,
+  shell/Python/strict-JSON checks, npm/Cargo dependency trees, and production
+  plus full npm audits reporting zero vulnerabilities
+- Rust advisory result: **indeterminate** because <code>cargo-audit</code> is
+  unavailable; the full route records the skip explicitly and this
+  environmental limitation is not a pass
+- Live Codex/Ollama generation, provider authentication, microphone/listener,
+  portal, install/remove, desktop package, and desktop/system-control actions:
+  not run
+- Security/privacy and recovery effects: untrusted renderer state cannot mint
+  task/orchestration authority; routing and queue evidence remain local in the
+  existing private SQLite store; stale writes and invalid queue transitions
+  fail closed; migration and allocator updates are atomic; restart preserves
+  queue order/evidence and reconciles pre- versus post-dispatch failures
+- Remaining limits: TASK-0011 owns structured multi-level review/revision;
+  TASK-0012 owns complete workspace evidence; TASK-0014 owns strict future
+  backup/lifecycle UX; live and packaged-platform acceptance remain with
+  TASK-0020
 - Git closure: **PENDING USER** review, commit, push, and clean-tree evidence
 
 ## Successor-preflight closure rule

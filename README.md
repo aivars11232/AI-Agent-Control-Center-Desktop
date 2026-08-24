@@ -19,6 +19,8 @@ The current checkout contains:
 - a backend-owned, versioned SQLite store for desktop application state;
 - a backend-authoritative agent registry with validated hierarchy, durable
   create/update/delete operations, and explicit default-template restoration;
+- a backend-authoritative deterministic task router and one global sequential
+  execute queue with durable workload, ordering, and routing evidence;
 - a backend-authoritative single-run coordinator with a durable, bounded run
   ledger;
 - a truthful Codex/Ollama provider registry with exact model/runtime dispatch
@@ -37,8 +39,10 @@ admission, task/run lifecycle projection, cancellation state, recovery, and
 bounded evidence retention are backend-authoritative. Provider identity and
 dispatch use a common backend contract. Codex process/protocol hardening is
 implemented for the current Linux path; bounded Ollama transport and workspace
-tools are implemented for the current Linux path; routing, live provider
-acceptance, and multi-level review orchestration remain prototype boundaries.
+tools are implemented for the current Linux path. Deterministic task routing,
+overflow handling, queue ordering, and execute-head admission are
+backend-authoritative; live provider acceptance and multi-level review
+orchestration remain prototype boundaries.
 Agent identity, lifecycle, role-derived authority, reporting relationships,
 and template restoration are backend-authoritative; dashboard, agent, routing,
 review, voice, reminder, approval, and settings projections consume active
@@ -83,9 +87,9 @@ Run the deterministic fast characterization gate from the repository root:
 npm run verify:fast
 ```
 
-It runs 39 frontend characterization/persistence/coordinator/provider/registry
-tests, the TypeScript check, the Rust format check, and 93 locked/offline Rust
-tests.
+It runs 41 frontend characterization/persistence/coordinator/provider/registry/
+orchestration tests, the TypeScript check, the Rust format check, and 105
+locked/offline Rust tests.
 The full gate adds the
 frontend build, Clippy, shell/Python/JSON checks, dependency-tree checks, and
 production plus development npm audits:

@@ -1,4 +1,8 @@
 import applicationStateSeed from "./application-state-seed.json";
+import type {
+  RoutingEvidence,
+  TaskQueueState,
+} from "./taskOrchestration";
 
 export type VoiceState = "VOICE_OFF" | "VOICE_PASSIVE" | "VOICE_ACTIVE";
 export type AccessLevel = "none" | "read" | "write" | "full";
@@ -56,6 +60,7 @@ export type AgentPerformance = {
   focus: ExecutionFocus;
   cpuLimit: number;
   gpuLimit: number;
+  queueThreshold: number;
   overflowAction: OverflowAction;
   redirectAgentId: number | null;
 };
@@ -142,6 +147,9 @@ export type AgentTask = {
   routingMode: RoutingMode;
   routedFromAgentId: number | null;
   routingReason: string | null;
+  queueState: TaskQueueState;
+  enqueueSequence: number | null;
+  routingEvidence: RoutingEvidence | null;
   reviewAgentId: number | null;
   reviewStatus: ReviewStatus;
   reviewResult: string | null;

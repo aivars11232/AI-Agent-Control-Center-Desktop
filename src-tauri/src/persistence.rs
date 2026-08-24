@@ -14,12 +14,17 @@ use crate::authorization::{
     ApprovalResolution, AuthorizationGrant, AuthorizationOutcome,
 };
 use crate::policy::{evaluate_policy, ActionIntent, PolicyDisposition, PolicyEvaluation};
+use crate::provider_runtime::ProviderRegistrySnapshot;
 use crate::run_coordinator::{
     bound_diff, bound_paths, validate_request_id, BoundedText, RunAttemptMode,
     RunAttemptProjection, RunAttemptStatus, RunCompletion, RunCoordinatorSnapshot,
     RunEventProjection, RunTruncationEvidence, RunUsage, MAX_ERROR_BYTES, MAX_PROGRESS_BYTES,
     MAX_PROGRESS_EVENTS, MAX_PROGRESS_MESSAGE_BYTES, MAX_RECENT_ATTEMPTS, MAX_RETAINED_ATTEMPTS,
     MAX_RETAINED_PAYLOAD_BYTES, MAX_STDERR_CAPTURE_BYTES, MAX_SUMMARY_BYTES,
+};
+use crate::task_orchestration::{
+    route_task, CreateRoutedTaskRequest, QueueDisposition, RerouteTaskRequest, RoutingTaskInput,
+    SetTaskQueueDispositionRequest, TaskOrchestrationSnapshot, TaskQueueEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
@@ -36,6 +41,8 @@ const AUTHORIZATION_MIGRATION: &str =
     include_str!("../migrations/0002_authoritative_approvals.sql");
 const RUN_COORDINATION_MIGRATION: &str = include_str!("../migrations/0003_run_coordination.sql");
 const AGENT_REGISTRY_MIGRATION: &str = include_str!("../migrations/0004_agent_registry.sql");
+const TASK_ORCHESTRATION_MIGRATION: &str =
+    include_str!("../migrations/0005_task_orchestration.sql");
 const MAX_AUTHORIZATION_RECORDS: i64 = 10_000;
 
 #[derive(Debug, Clone)]
@@ -252,6 +259,38 @@ impl PersistenceService {
     ) -> PersistenceResult<StateEnvelope> {
         self.run(move |repository| repository.restore_agent_template(request))
             .await
+    }
+
+    pub async fn create_routed_task(
+        &self,
+        request: CreateRoutedTaskRequest,
+        providers: ProviderRegistrySnapshot,
+    ) -> PersistenceResult<StateEnvelope> {
+        self.run(move |repository| repository.create_routed_task(request, &providers))
+            .await
+    }
+
+    pub async fn reroute_task(
+        &self,
+        request: RerouteTaskRequest,
+        providers: ProviderRegistrySnapshot,
+    ) -> PersistenceResult<StateEnvelope> {
+        self.run(move |repository| repository.reroute_task(request, &providers))
+            .await
+    }
+
+    pub async fn set_task_queue_disposition(
+        &self,
+        request: SetTaskQueueDispositionRequest,
+    ) -> PersistenceResult<StateEnvelope> {
+        self.run(move |repository| repository.set_task_queue_disposition(request))
+            .await
+    }
+
+    pub async fn task_orchestration_snapshot(
+        &self,
+    ) -> PersistenceResult<TaskOrchestrationSnapshot> {
+        self.run(StateRepository::task_orchestration_snapshot).await
     }
 
     pub async fn request_authorization(
@@ -507,6 +546,7 @@ impl StateRepository {
                 [revision],
             )
             .map_err(PersistenceError::database)?;
+        advance_task_orchestration_revision(&transaction)?;
         transaction.commit().map_err(PersistenceError::database)?;
         self.load()?.ok_or_else(|| {
             PersistenceError::new(
@@ -678,15 +718,27 @@ impl StateRepository {
                     if deleted_owner {
                         task.status = "Failed".to_string();
                         task.phase = "Failed".to_string();
+                        task.queue_state = "notQueued".to_string();
+                        task.enqueue_sequence = None;
+                        task.routing_evidence = None;
                         task.completed_at = Some(resolved_at.clone());
                         task.result =
                             Some("Task closed because its owning agent was deleted.".to_string());
                     } else if task.assigned_agent_id == request.agent_id && nonterminal {
+                        if task.enqueue_sequence.is_none() {
+                            task.enqueue_sequence = Some(allocate_enqueue_sequence(transaction)?);
+                        }
                         task.assigned_agent_id = agent.id;
                         task.status = "Pending".to_string();
                         task.phase = "Assigned".to_string();
-                    }
-                    if task.routed_from_agent_id == Some(request.agent_id) {
+                        task.queue_state = "queued".to_string();
+                        task.routed_from_agent_id = Some(request.agent_id);
+                        task.routing_reason = Some(
+                            "Executor reset because the previously assigned agent was deleted."
+                                .to_string(),
+                        );
+                        task.routing_evidence = None;
+                    } else if task.routed_from_agent_id == Some(request.agent_id) {
                         task.routed_from_agent_id = None;
                     }
                     if deleted_owner
@@ -837,6 +889,363 @@ impl StateRepository {
                 state.agents.push(restored);
             }
             Ok(())
+        })
+    }
+
+    pub fn create_routed_task(
+        &mut self,
+        request: CreateRoutedTaskRequest,
+        providers: &ProviderRegistrySnapshot,
+    ) -> PersistenceResult<StateEnvelope> {
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let meta = application_meta_from(&transaction)?;
+        ensure_expected_revision(&meta, request.expected_revision)?;
+        let mut state = read_application_state(&transaction)?;
+        let owner_index = state
+            .agents
+            .iter()
+            .position(|agent| agent.id == request.task_owner_agent_id)
+            .ok_or_else(|| {
+                PersistenceError::new(
+                    "TASK_OWNER_NOT_FOUND",
+                    "The selected task owner no longer exists.",
+                    true,
+                )
+            })?;
+        if state.agents[owner_index].registry_state != "active" {
+            return Err(PersistenceError::new(
+                "TASK_OWNER_INACTIVE",
+                "New tasks require an active registry owner.",
+                true,
+            ));
+        }
+        let (task_id, enqueue_sequence) = allocate_task_and_enqueue_sequence(&transaction)?;
+        let mut task = AgentTask {
+            id: task_id,
+            title: request.title.trim().to_string(),
+            category: request.category,
+            priority: request.priority,
+            assigned_agent_id: request.task_owner_agent_id,
+            status: "Pending".to_string(),
+            phase: "Assigned".to_string(),
+            created_at: format_unix_ms(timestamp),
+            completed_at: None,
+            result: None,
+            response_id: None,
+            runtime_model: None,
+            total_tokens: None,
+            workspace_id: Some(request.workspace_id),
+            changed_files: Vec::new(),
+            diff: None,
+            duration_seconds: None,
+            routing_mode: request.routing_mode,
+            routed_from_agent_id: None,
+            routing_reason: None,
+            queue_state: "queued".to_string(),
+            enqueue_sequence: Some(enqueue_sequence),
+            routing_evidence: None,
+            review_agent_id: None,
+            review_status: "Not Requested".to_string(),
+            review_result: None,
+            review_model: None,
+            review_duration_seconds: None,
+            reviewed_at: None,
+        };
+        let input = RoutingTaskInput {
+            task_owner_agent_id: request.task_owner_agent_id,
+            task: task.clone(),
+            preferred_agent_id: request.preferred_agent_id,
+            selected_agent_id: request.selected_agent_id,
+        };
+        let evidence = route_task(&state, providers, &input).map_err(routing_error)?;
+        task.assigned_agent_id = evidence.winning_agent_id;
+        task.routing_reason = Some(evidence.reason.clone());
+        task.routing_evidence = Some(evidence);
+        state.agents[owner_index].tasks.push(task.clone());
+        validate_application_state(&state).map_err(PersistenceError::validation)?;
+
+        let position: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(position), -1) + 1
+                 FROM agent_tasks WHERE owner_agent_id = ?1",
+                [request.task_owner_agent_id],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        write_task(
+            &transaction,
+            request.task_owner_agent_id,
+            position as usize,
+            &task,
+        )?;
+        finish_task_orchestration_mutation(&transaction, meta.state_revision)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        self.load()?.ok_or_else(|| {
+            PersistenceError::new(
+                "TASK_CREATE_FAILED",
+                "Application state was unavailable after task creation.",
+                false,
+            )
+        })
+    }
+
+    pub fn reroute_task(
+        &mut self,
+        request: RerouteTaskRequest,
+        providers: &ProviderRegistrySnapshot,
+    ) -> PersistenceResult<StateEnvelope> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let meta = application_meta_from(&transaction)?;
+        ensure_expected_revision(&meta, request.expected_revision)?;
+        ensure_task_has_no_active_run(&transaction, request.task_owner_agent_id, request.task_id)?;
+        let mut state = read_application_state(&transaction)?;
+        let (owner_index, task_index) =
+            find_task_indexes(&state, request.task_owner_agent_id, request.task_id)?;
+        if state.agents[owner_index].registry_state != "active" {
+            return Err(PersistenceError::new(
+                "TASK_OWNER_INACTIVE",
+                "Queued tasks can only be rerouted while their owner is active.",
+                true,
+            ));
+        }
+        let current = state.agents[owner_index].tasks[task_index].clone();
+        if !matches!(current.queue_state.as_str(), "queued" | "held") {
+            return Err(PersistenceError::new(
+                "TASK_QUEUE_LOCKED",
+                "Only queued or held tasks can be rerouted.",
+                true,
+            ));
+        }
+        let mut task = current.clone();
+        task.title = request.title.trim().to_string();
+        task.category = request.category;
+        task.priority = request.priority;
+        task.workspace_id = Some(request.workspace_id);
+        task.routing_mode = request.routing_mode;
+        let input = RoutingTaskInput {
+            task_owner_agent_id: request.task_owner_agent_id,
+            task: task.clone(),
+            preferred_agent_id: request.preferred_agent_id,
+            selected_agent_id: request.selected_agent_id,
+        };
+        let evidence = route_task(&state, providers, &input).map_err(routing_error)?;
+        if current.assigned_agent_id != evidence.winning_agent_id {
+            task.routed_from_agent_id = Some(current.assigned_agent_id);
+        }
+        task.assigned_agent_id = evidence.winning_agent_id;
+        task.routing_reason = Some(evidence.reason.clone());
+        task.routing_evidence = Some(evidence);
+        state.agents[owner_index].tasks[task_index] = task.clone();
+        validate_application_state(&state).map_err(PersistenceError::validation)?;
+        let routing_evidence_json =
+            serde_json::to_string(&task.routing_evidence).map_err(|_| {
+                PersistenceError::new(
+                    "ROUTING_EVIDENCE_INVALID",
+                    "Task routing evidence could not be normalized.",
+                    false,
+                )
+            })?;
+        transaction
+            .execute(
+                "UPDATE agent_tasks
+                 SET title = ?1, category = ?2, priority = ?3, workspace_id = ?4,
+                     routing_mode = ?5, assigned_agent_id = ?6,
+                     routed_from_agent_id = ?7, routing_reason = ?8,
+                     routing_evidence_json = ?9
+                 WHERE owner_agent_id = ?10 AND id = ?11",
+                params![
+                    task.title,
+                    task.category,
+                    task.priority,
+                    task.workspace_id,
+                    task.routing_mode,
+                    task.assigned_agent_id,
+                    task.routed_from_agent_id,
+                    task.routing_reason,
+                    routing_evidence_json,
+                    request.task_owner_agent_id,
+                    request.task_id
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        expire_task_approvals(&transaction, request.task_owner_agent_id, request.task_id)?;
+        finish_task_orchestration_mutation(&transaction, meta.state_revision)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        self.load()?.ok_or_else(|| {
+            PersistenceError::new(
+                "TASK_REROUTE_FAILED",
+                "Application state was unavailable after task rerouting.",
+                false,
+            )
+        })
+    }
+
+    pub fn set_task_queue_disposition(
+        &mut self,
+        request: SetTaskQueueDispositionRequest,
+    ) -> PersistenceResult<StateEnvelope> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let meta = application_meta_from(&transaction)?;
+        ensure_expected_revision(&meta, request.expected_revision)?;
+        ensure_task_has_no_active_run(&transaction, request.task_owner_agent_id, request.task_id)?;
+        let mut state = read_application_state(&transaction)?;
+        let (owner_index, task_index) =
+            find_task_indexes(&state, request.task_owner_agent_id, request.task_id)?;
+        let task = &mut state.agents[owner_index].tasks[task_index];
+        match request.disposition {
+            QueueDisposition::Hold => {
+                if task.queue_state != "queued" {
+                    return Err(PersistenceError::new(
+                        "TASK_QUEUE_STATE_CONFLICT",
+                        "Only a queued task can be held.",
+                        true,
+                    ));
+                }
+                task.queue_state = "held".to_string();
+                task.status = "Blocked".to_string();
+                task.phase = "Supervisor Approval".to_string();
+            }
+            QueueDisposition::Resume => {
+                if task.queue_state != "held" {
+                    return Err(PersistenceError::new(
+                        "TASK_QUEUE_STATE_CONFLICT",
+                        "Only a held task can be resumed.",
+                        true,
+                    ));
+                }
+                task.queue_state = "queued".to_string();
+                task.status = "Pending".to_string();
+                task.phase = "Assigned".to_string();
+            }
+            QueueDisposition::ResetTerminal => {
+                if task.queue_state != "notQueued"
+                    || !matches!(task.status.as_str(), "Completed" | "Failed")
+                {
+                    return Err(PersistenceError::new(
+                        "TASK_QUEUE_STATE_CONFLICT",
+                        "Only a terminal task outside the queue can be reset.",
+                        true,
+                    ));
+                }
+                task.enqueue_sequence = Some(allocate_enqueue_sequence(&transaction)?);
+                task.queue_state = "queued".to_string();
+                task.status = "Pending".to_string();
+                task.phase = "Assigned".to_string();
+                task.completed_at = None;
+                task.result = None;
+                task.response_id = None;
+                task.runtime_model = None;
+                task.total_tokens = None;
+                task.changed_files.clear();
+                task.diff = None;
+                task.duration_seconds = None;
+                task.review_agent_id = None;
+                task.review_status = "Not Requested".to_string();
+                task.review_result = None;
+                task.review_model = None;
+                task.review_duration_seconds = None;
+                task.reviewed_at = None;
+            }
+        }
+        validate_application_state(&state).map_err(PersistenceError::validation)?;
+        let task = &state.agents[owner_index].tasks[task_index];
+        transaction
+            .execute(
+                "UPDATE agent_tasks
+                 SET queue_state = ?1, enqueue_sequence = ?2, status = ?3, phase = ?4,
+                     completed_at = ?5, result = ?6, response_id = ?7,
+                     runtime_model = ?8, total_tokens = ?9, diff = ?10,
+                     duration_seconds = ?11, review_agent_id = ?12,
+                     review_status = ?13, review_result = ?14, review_model = ?15,
+                     review_duration_seconds = ?16, reviewed_at = ?17
+                 WHERE owner_agent_id = ?18 AND id = ?19",
+                params![
+                    task.queue_state,
+                    task.enqueue_sequence,
+                    task.status,
+                    task.phase,
+                    task.completed_at,
+                    task.result,
+                    task.response_id,
+                    task.runtime_model,
+                    task.total_tokens,
+                    task.diff,
+                    task.duration_seconds,
+                    task.review_agent_id,
+                    task.review_status,
+                    task.review_result,
+                    task.review_model,
+                    task.review_duration_seconds,
+                    task.reviewed_at,
+                    request.task_owner_agent_id,
+                    request.task_id
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        if request.disposition == QueueDisposition::ResetTerminal {
+            transaction
+                .execute(
+                    "DELETE FROM task_changed_files
+                     WHERE owner_agent_id = ?1 AND task_id = ?2",
+                    params![request.task_owner_agent_id, request.task_id],
+                )
+                .map_err(PersistenceError::database)?;
+        }
+        expire_task_approvals(&transaction, request.task_owner_agent_id, request.task_id)?;
+        finish_task_orchestration_mutation(&transaction, meta.state_revision)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        self.load()?.ok_or_else(|| {
+            PersistenceError::new(
+                "TASK_QUEUE_UPDATE_FAILED",
+                "Application state was unavailable after the queue update.",
+                false,
+            )
+        })
+    }
+
+    pub fn task_orchestration_snapshot(&mut self) -> PersistenceResult<TaskOrchestrationSnapshot> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(PersistenceError::database)?;
+        ensure_state_initialized(&transaction)?;
+        let revision: i64 = transaction
+            .query_row(
+                "SELECT revision FROM task_orchestration_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        let mut execute_queue = read_task_queue_entries(&transaction, "queued")?;
+        for (position, entry) in execute_queue.iter_mut().enumerate() {
+            entry.queue_position = Some(position as i64 + 1);
+        }
+        let held_tasks = read_task_queue_entries(&transaction, "held")?;
+        let active_entries = read_active_task_queue_entries(&transaction)?;
+        if active_entries.len() > 1 {
+            return Err(PersistenceError::new(
+                "TASK_QUEUE_CORRUPT",
+                "More than one execute task is marked active.",
+                false,
+            ));
+        }
+        let active_execute = active_entries.into_iter().next();
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(TaskOrchestrationSnapshot {
+            revision,
+            execute_queue,
+            held_tasks,
+            active_execute,
         })
     }
 
@@ -1479,6 +1888,10 @@ impl StateRepository {
             ));
         }
 
+        if run_mode == RunAttemptMode::Execute {
+            ensure_execute_queue_head(&transaction, task_owner_agent_id, task_id)?;
+        }
+
         let evaluation = evaluate_policy(&state, intent).map_err(policy_denial)?;
         let approval_id = if evaluation.disposition == PolicyDisposition::ApprovalRequired {
             let Some(approval_id) =
@@ -1551,6 +1964,23 @@ impl StateRepository {
                 [attempt_id],
             )
             .map_err(PersistenceError::database)?;
+        if run_mode == RunAttemptMode::Execute {
+            let changed = transaction
+                .execute(
+                    "UPDATE agent_tasks SET queue_state = 'admitted'
+                     WHERE owner_agent_id = ?1 AND id = ?2 AND queue_state = 'queued'",
+                    params![task_owner_agent_id, task_id],
+                )
+                .map_err(PersistenceError::database)?;
+            if changed != 1 {
+                return Err(PersistenceError::new(
+                    "TASK_QUEUE_STATE_CONFLICT",
+                    "The queue head changed before execution admission completed.",
+                    true,
+                ));
+            }
+            advance_task_orchestration_revision(&transaction)?;
+        }
         refresh_run_retention_meta(&transaction)?;
         let attempt = read_run_attempt(&transaction, attempt_id)?;
         let authorization = approval_id
@@ -1559,11 +1989,12 @@ impl StateRepository {
             .map(|approval| AuthorizationGrant {
                 approval: Some(approval),
             });
+        let application_state = read_application_state(&transaction)?;
         transaction.commit().map_err(PersistenceError::database)?;
         Ok(RunAdmission {
             attempt,
             authorization,
-            application_state: state,
+            application_state,
             duplicate: false,
         })
     }
@@ -1674,6 +2105,9 @@ impl StateRepository {
             )
             .map_err(PersistenceError::database)?;
         project_run_started_to_task(&transaction, &current)?;
+        if current.run_mode == RunAttemptMode::Execute {
+            advance_task_orchestration_revision(&transaction)?;
+        }
         advance_run_revision(&transaction)?;
         let attempt = read_run_attempt(&transaction, attempt_id)?;
         transaction.commit().map_err(PersistenceError::database)?;
@@ -1696,12 +2130,26 @@ impl StateRepository {
         }
         ensure_active_attempt(&transaction, attempt_id)?;
         ensure_run_transition(current.status, RunAttemptStatus::CancelRequested)?;
+        let cancellation_disposition = if matches!(
+            current.status,
+            RunAttemptStatus::Dispatching | RunAttemptStatus::Running
+        ) {
+            "manual_review_required"
+        } else {
+            "safe_to_retry"
+        };
         transaction
             .execute(
                 "UPDATE run_attempts
-                 SET status = 'cancel_requested', cancel_requested_at_unix_ms = ?1
-                 WHERE id = ?2 AND status = ?3",
-                params![timestamp, attempt_id, current.status.as_str()],
+                 SET status = 'cancel_requested', cancel_requested_at_unix_ms = ?1,
+                     recovery_disposition = ?2
+                 WHERE id = ?3 AND status = ?4",
+                params![
+                    timestamp,
+                    cancellation_disposition,
+                    attempt_id,
+                    current.status.as_str()
+                ],
             )
             .map_err(PersistenceError::database)?;
         advance_run_revision(&transaction)?;
@@ -1846,6 +2294,10 @@ impl StateRepository {
         } else {
             completion.status
         };
+        let recovery_disposition = completion
+            .recovery_disposition
+            .as_deref()
+            .or(current.recovery_disposition.as_deref());
         ensure_run_transition(current.status, terminal_status)?;
 
         let summary = completion
@@ -1976,7 +2428,7 @@ impl StateRepository {
                     bounded_i64(truncation.original_diff_bytes),
                     bounded_i64(truncation.original_changed_file_count),
                     bounded_i64(truncation.omitted_progress_event_count),
-                    completion.recovery_disposition,
+                    recovery_disposition,
                     attempt_id,
                     current.status.as_str()
                 ],
@@ -1997,7 +2449,13 @@ impl StateRepository {
             diff.as_deref(),
             completion.duration_seconds,
             timestamp,
-            completion.recovery_disposition.as_deref(),
+            recovery_disposition,
+        )?;
+        project_run_completion_to_queue(
+            &transaction,
+            &current,
+            terminal_status,
+            recovery_disposition,
         )?;
         transaction
             .execute(
@@ -2005,6 +2463,9 @@ impl StateRepository {
                 [attempt_id],
             )
             .map_err(PersistenceError::database)?;
+        if current.run_mode == RunAttemptMode::Execute {
+            advance_task_orchestration_revision(&transaction)?;
+        }
         transaction
             .execute(
                 "UPDATE run_coordinator_meta
@@ -2109,6 +2570,11 @@ impl StateRepository {
                     RUN_COORDINATION_MIGRATION,
                 )?,
                 3 => self.apply_migration(4, "dynamic_agent_registry", AGENT_REGISTRY_MIGRATION)?,
+                4 => self.apply_migration(
+                    5,
+                    "authoritative_task_orchestration",
+                    TASK_ORCHESTRATION_MIGRATION,
+                )?,
                 version => {
                     return Err(PersistenceError::new(
                         "MIGRATION_PATH_MISSING",
@@ -2430,6 +2896,7 @@ impl StateRepository {
                     [],
                 )
                 .map_err(PersistenceError::database)?;
+            advance_task_orchestration_revision(&transaction)?;
             prune_run_history(&transaction, timestamp)?;
             refresh_run_retention_meta(&transaction)?;
         }
@@ -2669,6 +3136,76 @@ fn run_intent_parts(intent: &ActionIntent) -> PersistenceResult<(i64, i64, i64, 
     }
 }
 
+fn ensure_execute_queue_head(
+    transaction: &Transaction<'_>,
+    owner_agent_id: i64,
+    task_id: i64,
+) -> PersistenceResult<()> {
+    let queue_state: Option<String> = transaction
+        .query_row(
+            "SELECT queue_state FROM agent_tasks
+             WHERE owner_agent_id = ?1 AND id = ?2",
+            params![owner_agent_id, task_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(PersistenceError::database)?;
+    let Some(queue_state) = queue_state else {
+        return Err(PersistenceError::new(
+            "TASK_NOT_FOUND",
+            "The selected task no longer exists.",
+            true,
+        ));
+    };
+    if queue_state != "queued" {
+        return Err(PersistenceError::new(
+            "TASK_NOT_QUEUED",
+            "Only a queued execute task can be admitted.",
+            true,
+        ));
+    }
+    let head: Option<(i64, i64)> = transaction
+        .query_row(
+            "SELECT owner_agent_id, id FROM agent_tasks
+             WHERE queue_state = 'queued'
+             ORDER BY CASE priority
+                 WHEN 'Critical' THEN 0 WHEN 'High' THEN 1
+                 WHEN 'Normal' THEN 2 ELSE 3 END,
+                 enqueue_sequence, owner_agent_id, id
+             LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(PersistenceError::database)?;
+    if head != Some((owner_agent_id, task_id)) {
+        return Err(PersistenceError::new(
+            "QUEUE_HEAD_REQUIRED",
+            "Only queue position 1 can enter the global execute slot.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn advance_task_orchestration_revision(transaction: &Transaction<'_>) -> PersistenceResult<i64> {
+    let revision: i64 = transaction
+        .query_row(
+            "SELECT revision FROM task_orchestration_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let next = next_revision(revision)?;
+    transaction
+        .execute(
+            "UPDATE task_orchestration_meta SET revision = ?1 WHERE singleton = 1",
+            [next],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(next)
+}
+
 fn validate_run_label(label: &str, value: &str) -> PersistenceResult<()> {
     if value.trim().is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
         return Err(PersistenceError::new(
@@ -2811,8 +3348,9 @@ fn project_run_started_to_task(
     let changed = match attempt.run_mode {
         RunAttemptMode::Execute => transaction.execute(
             "UPDATE agent_tasks
-             SET status = 'Running', phase = 'Specialist Work', completed_at = NULL
-             WHERE owner_agent_id = ?1 AND id = ?2",
+             SET status = 'Running', phase = 'Specialist Work', completed_at = NULL,
+                 queue_state = 'running'
+             WHERE owner_agent_id = ?1 AND id = ?2 AND queue_state = 'admitted'",
             params![attempt.task_owner_agent_id, attempt.task_id],
         ),
         RunAttemptMode::Review => transaction.execute(
@@ -3026,6 +3564,66 @@ fn project_run_completion_to_task(
     Ok(())
 }
 
+fn project_run_completion_to_queue(
+    transaction: &Transaction<'_>,
+    attempt: &RunAttemptProjection,
+    status: RunAttemptStatus,
+    recovery_disposition: Option<&str>,
+) -> PersistenceResult<()> {
+    if attempt.run_mode != RunAttemptMode::Execute {
+        return Ok(());
+    }
+    let disposition = match status {
+        RunAttemptStatus::StartupFailed => "queued",
+        RunAttemptStatus::Cancelled if recovery_disposition == Some("safe_to_retry") => "queued",
+        RunAttemptStatus::Cancelled => "held",
+        RunAttemptStatus::Interrupted if recovery_disposition == Some("safe_to_retry") => "queued",
+        RunAttemptStatus::Interrupted => "held",
+        RunAttemptStatus::Succeeded | RunAttemptStatus::TimedOut | RunAttemptStatus::Failed => {
+            "notQueued"
+        }
+        _ => {
+            return Err(PersistenceError::new(
+                "INVALID_RUN_COMPLETION",
+                "The execution queue cannot project a nonterminal completion.",
+                false,
+            ))
+        }
+    };
+    let changed = match disposition {
+        "queued" => transaction.execute(
+            "UPDATE agent_tasks
+             SET queue_state = 'queued', status = 'Pending', phase = 'Assigned',
+                 completed_at = NULL
+             WHERE owner_agent_id = ?1 AND id = ?2",
+            params![attempt.task_owner_agent_id, attempt.task_id],
+        ),
+        "held" => transaction.execute(
+            "UPDATE agent_tasks
+             SET queue_state = 'held', status = 'Blocked',
+                 phase = 'Supervisor Approval', completed_at = NULL
+             WHERE owner_agent_id = ?1 AND id = ?2",
+            params![attempt.task_owner_agent_id, attempt.task_id],
+        ),
+        "notQueued" => transaction.execute(
+            "UPDATE agent_tasks
+             SET queue_state = 'notQueued', enqueue_sequence = NULL
+             WHERE owner_agent_id = ?1 AND id = ?2",
+            params![attempt.task_owner_agent_id, attempt.task_id],
+        ),
+        _ => unreachable!(),
+    }
+    .map_err(PersistenceError::database)?;
+    if changed != 1 {
+        return Err(PersistenceError::new(
+            "TASK_STATE_CONFLICT",
+            "The execution task disappeared before its queue completion was recorded.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
 fn project_recovered_attempt_to_task(
     transaction: &Transaction<'_>,
     attempt: &RunAttemptProjection,
@@ -3035,8 +3633,9 @@ fn project_recovered_attempt_to_task(
         RunAttemptMode::Execute => {
             transaction
                 .execute(
-                    "UPDATE agent_tasks SET status = ?1, phase = ?2, completed_at = NULL
-                     WHERE owner_agent_id = ?3 AND id = ?4",
+                    "UPDATE agent_tasks
+                     SET status = ?1, phase = ?2, completed_at = NULL, queue_state = ?3
+                     WHERE owner_agent_id = ?4 AND id = ?5",
                     params![
                         if safe_to_retry { "Pending" } else { "Blocked" },
                         if safe_to_retry {
@@ -3044,6 +3643,7 @@ fn project_recovered_attempt_to_task(
                         } else {
                             "Supervisor Approval"
                         },
+                        if safe_to_retry { "queued" } else { "held" },
                         attempt.task_owner_agent_id,
                         attempt.task_id
                     ],
@@ -3221,16 +3821,6 @@ fn protect_run_owned_state(
     requested: &ApplicationState,
     timestamp: i64,
 ) -> PersistenceResult<ApplicationState> {
-    let run_owned_tasks = {
-        let mut statement = transaction
-            .prepare("SELECT DISTINCT task_owner_agent_id, task_id FROM run_attempts")
-            .map_err(PersistenceError::database)?;
-        collect_rows(
-            statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))),
-        )?
-        .into_iter()
-        .collect::<HashSet<_>>()
-    };
     let mut locked_tasks = {
         let mut statement = transaction
             .prepare(
@@ -3306,16 +3896,35 @@ fn protect_run_owned_state(
         }
     }
 
+    for key in current_tasks.keys() {
+        if !requested_tasks.contains_key(key) {
+            return Err(PersistenceError::new(
+                "TASK_ORCHESTRATION_AUTHORITY_REQUIRED",
+                "Create, remove, and relocate tasks through the authoritative task orchestration commands.",
+                true,
+            ));
+        }
+    }
+
     let mut protected = requested.clone();
     for owner in &mut protected.agents {
         for task in &mut owner.tasks {
             let key = (owner.id, task.id);
             if let Some(current_task) = current_tasks.get(&key) {
-                if run_owned_tasks.contains(&key) || locked_tasks.contains(&key) {
-                    copy_run_owned_task_fields(task, current_task);
+                if task_orchestration_inputs_changed(current_task, task) {
+                    return Err(PersistenceError::new(
+                        "TASK_ORCHESTRATION_AUTHORITY_REQUIRED",
+                        "Edit routing inputs and executor assignment through the authoritative reroute command.",
+                        true,
+                    ));
                 }
+                copy_run_owned_task_fields(task, current_task);
             } else {
-                validate_new_task_lifecycle(task)?;
+                return Err(PersistenceError::new(
+                    "TASK_ORCHESTRATION_AUTHORITY_REQUIRED",
+                    "Create tasks through the authoritative routed-task command.",
+                    true,
+                ));
             }
         }
     }
@@ -3342,6 +3951,18 @@ fn task_run_inputs_changed(current: &AgentTask, requested: &AgentTask) -> bool {
         || current.routing_reason != requested.routing_reason
 }
 
+fn task_orchestration_inputs_changed(current: &AgentTask, requested: &AgentTask) -> bool {
+    current.title != requested.title
+        || current.category != requested.category
+        || current.priority != requested.priority
+        || current.assigned_agent_id != requested.assigned_agent_id
+        || current.created_at != requested.created_at
+        || current.workspace_id != requested.workspace_id
+        || current.routing_mode != requested.routing_mode
+        || current.routed_from_agent_id != requested.routed_from_agent_id
+        || current.routing_reason != requested.routing_reason
+}
+
 fn copy_run_owned_task_fields(target: &mut AgentTask, source: &AgentTask) {
     target.status.clone_from(&source.status);
     target.phase.clone_from(&source.phase);
@@ -3353,39 +3974,15 @@ fn copy_run_owned_task_fields(target: &mut AgentTask, source: &AgentTask) {
     target.changed_files.clone_from(&source.changed_files);
     target.diff.clone_from(&source.diff);
     target.duration_seconds = source.duration_seconds;
+    target.queue_state.clone_from(&source.queue_state);
+    target.enqueue_sequence = source.enqueue_sequence;
+    target.routing_evidence.clone_from(&source.routing_evidence);
     target.review_agent_id = source.review_agent_id;
     target.review_status.clone_from(&source.review_status);
     target.review_result.clone_from(&source.review_result);
     target.review_model.clone_from(&source.review_model);
     target.review_duration_seconds = source.review_duration_seconds;
     target.reviewed_at.clone_from(&source.reviewed_at);
-}
-
-fn validate_new_task_lifecycle(task: &AgentTask) -> PersistenceResult<()> {
-    let clean = task.status == "Pending"
-        && task.phase == "Assigned"
-        && task.completed_at.is_none()
-        && task.result.is_none()
-        && task.response_id.is_none()
-        && task.runtime_model.is_none()
-        && task.total_tokens.is_none()
-        && task.changed_files.is_empty()
-        && task.diff.is_none()
-        && task.duration_seconds.is_none()
-        && task.review_agent_id.is_none()
-        && task.review_status == "Not Requested"
-        && task.review_result.is_none()
-        && task.review_model.is_none()
-        && task.review_duration_seconds.is_none()
-        && task.reviewed_at.is_none();
-    if !clean {
-        return Err(PersistenceError::new(
-            "RUN_TASK_STATE_FORGED",
-            "New tasks must begin in the pending assigned state without run or review results.",
-            true,
-        ));
-    }
-    Ok(())
 }
 
 fn prepare_private_database_file(path: &Path) -> PersistenceResult<()> {
@@ -3491,6 +4088,224 @@ fn next_revision(revision: i64) -> PersistenceResult<i64> {
         })
 }
 
+fn routing_error(error: crate::task_orchestration::RoutingError) -> PersistenceError {
+    PersistenceError::new(&error.code, error.message, true)
+}
+
+fn find_task_indexes(
+    state: &ApplicationState,
+    owner_agent_id: i64,
+    task_id: i64,
+) -> PersistenceResult<(usize, usize)> {
+    let owner_index = state
+        .agents
+        .iter()
+        .position(|agent| agent.id == owner_agent_id)
+        .ok_or_else(|| {
+            PersistenceError::new(
+                "TASK_OWNER_NOT_FOUND",
+                "The selected task owner no longer exists.",
+                true,
+            )
+        })?;
+    let task_index = state.agents[owner_index]
+        .tasks
+        .iter()
+        .position(|task| task.id == task_id)
+        .ok_or_else(|| {
+            PersistenceError::new(
+                "TASK_NOT_FOUND",
+                "The selected task no longer exists.",
+                true,
+            )
+        })?;
+    Ok((owner_index, task_index))
+}
+
+fn allocate_task_and_enqueue_sequence(
+    transaction: &Transaction<'_>,
+) -> PersistenceResult<(i64, i64)> {
+    let (task_id, enqueue_sequence): (i64, i64) = transaction
+        .query_row(
+            "SELECT next_task_id, next_enqueue_sequence
+             FROM task_orchestration_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(PersistenceError::database)?;
+    if task_id >= MAX_SAFE_INTEGER {
+        return Err(PersistenceError::new(
+            "TASK_ID_EXHAUSTED",
+            "No additional JavaScript-safe task identifiers are available.",
+            false,
+        ));
+    }
+    if enqueue_sequence >= MAX_SAFE_INTEGER {
+        return Err(PersistenceError::new(
+            "TASK_QUEUE_SEQUENCE_EXHAUSTED",
+            "No additional JavaScript-safe queue sequence values are available.",
+            false,
+        ));
+    }
+    transaction
+        .execute(
+            "UPDATE task_orchestration_meta
+             SET next_task_id = ?1, next_enqueue_sequence = ?2
+             WHERE singleton = 1",
+            params![task_id + 1, enqueue_sequence + 1],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok((task_id, enqueue_sequence))
+}
+
+fn allocate_enqueue_sequence(transaction: &Transaction<'_>) -> PersistenceResult<i64> {
+    let sequence: i64 = transaction
+        .query_row(
+            "SELECT next_enqueue_sequence
+             FROM task_orchestration_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    if sequence >= MAX_SAFE_INTEGER {
+        return Err(PersistenceError::new(
+            "TASK_QUEUE_SEQUENCE_EXHAUSTED",
+            "No additional JavaScript-safe queue sequence values are available.",
+            false,
+        ));
+    }
+    transaction
+        .execute(
+            "UPDATE task_orchestration_meta
+             SET next_enqueue_sequence = ?1 WHERE singleton = 1",
+            [sequence + 1],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(sequence)
+}
+
+fn finish_task_orchestration_mutation(
+    transaction: &Transaction<'_>,
+    state_revision: i64,
+) -> PersistenceResult<()> {
+    let next_state_revision = next_revision(state_revision)?;
+    let orchestration_revision: i64 = transaction
+        .query_row(
+            "SELECT revision FROM task_orchestration_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let next_orchestration_revision = next_revision(orchestration_revision)?;
+    transaction
+        .execute(
+            "UPDATE application_meta SET state_revision = ?1 WHERE singleton = 1",
+            [next_state_revision],
+        )
+        .map_err(PersistenceError::database)?;
+    transaction
+        .execute(
+            "UPDATE task_orchestration_meta SET revision = ?1 WHERE singleton = 1",
+            [next_orchestration_revision],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+fn ensure_task_has_no_active_run(
+    transaction: &Transaction<'_>,
+    owner_agent_id: i64,
+    task_id: i64,
+) -> PersistenceResult<()> {
+    let active: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM run_attempts
+                 WHERE task_owner_agent_id = ?1 AND task_id = ?2
+                   AND status IN ('admitted', 'starting', 'dispatching', 'running',
+                                  'cancel_requested')
+             )",
+            params![owner_agent_id, task_id],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    if active {
+        return Err(PersistenceError::new(
+            "TASK_QUEUE_LOCKED",
+            "The task is locked by an active run.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn expire_task_approvals(
+    transaction: &Transaction<'_>,
+    task_owner_agent_id: i64,
+    task_id: i64,
+) -> PersistenceResult<()> {
+    let timestamp = now_unix_ms()?;
+    let resolved_at = format_unix_ms(timestamp);
+    transaction
+        .execute(
+            "UPDATE approval_requests
+             SET status = 'Expired', resolved_at = COALESCE(resolved_at, ?1),
+                 resolved_at_unix_ms = COALESCE(resolved_at_unix_ms, ?2)
+             WHERE authoritative = 1 AND intent_kind = 'runTask' AND task_id = ?3
+               AND json_extract(intent_json, '$.taskOwnerAgentId') = ?4
+               AND status IN ('Pending', 'Approved')
+               AND consumed_at_unix_ms IS NULL",
+            params![resolved_at, timestamp, task_id, task_owner_agent_id],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+fn map_task_queue_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskQueueEntry> {
+    Ok(TaskQueueEntry {
+        task_owner_agent_id: row.get(0)?,
+        task_id: row.get(1)?,
+        assigned_agent_id: row.get(2)?,
+        title: row.get(3)?,
+        priority: row.get(4)?,
+        queue_state: row.get(5)?,
+        enqueue_sequence: row.get(6)?,
+        queue_position: None,
+    })
+}
+
+fn read_task_queue_entries(
+    transaction: &Transaction<'_>,
+    queue_state: &str,
+) -> PersistenceResult<Vec<TaskQueueEntry>> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT owner_agent_id, id, assigned_agent_id, title, priority,
+                    queue_state, enqueue_sequence
+             FROM agent_tasks WHERE queue_state = ?1
+             ORDER BY CASE priority
+                 WHEN 'Critical' THEN 0 WHEN 'High' THEN 1
+                 WHEN 'Normal' THEN 2 ELSE 3 END,
+                 enqueue_sequence, owner_agent_id, id",
+        )
+        .map_err(PersistenceError::database)?;
+    collect_rows(statement.query_map([queue_state], map_task_queue_entry))
+}
+
+fn read_active_task_queue_entries(
+    transaction: &Transaction<'_>,
+) -> PersistenceResult<Vec<TaskQueueEntry>> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT owner_agent_id, id, assigned_agent_id, title, priority,
+                    queue_state, enqueue_sequence
+             FROM agent_tasks WHERE queue_state IN ('admitted', 'running')
+             ORDER BY enqueue_sequence, owner_agent_id, id",
+        )
+        .map_err(PersistenceError::database)?;
+    collect_rows(statement.query_map([], map_task_queue_entry))
+}
+
 fn allocate_agent_id(transaction: &Transaction<'_>) -> PersistenceResult<i64> {
     let next_id: i64 = transaction
         .query_row(
@@ -3527,6 +4342,38 @@ fn synchronize_agent_id_allocator(
              SET next_agent_id = MAX(next_agent_id, ?1)
              WHERE singleton = 1",
             [desired],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+fn synchronize_task_orchestration_allocators(
+    transaction: &Transaction<'_>,
+    state: &ApplicationState,
+) -> PersistenceResult<()> {
+    let maximum_task_id = state
+        .agents
+        .iter()
+        .flat_map(|agent| agent.tasks.iter().map(|task| task.id))
+        .max()
+        .unwrap_or(0);
+    let maximum_enqueue_sequence = state
+        .agents
+        .iter()
+        .flat_map(|agent| agent.tasks.iter().filter_map(|task| task.enqueue_sequence))
+        .max()
+        .unwrap_or(0);
+    let next_task_id = maximum_task_id.saturating_add(1).min(MAX_SAFE_INTEGER);
+    let next_enqueue_sequence = maximum_enqueue_sequence
+        .saturating_add(1)
+        .min(MAX_SAFE_INTEGER);
+    transaction
+        .execute(
+            "UPDATE task_orchestration_meta
+             SET next_task_id = MAX(next_task_id, ?1),
+                 next_enqueue_sequence = MAX(next_enqueue_sequence, ?2)
+             WHERE singleton = 1",
+            params![next_task_id, next_enqueue_sequence],
         )
         .map_err(PersistenceError::database)?;
     Ok(())
@@ -4373,6 +5220,7 @@ fn write_application_state(
             .map_err(PersistenceError::database)?;
     }
     synchronize_agent_id_allocator(transaction, state)?;
+    synchronize_task_orchestration_allocators(transaction, state)?;
     Ok(())
 }
 
@@ -4392,11 +5240,11 @@ fn write_preferences(
               approval_expiry_minutes, default_routing_mode, review_mode,
               background_voice_enabled, voice_control_master_enabled, voice_wake_phrase,
               voice_deactivate_phrase, voice_open_phrases, voice_close_phrases,
-              voice_command_replacements, voice_state)
+              voice_command_replacements, voice_state, default_queue_threshold)
              VALUES
              (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
               ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
-              ?28, ?29, ?30)",
+              ?28, ?29, ?30, ?31)",
             params![
                 preferences.theme,
                 preferences.accent_color,
@@ -4427,7 +5275,8 @@ fn write_preferences(
                 preferences.voice_open_phrases,
                 preferences.voice_close_phrases,
                 preferences.voice_command_replacements,
-                preferences.voice_state
+                preferences.voice_state,
+                default.queue_threshold
             ],
         )
         .map_err(PersistenceError::database)?;
@@ -4461,10 +5310,11 @@ fn write_agent(
               authority_level, model, memory, strength, focus, cpu_limit, gpu_limit,
               overflow_action, redirect_agent_id, capability_files, capability_internet,
               capability_clipboard, capability_terminal, capability_system, approval_files,
-              approval_internet, approval_clipboard, approval_terminal, approval_system)
+              approval_internet, approval_clipboard, approval_terminal, approval_system,
+              queue_threshold)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                      ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
-                     ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
+                     ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)",
             params![
                 agent.id,
                 agent.template_key,
@@ -4496,7 +5346,8 @@ fn write_agent(
                 agent.approvals.internet,
                 agent.approvals.clipboard,
                 agent.approvals.terminal,
-                agent.approvals.system
+                agent.approvals.system,
+                agent.performance.queue_threshold
             ],
         )
         .map_err(PersistenceError::database)?;
@@ -4529,6 +5380,18 @@ fn write_task(
     position: usize,
     task: &AgentTask,
 ) -> PersistenceResult<()> {
+    let routing_evidence_json = task
+        .routing_evidence
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| {
+            PersistenceError::new(
+                "ROUTING_EVIDENCE_INVALID",
+                "Task routing evidence could not be normalized.",
+                false,
+            )
+        })?;
     transaction
         .execute(
             "INSERT INTO agent_tasks
@@ -4536,10 +5399,11 @@ fn write_task(
               status, phase, created_at, completed_at, result, response_id, runtime_model,
               total_tokens, workspace_id, diff, duration_seconds, routing_mode,
               routed_from_agent_id, routing_reason, review_agent_id, review_status,
-              review_result, review_model, review_duration_seconds, reviewed_at)
+              review_result, review_model, review_duration_seconds, reviewed_at,
+              queue_state, enqueue_sequence, routing_evidence_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                      ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                     ?25, ?26, ?27)",
+                     ?25, ?26, ?27, ?28, ?29, ?30)",
             params![
                 owner_agent_id,
                 task.id,
@@ -4567,7 +5431,10 @@ fn write_task(
                 task.review_result,
                 task.review_model,
                 task.review_duration_seconds,
-                task.reviewed_at
+                task.reviewed_at,
+                task.queue_state,
+                task.enqueue_sequence,
+                routing_evidence_json
             ],
         )
         .map_err(PersistenceError::database)?;
@@ -4668,7 +5535,7 @@ fn read_preferences(connection: &Connection) -> PersistenceResult<AppPreferences
                     approval_expiry_minutes, default_routing_mode, review_mode,
                     background_voice_enabled, voice_control_master_enabled, voice_wake_phrase,
                     voice_deactivate_phrase, voice_open_phrases, voice_close_phrases,
-                    voice_command_replacements, voice_state
+                    voice_command_replacements, voice_state, default_queue_threshold
              FROM preferences WHERE singleton = 1",
             [],
             |row| {
@@ -4687,6 +5554,7 @@ fn read_preferences(connection: &Connection) -> PersistenceResult<AppPreferences
                         focus: row.get(10)?,
                         cpu_limit: row.get(11)?,
                         gpu_limit: row.get(12)?,
+                        queue_threshold: row.get(30)?,
                         overflow_action: row.get(13)?,
                         redirect_agent_id: row.get(14)?,
                     },
@@ -4733,7 +5601,8 @@ fn read_agents(connection: &Connection) -> PersistenceResult<Vec<Agent>> {
                     authority_level, model, memory, strength, focus, cpu_limit, gpu_limit,
                     overflow_action, redirect_agent_id, capability_files, capability_internet,
                     capability_clipboard, capability_terminal, capability_system, approval_files,
-                    approval_internet, approval_clipboard, approval_terminal, approval_system
+                    approval_internet, approval_clipboard, approval_terminal, approval_system,
+                    queue_threshold
              FROM agents ORDER BY position",
         )
         .map_err(PersistenceError::database)?;
@@ -4761,6 +5630,7 @@ fn read_agents(connection: &Connection) -> PersistenceResult<Vec<Agent>> {
                     focus: row.get(15)?,
                     cpu_limit: row.get(16)?,
                     gpu_limit: row.get(17)?,
+                    queue_threshold: row.get(30)?,
                     overflow_action: row.get(18)?,
                     redirect_agent_id: row.get(19)?,
                 },
@@ -4798,12 +5668,25 @@ fn read_tasks(connection: &Connection, owner_agent_id: i64) -> PersistenceResult
                     created_at, completed_at, result, response_id, runtime_model, total_tokens,
                     workspace_id, diff, duration_seconds, routing_mode, routed_from_agent_id,
                     routing_reason, review_agent_id, review_status, review_result, review_model,
-                    review_duration_seconds, reviewed_at
+                    review_duration_seconds, reviewed_at, queue_state, enqueue_sequence,
+                    routing_evidence_json
              FROM agent_tasks WHERE owner_agent_id = ?1 ORDER BY position",
         )
         .map_err(PersistenceError::database)?;
     let rows = statement
         .query_map([owner_agent_id], |row| {
+            let routing_evidence_json: Option<String> = row.get(27)?;
+            let routing_evidence = routing_evidence_json
+                .map(|json| {
+                    serde_json::from_str(&json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            27,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .transpose()?;
             Ok(AgentTask {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -4825,6 +5708,9 @@ fn read_tasks(connection: &Connection, owner_agent_id: i64) -> PersistenceResult
                 routing_mode: row.get(16)?,
                 routed_from_agent_id: row.get(17)?,
                 routing_reason: row.get(18)?,
+                queue_state: row.get(25)?,
+                enqueue_sequence: row.get(26)?,
+                routing_evidence,
                 review_agent_id: row.get(19)?,
                 review_status: row.get(20)?,
                 review_result: row.get(21)?,
@@ -5006,6 +5892,10 @@ where
 mod tests {
     use super::*;
     use crate::policy::RunMode;
+    use crate::provider_runtime::{
+        catalog_provider_bindings, ollama_descriptor, ProviderAvailability, ProviderRuntimeModel,
+        ProviderRuntimeStatus,
+    };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -5051,6 +5941,77 @@ mod tests {
         }
     }
 
+    fn task_0010_provider_snapshot() -> ProviderRegistrySnapshot {
+        ProviderRegistrySnapshot {
+            providers: vec![ProviderRuntimeStatus {
+                provider: ollama_descriptor(),
+                availability: ProviderAvailability::Ready,
+                version: Some("fixture".to_string()),
+                models: vec![ProviderRuntimeModel {
+                    name: "qwen2.5-coder:7b".to_string(),
+                    capabilities: vec!["completion".to_string(), "tools".to_string()],
+                    context_length: Some(32_768),
+                    availability: ProviderAvailability::Ready,
+                    message: "Ready".to_string(),
+                }],
+                message: "Ready".to_string(),
+            }],
+            catalog_bindings: catalog_provider_bindings(),
+        }
+    }
+
+    fn configure_task_0010_repository(repository: &mut StateRepository) -> StateEnvelope {
+        let initialized = repository.initialize_fresh().unwrap();
+        let mut configured = initialized.state;
+        configured.preferences.active_ai_provider = "ollama".to_string();
+        configured.preferences.workspaces.push(WorkspaceDefinition {
+            id: "workspace-1".to_string(),
+            name: "Fixture".to_string(),
+            path: "/tmp/task-0010-fixture".to_string(),
+        });
+        configured.preferences.active_workspace_id = Some("workspace-1".to_string());
+        configured.preferences.workspace_path = "/tmp/task-0010-fixture".to_string();
+        let receipt = repository
+            .save(initialized.revision, &configured, true)
+            .unwrap();
+        let envelope = repository.load().unwrap().unwrap();
+        assert_eq!(envelope.revision, receipt.revision);
+        envelope
+    }
+
+    fn task_0010_repository() -> (StateRepository, StateEnvelope) {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        let envelope = configure_task_0010_repository(&mut repository);
+        (repository, envelope)
+    }
+
+    fn task_0010_create_request(
+        revision: i64,
+        title: &str,
+        priority: &str,
+    ) -> CreateRoutedTaskRequest {
+        CreateRoutedTaskRequest {
+            expected_revision: revision,
+            task_owner_agent_id: 1,
+            title: title.to_string(),
+            category: "Development".to_string(),
+            priority: priority.to_string(),
+            workspace_id: "workspace-1".to_string(),
+            routing_mode: "automatic".to_string(),
+            preferred_agent_id: Some(2),
+            selected_agent_id: None,
+        }
+    }
+
+    fn task_by_title<'a>(state: &'a ApplicationState, title: &str) -> &'a AgentTask {
+        state
+            .agents
+            .iter()
+            .flat_map(|agent| &agent.tasks)
+            .find(|task| task.title == title)
+            .expect("task should exist")
+    }
+
     #[test]
     fn fresh_state_has_exact_schema_and_survives_reopen() {
         let directory = TestDirectory::new();
@@ -5073,7 +6034,8 @@ mod tests {
                     (1, "initial_application_state".to_string()),
                     (2, "authoritative_approval_lifecycle".to_string()),
                     (3, "authoritative_run_coordination".to_string()),
-                    (4, "dynamic_agent_registry".to_string())
+                    (4, "dynamic_agent_registry".to_string()),
+                    (5, "authoritative_task_orchestration".to_string())
                 ]
             );
             let journal_mode: String = repository
@@ -5100,6 +6062,407 @@ mod tests {
         let reopened = repository.load().unwrap().expect("state should exist");
         assert_eq!(reopened.revision, 1);
         assert_eq!(reopened.state, expected);
+    }
+
+    #[test]
+    fn task_0010_persistence_allocates_monotonic_ids_and_orders_one_global_queue() {
+        let (mut repository, configured) = task_0010_repository();
+        let providers = task_0010_provider_snapshot();
+        let normal = repository
+            .create_routed_task(
+                task_0010_create_request(configured.revision, "Normal parser work", "Normal"),
+                &providers,
+            )
+            .unwrap();
+        let critical = repository
+            .create_routed_task(
+                task_0010_create_request(normal.revision, "Critical parser fix", "Critical"),
+                &providers,
+            )
+            .unwrap();
+
+        let normal_task = task_by_title(&critical.state, "Normal parser work");
+        let critical_task = task_by_title(&critical.state, "Critical parser fix");
+        assert_eq!((normal_task.id, normal_task.enqueue_sequence), (1, Some(1)));
+        assert_eq!(
+            (critical_task.id, critical_task.enqueue_sequence),
+            (2, Some(2))
+        );
+        assert_eq!(normal_task.assigned_agent_id, 2);
+        assert_eq!(critical_task.assigned_agent_id, 2);
+        assert!(normal_task.routing_evidence.is_some());
+
+        let snapshot = repository.task_orchestration_snapshot().unwrap();
+        assert_eq!(snapshot.execute_queue.len(), 2);
+        assert_eq!(snapshot.execute_queue[0].task_id, critical_task.id);
+        assert_eq!(snapshot.execute_queue[0].queue_position, Some(1));
+        assert_eq!(snapshot.execute_queue[1].task_id, normal_task.id);
+        assert_eq!(snapshot.execute_queue[1].queue_position, Some(2));
+        assert!(snapshot.held_tasks.is_empty());
+        assert!(snapshot.active_execute.is_none());
+    }
+
+    #[test]
+    fn task_0010_persistence_enforces_head_admission_and_hold_preserves_age() {
+        let (mut repository, configured) = task_0010_repository();
+        let providers = task_0010_provider_snapshot();
+        let normal = repository
+            .create_routed_task(
+                task_0010_create_request(configured.revision, "Normal queued task", "Normal"),
+                &providers,
+            )
+            .unwrap();
+        let critical = repository
+            .create_routed_task(
+                task_0010_create_request(normal.revision, "Critical queued task", "Critical"),
+                &providers,
+            )
+            .unwrap();
+        let normal_task = task_by_title(&critical.state, "Normal queued task").clone();
+        let critical_task = task_by_title(&critical.state, "Critical queued task").clone();
+        let normal_intent = ActionIntent::RunTask {
+            agent_id: normal_task.assigned_agent_id,
+            task_owner_agent_id: 1,
+            task_id: normal_task.id,
+            run_mode: RunMode::Execute,
+        };
+        assert_eq!(
+            repository
+                .admit_run("task-0010-non-head", &normal_intent)
+                .unwrap_err()
+                .code,
+            "QUEUE_HEAD_REQUIRED"
+        );
+
+        let held = repository
+            .set_task_queue_disposition(SetTaskQueueDispositionRequest {
+                expected_revision: critical.revision,
+                task_owner_agent_id: 1,
+                task_id: critical_task.id,
+                disposition: QueueDisposition::Hold,
+            })
+            .unwrap();
+        let held_task = task_by_title(&held.state, "Critical queued task");
+        assert_eq!(held_task.queue_state, "held");
+        assert_eq!(held_task.enqueue_sequence, critical_task.enqueue_sequence);
+        let snapshot = repository.task_orchestration_snapshot().unwrap();
+        assert_eq!(snapshot.execute_queue[0].task_id, normal_task.id);
+        assert_eq!(snapshot.held_tasks[0].task_id, critical_task.id);
+
+        let admitted = repository
+            .admit_run("task-0010-head", &normal_intent)
+            .unwrap();
+        assert_eq!(
+            task_by_title(&admitted.application_state, "Normal queued task").queue_state,
+            "admitted"
+        );
+    }
+
+    #[test]
+    fn task_0010_persistence_failure_and_cancellation_preserve_safe_queue_recovery() {
+        let (mut repository, configured) = task_0010_repository();
+        let providers = task_0010_provider_snapshot();
+        let high = repository
+            .create_routed_task(
+                task_0010_create_request(configured.revision, "Head task", "High"),
+                &providers,
+            )
+            .unwrap();
+        let second = repository
+            .create_routed_task(
+                task_0010_create_request(high.revision, "Later task", "Normal"),
+                &providers,
+            )
+            .unwrap();
+        let head_task = task_by_title(&second.state, "Head task").clone();
+        let later_task = task_by_title(&second.state, "Later task").clone();
+        let head_intent = ActionIntent::RunTask {
+            agent_id: head_task.assigned_agent_id,
+            task_owner_agent_id: 1,
+            task_id: head_task.id,
+            run_mode: RunMode::Execute,
+        };
+        let later_intent = ActionIntent::RunTask {
+            agent_id: later_task.assigned_agent_id,
+            task_owner_agent_id: 1,
+            task_id: later_task.id,
+            run_mode: RunMode::Execute,
+        };
+        let admitted = repository
+            .admit_run("task-0010-head-failure", &head_intent)
+            .unwrap();
+        assert_eq!(
+            repository
+                .admit_run("task-0010-parallel", &later_intent)
+                .unwrap_err()
+                .code,
+            "RUN_BUSY"
+        );
+        repository
+            .complete_run(
+                admitted.attempt.id,
+                &RunCompletion::terminal_error(
+                    RunAttemptStatus::StartupFailed,
+                    "PROVIDER_START_FAILED",
+                    "Provider startup failed before dispatch.",
+                    0,
+                ),
+            )
+            .unwrap();
+
+        let snapshot = repository.task_orchestration_snapshot().unwrap();
+        assert_eq!(snapshot.execute_queue[0].task_id, head_task.id);
+        assert_eq!(
+            snapshot.execute_queue[0].enqueue_sequence,
+            head_task.enqueue_sequence.unwrap()
+        );
+        assert_eq!(
+            repository
+                .admit_run("task-0010-skip-failed-head", &later_intent)
+                .unwrap_err()
+                .code,
+            "QUEUE_HEAD_REQUIRED"
+        );
+
+        let cancelled_before_dispatch = repository
+            .admit_run("task-0010-cancel-before-dispatch", &head_intent)
+            .unwrap();
+        repository
+            .request_run_cancellation(cancelled_before_dispatch.attempt.id)
+            .unwrap();
+        repository
+            .complete_run(
+                cancelled_before_dispatch.attempt.id,
+                &RunCompletion::terminal_error(
+                    RunAttemptStatus::Cancelled,
+                    "RUN_CANCELLED",
+                    "Cancelled before provider dispatch.",
+                    0,
+                ),
+            )
+            .unwrap();
+        let safely_requeued = repository.task_orchestration_snapshot().unwrap();
+        assert_eq!(safely_requeued.execute_queue[0].task_id, head_task.id);
+        assert_eq!(
+            safely_requeued.execute_queue[0].enqueue_sequence,
+            head_task.enqueue_sequence.unwrap()
+        );
+
+        let cancelled_during_dispatch = repository
+            .admit_run("task-0010-cancel-during-dispatch", &head_intent)
+            .unwrap();
+        repository
+            .prepare_run_attempt(
+                cancelled_during_dispatch.attempt.id,
+                "Ollama",
+                "qwen2.5-coder:7b",
+                None,
+            )
+            .unwrap();
+        repository
+            .mark_run_dispatching(cancelled_during_dispatch.attempt.id)
+            .unwrap();
+        repository
+            .request_run_cancellation(cancelled_during_dispatch.attempt.id)
+            .unwrap();
+        repository
+            .complete_run(
+                cancelled_during_dispatch.attempt.id,
+                &RunCompletion::terminal_error(
+                    RunAttemptStatus::Cancelled,
+                    "RUN_CANCELLED",
+                    "Cancelled after provider dispatch became uncertain.",
+                    0,
+                ),
+            )
+            .unwrap();
+        let held_after_uncertain_dispatch = repository.task_orchestration_snapshot().unwrap();
+        assert_eq!(
+            held_after_uncertain_dispatch.held_tasks[0].task_id,
+            head_task.id
+        );
+        assert_eq!(
+            held_after_uncertain_dispatch.held_tasks[0].enqueue_sequence,
+            head_task.enqueue_sequence.unwrap()
+        );
+        assert!(repository
+            .admit_run("task-0010-next-after-hold", &later_intent)
+            .is_ok());
+    }
+
+    #[test]
+    fn task_0010_persistence_stale_create_rolls_back_allocator_and_renderer_cannot_forge_tasks() {
+        let (mut repository, configured) = task_0010_repository();
+        let providers = task_0010_provider_snapshot();
+        let first = repository
+            .create_routed_task(
+                task_0010_create_request(configured.revision, "First task", "Normal"),
+                &providers,
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .create_routed_task(
+                    task_0010_create_request(configured.revision, "Stale task", "Normal"),
+                    &providers,
+                )
+                .unwrap_err()
+                .code,
+            "REVISION_CONFLICT"
+        );
+        let second = repository
+            .create_routed_task(
+                task_0010_create_request(first.revision, "Second task", "Normal"),
+                &providers,
+            )
+            .unwrap();
+        assert_eq!(task_by_title(&second.state, "Second task").id, 2);
+
+        let mut forged = second.state.clone();
+        let task = forged
+            .agents
+            .iter_mut()
+            .flat_map(|agent| &mut agent.tasks)
+            .find(|task| task.title == "First task")
+            .unwrap();
+        task.assigned_agent_id = 1;
+        assert_eq!(
+            repository
+                .save(second.revision, &forged, false)
+                .unwrap_err()
+                .code,
+            "TASK_ORCHESTRATION_AUTHORITY_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn task_0010_persistence_reopens_queue_order_override_evidence_and_allocators() {
+        let directory = TestDirectory::new();
+        let path = directory.database_path();
+        let providers = task_0010_provider_snapshot();
+        let expected_snapshot;
+        {
+            let mut repository = StateRepository::open(&path).unwrap();
+            let configured = configure_task_0010_repository(&mut repository);
+            let mut selected =
+                task_0010_create_request(configured.revision, "Selected task", "Normal");
+            selected.routing_mode = "selected".to_string();
+            selected.selected_agent_id = Some(2);
+            let selected_state = repository.create_routed_task(selected, &providers).unwrap();
+            let critical = repository
+                .create_routed_task(
+                    task_0010_create_request(selected_state.revision, "Critical task", "Critical"),
+                    &providers,
+                )
+                .unwrap();
+            let selected_task = task_by_title(&critical.state, "Selected task");
+            assert_eq!(
+                selected_task
+                    .routing_evidence
+                    .as_ref()
+                    .map(|evidence| evidence.outcome_code.as_str()),
+                Some("MANUAL_SELECTION")
+            );
+            assert!(selected_task
+                .routing_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.manual_override));
+            expected_snapshot = repository.task_orchestration_snapshot().unwrap();
+        }
+
+        let mut reopened = StateRepository::open(&path).unwrap();
+        let reopened_snapshot = reopened.task_orchestration_snapshot().unwrap();
+        assert_eq!(reopened_snapshot, expected_snapshot);
+        let envelope = reopened.load().unwrap().unwrap();
+        assert!(task_by_title(&envelope.state, "Selected task")
+            .routing_evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.manual_override));
+        let third = reopened
+            .create_routed_task(
+                task_0010_create_request(envelope.revision, "Third task", "Low"),
+                &providers,
+            )
+            .unwrap();
+        let task = task_by_title(&third.state, "Third task");
+        assert_eq!((task.id, task.enqueue_sequence), (3, Some(3)));
+    }
+
+    #[test]
+    fn task_0010_persistence_reroute_preserves_age_and_terminal_reset_allocates_new_age() {
+        let (mut repository, configured) = task_0010_repository();
+        let providers = task_0010_provider_snapshot();
+        let created = repository
+            .create_routed_task(
+                task_0010_create_request(configured.revision, "Lifecycle task", "Normal"),
+                &providers,
+            )
+            .unwrap();
+        let original = task_by_title(&created.state, "Lifecycle task").clone();
+        let rerouted = repository
+            .reroute_task(
+                RerouteTaskRequest {
+                    expected_revision: created.revision,
+                    task_owner_agent_id: 1,
+                    task_id: original.id,
+                    title: original.title.clone(),
+                    category: original.category.clone(),
+                    priority: original.priority.clone(),
+                    workspace_id: original.workspace_id.clone().unwrap(),
+                    routing_mode: "selected".to_string(),
+                    preferred_agent_id: Some(2),
+                    selected_agent_id: Some(2),
+                },
+                &providers,
+            )
+            .unwrap();
+        let rerouted_task = task_by_title(&rerouted.state, "Lifecycle task");
+        assert_eq!(rerouted_task.enqueue_sequence, original.enqueue_sequence);
+        assert!(rerouted_task
+            .routing_evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.manual_override));
+
+        let intent = ActionIntent::RunTask {
+            agent_id: rerouted_task.assigned_agent_id,
+            task_owner_agent_id: 1,
+            task_id: rerouted_task.id,
+            run_mode: RunMode::Execute,
+        };
+        let attempt = repository.admit_run("task-0010-reset", &intent).unwrap();
+        repository
+            .prepare_run_attempt(attempt.attempt.id, "Ollama", "qwen2.5-coder:7b", None)
+            .unwrap();
+        repository.mark_run_dispatching(attempt.attempt.id).unwrap();
+        repository.mark_run_started(attempt.attempt.id).unwrap();
+        repository
+            .complete_run(
+                attempt.attempt.id,
+                &RunCompletion::terminal_error(
+                    RunAttemptStatus::Failed,
+                    "TASK_FAILED",
+                    "The task failed after dispatch.",
+                    3,
+                ),
+            )
+            .unwrap();
+        let completed = repository.load().unwrap().unwrap();
+        let completed_task = task_by_title(&completed.state, "Lifecycle task");
+        assert_eq!(completed_task.queue_state, "notQueued");
+        assert_eq!(completed_task.enqueue_sequence, None);
+
+        let reset = repository
+            .set_task_queue_disposition(SetTaskQueueDispositionRequest {
+                expected_revision: completed.revision,
+                task_owner_agent_id: 1,
+                task_id: completed_task.id,
+                disposition: QueueDisposition::ResetTerminal,
+            })
+            .unwrap();
+        let reset_task = task_by_title(&reset.state, "Lifecycle task");
+        assert_eq!(reset_task.queue_state, "queued");
+        assert_eq!(reset_task.status, "Pending");
+        assert!(reset_task.enqueue_sequence > original.enqueue_sequence);
     }
 
     #[test]
@@ -5309,9 +6672,7 @@ mod tests {
             "AGENT_REGISTRY_MUTATION_REQUIRED"
         );
 
-        let receipt = repository
-            .save(initialized.revision, &authorization_state(), true)
-            .unwrap();
+        let receipt = install_authorization_fixture(&mut repository, initialized.revision);
         let deleted = repository
             .delete_agent(DeleteAgentRequest {
                 expected_revision: receipt.revision,
@@ -5690,6 +7051,9 @@ mod tests {
             routing_mode: "selected".to_string(),
             routed_from_agent_id: None,
             routing_reason: None,
+            queue_state: "queued".to_string(),
+            enqueue_sequence: Some(1),
+            routing_evidence: None,
             review_agent_id: None,
             review_status: "Not Requested".to_string(),
             review_result: None,
@@ -5709,12 +7073,41 @@ mod tests {
         }
     }
 
+    fn install_authorization_fixture(
+        repository: &mut StateRepository,
+        expected_revision: i64,
+    ) -> StateEnvelope {
+        let state = authorization_state();
+        let transaction = repository
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let meta = application_meta_from(&transaction).unwrap();
+        ensure_expected_revision(&meta, expected_revision).unwrap();
+        write_application_state(
+            &transaction,
+            &state,
+            "renderer_prototype",
+            &HashMap::new(),
+            false,
+        )
+        .unwrap();
+        let revision = next_revision(meta.state_revision).unwrap();
+        transaction
+            .execute(
+                "UPDATE application_meta SET state_revision = ?1 WHERE singleton = 1",
+                [revision],
+            )
+            .unwrap();
+        advance_task_orchestration_revision(&transaction).unwrap();
+        transaction.commit().unwrap();
+        repository.load().unwrap().unwrap()
+    }
+
     fn initialized_authorization_repository() -> StateRepository {
         let mut repository = StateRepository::open_in_memory().unwrap();
         let initialized = repository.initialize_fresh().unwrap();
-        repository
-            .save(initialized.revision, &authorization_state(), true)
-            .unwrap();
+        install_authorization_fixture(&mut repository, initialized.revision);
         repository
     }
 
@@ -5854,9 +7247,7 @@ mod tests {
         let path = directory.database_path();
         let mut first = StateRepository::open(&path).unwrap();
         let initialized = first.initialize_fresh().unwrap();
-        first
-            .save(initialized.revision, &authorization_state(), true)
-            .unwrap();
+        install_authorization_fixture(&mut first, initialized.revision);
         let intent = authorization_intent();
         approve_authorization(&mut first, &intent);
         let second = StateRepository::open(&path).unwrap();
@@ -6029,6 +7420,15 @@ mod tests {
             .unwrap();
         assert!(consumed.is_some());
 
+        let queue_revision = repository.load().unwrap().unwrap().revision;
+        repository
+            .set_task_queue_disposition(SetTaskQueueDispositionRequest {
+                expected_revision: queue_revision,
+                task_owner_agent_id: 2,
+                task_id: 41,
+                disposition: QueueDisposition::Resume,
+            })
+            .unwrap();
         let approval_id = approve_authorization(&mut repository, &intent);
         let timeout = repository.admit_run("timeout", &intent).unwrap();
         repository
@@ -6135,9 +7535,7 @@ mod tests {
         {
             let mut repository = StateRepository::open(&safe_path).unwrap();
             let initialized = repository.initialize_fresh().unwrap();
-            repository
-                .save(initialized.revision, &authorization_state(), true)
-                .unwrap();
+            install_authorization_fixture(&mut repository, initialized.revision);
             let intent = authorization_intent();
             safe_approval = approve_authorization(&mut repository, &intent);
             let attempt = repository.admit_run("safe-restart", &intent).unwrap();
@@ -6165,9 +7563,7 @@ mod tests {
         {
             let mut repository = StateRepository::open(&uncertain_path).unwrap();
             let initialized = repository.initialize_fresh().unwrap();
-            repository
-                .save(initialized.revision, &authorization_state(), true)
-                .unwrap();
+            install_authorization_fixture(&mut repository, initialized.revision);
             let intent = authorization_intent();
             uncertain_approval = approve_authorization(&mut repository, &intent);
             let attempt = repository.admit_run("uncertain-restart", &intent).unwrap();
@@ -6249,7 +7645,7 @@ mod tests {
         drop(connection);
 
         let repository = StateRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 4);
+        assert_eq!(repository.schema_version().unwrap(), 5);
         let upgraded: (String, i64, String) = repository
             .connection
             .query_row(
@@ -6378,7 +7774,21 @@ mod tests {
             )
             .unwrap();
         repository
-            .save(envelope.revision, &changed_task, false)
+            .reroute_task(
+                RerouteTaskRequest {
+                    expected_revision: envelope.revision,
+                    task_owner_agent_id: 2,
+                    task_id: 41,
+                    title: changed_task.agents[1].tasks[0].title.clone(),
+                    category: "Development".to_string(),
+                    priority: "Normal".to_string(),
+                    workspace_id: "workspace-authorization".to_string(),
+                    routing_mode: "selected".to_string(),
+                    preferred_agent_id: Some(2),
+                    selected_agent_id: Some(2),
+                },
+                &task_0010_provider_snapshot(),
+            )
             .unwrap();
         assert_eq!(
             repository.authorize_intent(&intent).unwrap_err().code,

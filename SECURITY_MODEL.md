@@ -11,8 +11,10 @@
 > Linux descendant cleanup. TASK-0008 adds fixed-loopback Ollama transport,
 > bounded discovery and cancellation, and descriptor-confined conflict-safe
 > workspace tools. TASK-0009 adds backend-authoritative agent identity,
-> lifecycle, role-derived authority, and reporting validation; later tasks
-> still own voice semantics, packaging, and live acceptance.
+> lifecycle, role-derived authority, and reporting validation. TASK-0010 adds
+> backend-authoritative task routing, routing evidence, durable queue order,
+> and execute-head admission; later tasks still own structured review, voice
+> semantics, packaging, and live acceptance.
 
 ## Security objective
 
@@ -41,7 +43,7 @@ when stored locally.
 | React renderer/WebView | Untrusted for authorization; may be compromised or hold stale/tampered state |
 | Imported backup and <code>localStorage</code> | Untrusted serialized input requiring validation and migration |
 | Tauri IPC | Untrusted request boundary; backend must authenticate semantics, not just types |
-| Rust backend | Authoritative agent registry, approval/action-policy, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
+| Rust backend | Authoritative agent registry, task routing/queue, approval/action-policy, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
 | Codex/Ollama output | Untrusted content and action proposals |
 | Selected workspace | Sensitive bounded filesystem root |
 | External/local provider process | Separate process/service with its own failure and trust model |
@@ -123,10 +125,20 @@ Static inspection and deterministic tests found these implemented controls:
   reappearing;
 - policy, routing, review, voice, approval, reminder, dashboard, and settings
   projections that exclude non-active agent identities;
+- deterministic routing that hard-filters inactive/paused, workspace,
+  capability, provider/model, and Ollama-tool-ineligible candidates; records
+  score components, workload, disqualifications, winner, reason, and manual
+  override; and never lets selected routing bypass a hard filter;
+- dedicated revision-checked task creation/rerouting/hold/resume/reset IPC,
+  with generic renderer saves unable to create, remove, relocate, reroute, or
+  forge executor, queue, lifecycle, and routing-evidence state;
 - schema-versioned SQLite persistence with foreign keys, integrity checks,
   explicit migration evidence, atomic writes, and stale-revision rejection;
-- immediate-transaction admission of at most one execute/review attempt across
-  all renderer entry points, with deterministic no-queue rejection;
+- one durable global execute queue ordered by priority, monotonic enqueue
+  sequence, owner ID, and task ID, with queue age preserved across hold,
+  reroute, and pre-dispatch failure;
+- immediate-transaction admission of only the execute-queue head and at most
+  one execute/review attempt across all renderer entry points;
 - legal backend-only run transitions, immutable terminal attempts, bounded
   progress/output/evidence, explicit truncation metadata, and continuous
   terminal-history pruning;
@@ -153,7 +165,8 @@ Static inspection and deterministic tests found these implemented controls:
 These controls establish the TASK-0004 authorization boundary, TASK-0005
 run-coordination boundary, TASK-0006 provider-identity boundary, TASK-0007
 Codex process/protocol boundary, TASK-0008 Ollama transport/workspace-tool
-boundary, and TASK-0009 agent-registry boundary. They do not establish
+boundary, TASK-0009 agent-registry boundary, and TASK-0010 routing/queue
+boundary. They do not establish
 production readiness or the later live provider/platform guarantees.
 
 ## Known current gaps
@@ -212,21 +225,24 @@ workspace tools fail closed outside Linux.
 
 ### Verification coverage
 
-The checked-in non-live suite contains 39 frontend tests and 93 Rust tests. It
+The checked-in non-live suite contains 41 frontend tests and 105 Rust tests. It
 covers frontend characterization plus backend policy, authorization, run
 coordination/recovery/bounds, provider identity/fake-adapter dispatch, Codex
 compatibility/command/protocol/descendant-process cases, strict IPC,
 CSP/capability, Ollama fake-server transport/discovery/cancellation, safe
 workspace operations, agent CRUD/reopen/template/lifecycle/hierarchy behavior,
-persistence validation, migration, corruption, concurrency, and rollback
+routing eligibility/scoring/overflow evidence, global queue ordering/head
+admission/restart/recovery, persistence validation, migration, corruption,
+concurrency, and rollback
 cases. These checks do not establish end-to-end,
 packaging, upgrade, or live acceptance. Rust advisory status remains
 indeterminate when <code>cargo-audit</code> is unavailable.
 
 ## Target security invariants
 
-The agent-registry subset of invariant 1, the approval/action subset of
-invariants 2 through 5, the coordinator subset
+The agent-registry and task-orchestration subsets of invariant 1, the
+approval/action subset of invariants 2 through 5, the typed-routing-input
+subset of invariant 2, the queue/coordinator subset
 of invariant 6, the Ollama workspace subset of invariant 7, and the
 provider-identity/no-substitution plus Codex/Ollama adapter subsets of invariant
 8 are implemented for the current command surface. The full integrated

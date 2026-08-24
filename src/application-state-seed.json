@@ -17,7 +17,7 @@
       "memory": "",
       "tasks": [],
       "activity": [],
-      "performance": { "strength": 8, "focus": "strength", "cpuLimit": 80, "gpuLimit": 60, "overflowAction": "queue", "redirectAgentId": null },
+      "performance": { "strength": 8, "focus": "strength", "cpuLimit": 80, "gpuLimit": 60, "queueThreshold": 10, "overflowAction": "queue", "redirectAgentId": null },
       "capabilities": { "files": "full", "internet": "read", "clipboard": "write", "terminal": "user", "system": "notifications" },
       "approvals": { "files": "ask", "internet": "ask", "clipboard": "allow", "terminal": "ask", "system": "ask" }
     },
@@ -38,7 +38,7 @@
       "memory": "",
       "tasks": [],
       "activity": [],
-      "performance": { "strength": 8, "focus": "balanced", "cpuLimit": 85, "gpuLimit": 70, "overflowAction": "redirect", "redirectAgentId": 3 },
+      "performance": { "strength": 8, "focus": "balanced", "cpuLimit": 85, "gpuLimit": 70, "queueThreshold": 10, "overflowAction": "redirect", "redirectAgentId": 3 },
       "capabilities": { "files": "write", "internet": "read", "clipboard": "write", "terminal": "safe", "system": "none" },
       "approvals": { "files": "allow", "internet": "ask", "clipboard": "allow", "terminal": "ask", "system": "deny" }
     },
@@ -59,7 +59,7 @@
       "memory": "",
       "tasks": [],
       "activity": [],
-      "performance": { "strength": 7, "focus": "strength", "cpuLimit": 75, "gpuLimit": 60, "overflowAction": "redirect", "redirectAgentId": 1 },
+      "performance": { "strength": 7, "focus": "strength", "cpuLimit": 75, "gpuLimit": 60, "queueThreshold": 10, "overflowAction": "redirect", "redirectAgentId": 1 },
       "capabilities": { "files": "read", "internet": "none", "clipboard": "read", "terminal": "safe", "system": "none" },
       "approvals": { "files": "ask", "internet": "deny", "clipboard": "ask", "terminal": "ask", "system": "deny" }
     },
@@ -80,7 +80,7 @@
       "memory": "",
       "tasks": [],
       "activity": [],
-      "performance": { "strength": 4, "focus": "speed", "cpuLimit": 45, "gpuLimit": 10, "overflowAction": "redirect", "redirectAgentId": 1 },
+      "performance": { "strength": 4, "focus": "speed", "cpuLimit": 45, "gpuLimit": 10, "queueThreshold": 10, "overflowAction": "redirect", "redirectAgentId": 1 },
       "capabilities": { "files": "none", "internet": "read", "clipboard": "read", "terminal": "none", "system": "none" },
       "approvals": { "files": "deny", "internet": "ask", "clipboard": "ask", "terminal": "deny", "system": "deny" }
     },
@@ -101,7 +101,7 @@
       "memory": "",
       "tasks": [],
       "activity": [],
-      "performance": { "strength": 5, "focus": "balanced", "cpuLimit": 55, "gpuLimit": 25, "overflowAction": "redirect", "redirectAgentId": 1 },
+      "performance": { "strength": 5, "focus": "balanced", "cpuLimit": 55, "gpuLimit": 25, "queueThreshold": 10, "overflowAction": "redirect", "redirectAgentId": 1 },
       "capabilities": { "files": "read", "internet": "none", "clipboard": "none", "terminal": "none", "system": "none" },
       "approvals": { "files": "ask", "internet": "deny", "clipboard": "deny", "terminal": "deny", "system": "deny" }
     },
@@ -122,7 +122,7 @@
       "memory": "",
       "tasks": [],
       "activity": [],
-      "performance": { "strength": 8, "focus": "strength", "cpuLimit": 75, "gpuLimit": 55, "overflowAction": "queue", "redirectAgentId": null },
+      "performance": { "strength": 8, "focus": "strength", "cpuLimit": 75, "gpuLimit": 55, "queueThreshold": 10, "overflowAction": "queue", "redirectAgentId": null },
       "capabilities": { "files": "read", "internet": "none", "clipboard": "none", "terminal": "safe", "system": "none" },
       "approvals": { "files": "ask", "internet": "deny", "clipboard": "deny", "terminal": "ask", "system": "deny" }
     },
@@ -143,7 +143,7 @@
       "memory": "",
       "tasks": [],
       "activity": [],
-      "performance": { "strength": 5, "focus": "speed", "cpuLimit": 50, "gpuLimit": 15, "overflowAction": "redirect", "redirectAgentId": 1 },
+      "performance": { "strength": 5, "focus": "speed", "cpuLimit": 50, "gpuLimit": 15, "queueThreshold": 10, "overflowAction": "redirect", "redirectAgentId": 1 },
       "capabilities": { "files": "read", "internet": "none", "clipboard": "read", "terminal": "none", "system": "notifications" },
       "approvals": { "files": "ask", "internet": "deny", "clipboard": "ask", "terminal": "deny", "system": "ask" }
     },
@@ -164,7 +164,7 @@
       "memory": "",
       "tasks": [],
       "activity": [],
-      "performance": { "strength": 4, "focus": "speed", "cpuLimit": 45, "gpuLimit": 10, "overflowAction": "queue", "redirectAgentId": null },
+      "performance": { "strength": 4, "focus": "speed", "cpuLimit": 45, "gpuLimit": 10, "queueThreshold": 10, "overflowAction": "queue", "redirectAgentId": null },
       "capabilities": { "files": "read", "internet": "none", "clipboard": "none", "terminal": "none", "system": "notifications" },
       "approvals": { "files": "ask", "internet": "deny", "clipboard": "deny", "terminal": "deny", "system": "ask" }
     },
@@ -185,7 +185,7 @@
       "memory": "",
       "tasks": [],
       "activity": [],
-      "performance": { "strength": 7, "focus": "strength", "cpuLimit": 70, "gpuLimit": 45, "overflowAction": "queue", "redirectAgentId": null },
+      "performance": { "strength": 7, "focus": "strength", "cpuLimit": 70, "gpuLimit": 45, "queueThreshold": 10, "overflowAction": "queue", "redirectAgentId": null },
       "capabilities": { "files": "read", "internet": "read", "clipboard": "read", "terminal": "none", "system": "none" },
       "approvals": { "files": "ask", "internet": "ask", "clipboard": "ask", "terminal": "deny", "system": "deny" }
     },
@@ -206,7 +206,7 @@
       "memory": "",
       "tasks": [],
       "activity": [],
-      "performance": { "strength": 7, "focus": "balanced", "cpuLimit": 65, "gpuLimit": 35, "overflowAction": "queue", "redirectAgentId": null },
+      "performance": { "strength": 7, "focus": "balanced", "cpuLimit": 65, "gpuLimit": 35, "queueThreshold": 10, "overflowAction": "queue", "redirectAgentId": null },
       "capabilities": { "files": "read", "internet": "read", "clipboard": "none", "terminal": "none", "system": "none" },
       "approvals": { "files": "ask", "internet": "ask", "clipboard": "deny", "terminal": "deny", "system": "deny" }
     },
@@ -227,7 +227,7 @@
       "memory": "",
       "tasks": [],
       "activity": [],
-      "performance": { "strength": 7, "focus": "balanced", "cpuLimit": 65, "gpuLimit": 35, "overflowAction": "queue", "redirectAgentId": null },
+      "performance": { "strength": 7, "focus": "balanced", "cpuLimit": 65, "gpuLimit": 35, "queueThreshold": 10, "overflowAction": "queue", "redirectAgentId": null },
       "capabilities": { "files": "read", "internet": "none", "clipboard": "read", "terminal": "none", "system": "notifications" },
       "approvals": { "files": "ask", "internet": "deny", "clipboard": "ask", "terminal": "deny", "system": "ask" }
     }
@@ -254,7 +254,7 @@
     "defaultAgentStatus": "Waiting",
     "defaultTaskCategory": "General",
     "defaultTaskPriority": "Normal",
-    "defaultPerformance": { "strength": 5, "focus": "balanced", "cpuLimit": 70, "gpuLimit": 50, "overflowAction": "queue", "redirectAgentId": null },
+    "defaultPerformance": { "strength": 5, "focus": "balanced", "cpuLimit": 70, "gpuLimit": 50, "queueThreshold": 10, "overflowAction": "queue", "redirectAgentId": null },
     "workspacePath": "",
     "workspaces": [],
     "activeWorkspaceId": null,

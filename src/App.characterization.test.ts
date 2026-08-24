@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  executionRouteForTask,
   normalizeApprovalRequest,
   normalizePerformance,
   normalizePreferences,
@@ -135,71 +134,6 @@ describe("approval normalization characterization", () => {
   });
 });
 
-describe("routing characterization", () => {
-  it("prefers matching specialist capabilities over an unrelated preferred agent", () => {
-    const developmentAgent = agentFixture({
-      id: 4,
-      name: "Development Specialist",
-      category: "Development",
-      role: "Specialist",
-      capabilities: { files: "write", terminal: "user" },
-    });
-    const preferredManager = agentFixture({
-      id: 8,
-      name: "Preferred Manager",
-      category: "Management",
-      role: "Supervisor",
-      authorityLevel: 4,
-    });
-
-    const route = executionRouteForTask(
-      [preferredManager, developmentAgent],
-      registeredModels,
-      "Development",
-      preferredManager.id,
-      "codex",
-      readyProviderRegistry,
-    );
-
-    expect(route?.agent.id).toBe(developmentAgent.id);
-    expect(route?.reason).toBe(
-      "Development Specialist was selected for Development expertise and current availability.",
-    );
-  });
-
-  it("excludes paused and unregistered-model agents", () => {
-    const route = executionRouteForTask(
-      [
-        agentFixture({ status: "Paused" }),
-        agentFixture({ id: 2, model: "missing-model" }),
-      ],
-      registeredModels,
-      "General",
-      1,
-      "codex",
-      readyProviderRegistry,
-    );
-
-    expect(route).toBeNull();
-  });
-
-  it("breaks equal routing scores by the lowest agent id", () => {
-    const route = executionRouteForTask(
-      [
-        agentFixture({ id: 9, name: "Later Agent", category: "General" }),
-        agentFixture({ id: 2, name: "Earlier Agent", category: "General" }),
-      ],
-      registeredModels,
-      "General",
-      99,
-      "codex",
-      readyProviderRegistry,
-    );
-
-    expect(route?.agent.id).toBe(2);
-  });
-});
-
 describe("review routing characterization", () => {
   it("selects the matching available senior reviewer", () => {
     const owner = agentFixture({ id: 1 });
@@ -269,6 +203,7 @@ describe("stored-value normalization characterization", () => {
       focus: "balanced",
       cpuLimit: 10,
       gpuLimit: 100,
+      queueThreshold: 10,
       overflowAction: "redirect",
       redirectAgentId: 7,
     });

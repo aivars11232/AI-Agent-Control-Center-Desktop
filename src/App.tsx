@@ -58,6 +58,7 @@ import {
   bootstrapDesktopApplicationState,
   persistenceErrorMessage,
   type InvokeFunction,
+  type TaskOrchestrationCommand,
 } from "./persistence";
 import { interpretVoiceCommand } from "./voiceCommand";
 import {
@@ -90,6 +91,14 @@ import {
   type AgentGroup,
   type AgentRegistrySnapshot,
 } from "./agentRegistry";
+import {
+  emptyTaskOrchestrationSnapshot,
+  queueEntryForTask,
+  queueStateLabel,
+  taskCanEnterExecuteSlot,
+  type RoutingEvidence,
+  type TaskOrchestrationSnapshot,
+} from "./taskOrchestration";
 import logoUrl from "../AI-Agents.png";
 import "./App.css";
 
@@ -251,6 +260,11 @@ type Page =
   | "Models"
   | "Settings";
 
+type TaskOrchestrationMutation = (
+  command: TaskOrchestrationCommand,
+  request: Record<string, unknown>,
+) => Promise<void>;
+
 const pages: Page[] = [
   "Dashboard",
   "Agents",
@@ -266,12 +280,14 @@ const pages: Page[] = [
 function DashboardPage({
   agents,
   approvalRequests,
+  taskOrchestration,
   onOpenAgents,
   onOpenTasks,
   onOpenApprovals,
 }: {
   agents: Agent[];
   approvalRequests: ApprovalRequest[];
+  taskOrchestration: TaskOrchestrationSnapshot;
   onOpenAgents: () => void;
   onOpenTasks: () => void;
   onOpenApprovals: () => void;
@@ -289,32 +305,26 @@ function DashboardPage({
     0,
   );
 
-  const waitingTaskCount = agents.reduce(
-    (total, agent) =>
-      total +
-      agent.tasks.filter((task) => task.status === "Pending").length,
-    0,
-  );
+  const waitingTaskCount = taskOrchestration.executeQueue.length;
 
   const totalActivityCount = agents.reduce(
     (total, agent) => total + agent.activity.length,
     0,
   );
 
-  const supervisorQueue = agents
-    .flatMap((agent) =>
-      agent.tasks
-        .filter(
-          (task) =>
-            task.status === "Blocked" ||
-            task.status === "Under Review" ||
-            task.status === "Pending",
-        )
-        .map((task) => ({ task, agent })),
-    )
-    .sort((left, right) => {
-      const priority = { Critical: 0, High: 1, Normal: 2, Low: 3 };
-      return priority[left.task.priority] - priority[right.task.priority];
+  const supervisorQueue = [
+    ...(taskOrchestration.activeExecute
+      ? [taskOrchestration.activeExecute]
+      : []),
+    ...taskOrchestration.executeQueue,
+    ...taskOrchestration.heldTasks,
+  ]
+    .flatMap((entry) => {
+      const owner = agents.find(
+        (agent) => agent.id === entry.taskOwnerAgentId,
+      );
+      const task = owner?.tasks.find((item) => item.id === entry.taskId);
+      return owner && task ? [{ entry, owner, task }] : [];
     })
     .slice(0, 8);
   const pendingApprovalCount = approvalRequests.filter(
@@ -384,10 +394,10 @@ function DashboardPage({
       <section className="panel">
         <div className="panel-heading">
           <div>
-            <span className="eyebrow">SUPERVISOR QUEUE</span>
-            <h2>Needs attention</h2>
+            <span className="eyebrow">AUTHORITATIVE EXECUTE QUEUE</span>
+            <h2>Sequential work</h2>
             <p className="page-message">
-              Prioritized work that needs delegation, review, or human authorization.
+              Backend admission order, the active execute slot, and held work.
             </p>
           </div>
 
@@ -405,34 +415,41 @@ function DashboardPage({
 
         {supervisorQueue.length === 0 ? (
           <p className="page-message">
-            No pending, blocked, or under-review work needs attention.
+            No work is active, queued, or held.
           </p>
         ) : (
           <div className="agent-list">
-            {supervisorQueue.map(({ task, agent }) => (
-              <article className="agent-card" key={`${agent.id}-${task.id}`}>
+            {supervisorQueue.map(({ entry, task, owner }) => (
+              <article className="agent-card" key={`${owner.id}-${task.id}`}>
                 <div>
                   <h3>{task.title}</h3>
                   <p>
-                    {agent.name} · {task.category} · {task.priority} priority
+                    Owner: {owner.name} · Executor:{" "}
+                    {agents.find(
+                      (agent) => agent.id === entry.assignedAgentId,
+                    )?.name ?? "Unknown agent"}
                   </p>
                   <small>
-                    Phase: {task.phase}
-                    {task.reviewStatus !== "Not Requested"
-                      ? ` · Review: ${task.reviewStatus}`
-                      : ""}
+                    {task.priority} priority · {queueStateLabel(entry)}
                   </small>
                 </div>
                 <span
                   className={`agent-status ${
-                    task.status === "Blocked"
+                    entry.queueState === "held"
                       ? "paused"
-                      : task.status === "Under Review"
+                      : entry.queueState === "running" ||
+                          entry.queueState === "admitted"
                         ? "working"
                         : "waiting"
                   }`}
                 >
-                  {task.status}
+                  {entry.queueState === "held"
+                    ? "Held"
+                    : entry.queueState === "running"
+                      ? "Running"
+                      : entry.queueState === "admitted"
+                        ? "Admitted"
+                        : `#${entry.queuePosition ?? "—"}`}
                 </span>
               </article>
             ))}
@@ -480,13 +497,17 @@ function DashboardPage({
         ) : (
           <div className="dashboard-agent-grid">
             {groupedAgents.map((agent) => {
+              const assignedTasks = agents.flatMap((owner) =>
+                owner.tasks.filter(
+                  (task) => task.assignedAgentId === agent.id,
+                ),
+              );
               const runningTask =
-                agent.tasks.find(
-                  (task) => task.status === "Running",
-                ) ?? null;
+                assignedTasks.find((task) => task.status === "Running") ??
+                null;
 
-              const pendingTaskCount = agent.tasks.filter(
-                (task) => task.status === "Pending",
+              const pendingTaskCount = assignedTasks.filter(
+                (task) => task.queueState === "queued",
               ).length;
 
               const superior = agents.find((item) => item.id === agent.reportsTo);
@@ -740,75 +761,6 @@ export function normalizeApprovalRequest(
   };
 }
 
-export function executionRouteForTask(
-  agents: Agent[],
-  models: ModelDefinition[],
-  category: TaskCategory,
-  preferredAgentId: number,
-  activeProvider: RuntimeProviderId,
-  providerRegistry: ProviderRegistrySnapshot,
-) {
-  const candidates = agents
-    .filter(
-      (agent) =>
-        agent.status !== "Paused" &&
-        agent.model.trim().toLowerCase() !== "none" &&
-        resolveModelAvailability(
-          models,
-          agent.model,
-          providerRegistry,
-          activeProvider,
-        ).eligible,
-    )
-    .map((agent) => {
-      let score = agent.status === "Waiting" ? 18 : 10;
-      const categoryMatch =
-        agent.category === category ||
-        (category === "General" && agent.category === "Management");
-      if (categoryMatch) score += 50;
-      if (agent.id === preferredAgentId) score += categoryMatch ? 12 : 3;
-      if (agent.role === "Specialist") score += 10;
-      if (category === "Development") {
-        if (
-          agent.capabilities.files === "write" ||
-          agent.capabilities.files === "full"
-        ) {
-          score += 18;
-        }
-        if (agent.capabilities.terminal !== "none") score += 8;
-      }
-      if (
-        (category === "Browsing" || category === "Research") &&
-        agent.capabilities.internet !== "none"
-      ) {
-        score += 16;
-      }
-      score -= agent.tasks.filter(
-        (task) =>
-          task.status === "Pending" ||
-          task.status === "Running" ||
-          task.status === "Under Review",
-      ).length * 4;
-      return { agent, score, categoryMatch };
-    })
-    .sort(
-      (left, right) =>
-        right.score - left.score || left.agent.id - right.agent.id,
-    );
-
-  const winner = candidates[0] ?? null;
-  if (!winner) {
-    return null;
-  }
-
-  return {
-    agent: winner.agent,
-    reason: winner.categoryMatch
-      ? `${winner.agent.name} was selected for ${category} expertise and current availability.`
-      : `${winner.agent.name} was selected as the strongest available active agent.`,
-  };
-}
-
 export function reviewAgentForTask(
   agents: Agent[],
   ownerAgentId: number,
@@ -860,6 +812,7 @@ const defaultAgentPerformance: AgentPerformance = {
   focus: "balanced",
   cpuLimit: 70,
   gpuLimit: 50,
+  queueThreshold: 10,
   overflowAction: "queue",
   redirectAgentId: null,
 };
@@ -917,6 +870,7 @@ export function normalizePerformance(
         : "balanced",
     cpuLimit: clampNumber(performance?.cpuLimit, 10, 100, 70),
     gpuLimit: clampNumber(performance?.gpuLimit, 0, 100, 50),
+    queueThreshold: clampNumber(performance?.queueThreshold, 1, 100, 10),
     overflowAction:
       performance?.overflowAction === "redirect"
         ? "redirect"
@@ -1085,7 +1039,10 @@ function AgentsPage({
   setAgents,
   templates,
   onRegistryMutation,
+  onTaskMutation,
   authoritativeRegistry,
+  authoritativeTaskOrchestration,
+  taskOrchestration,
   models,
   providerRegistry,
   preferences,
@@ -1102,7 +1059,10 @@ function AgentsPage({
     command: "create_agent" | "update_agent" | "delete_agent" | "restore_agent_template",
     request: Record<string, unknown>,
   ) => Promise<void>;
+  onTaskMutation: TaskOrchestrationMutation;
   authoritativeRegistry: boolean;
+  authoritativeTaskOrchestration: boolean;
+  taskOrchestration: TaskOrchestrationSnapshot;
   models: ModelDefinition[];
   providerRegistry: ProviderRegistrySnapshot;
   preferences: AppPreferences;
@@ -1141,6 +1101,7 @@ function AgentsPage({
     useState<WorkspaceTab>("Overview");
   const [runtimeError, setRuntimeError] = useState("");
   const [systemCapabilityMessage, setSystemCapabilityMessage] = useState("");
+  const [taskMutationBusy, setTaskMutationBusy] = useState(false);
 
   const selectedAgent =
     agents.find((agent) => agent.id === selectedAgentId) ?? null;
@@ -1211,16 +1172,18 @@ function AgentsPage({
   function latestApprovalForTask(task: AgentTask) {
     return approvalRequests.find(
       (request) =>
-        request.agentId === selectedAgent?.id && request.taskId === task.id,
+        request.agentId === task.assignedAgentId && request.taskId === task.id,
     );
   }
 
-  function awaitingRunApproval(task: AgentTask) {
-    const approval = latestApprovalForTask(task);
-    return (
-      approval?.consumedAt === null &&
-      (approval.status === "Pending" || approval.status === "Approved")
-    );
+  function executorForTask(task: AgentTask) {
+    return agents.find((agent) => agent.id === task.assignedAgentId) ?? null;
+  }
+
+  function queueEntry(task: AgentTask) {
+    return selectedAgent
+      ? queueEntryForTask(taskOrchestration, selectedAgent.id, task.id)
+      : null;
   }
 
   function latestRunForTask(task: AgentTask) {
@@ -1525,238 +1488,90 @@ function AgentsPage({
     );
   }
 
-  function addTask() {
+  async function addTask() {
     const trimmedTitle = newTaskTitle.trim();
 
     if (selectedAgentId === null || !trimmedTitle) {
       return;
     }
-
-    const route =
-      newTaskRoutingMode === "automatic"
-        ? executionRouteForTask(
-            activeRegistryAgents(agents),
-            models,
-            newTaskCategory,
-            selectedAgentId,
-            preferences.activeAiProvider,
-            providerRegistry,
-          )
-        : null;
-    if (newTaskRoutingMode === "automatic" && !route) {
-      setRuntimeError(
-        "No active agent has a model executable through the active provider for automatic routing.",
-      );
+    if (!authoritativeTaskOrchestration) {
+      setRuntimeError("Task creation is available in the installed desktop app.");
       return;
     }
-    const targetAgentId = route?.agent.id ?? selectedAgentId;
-    const newTask: AgentTask = {
-      id: Date.now(),
-      title: trimmedTitle,
-      category: newTaskCategory,
-      priority: newTaskPriority,
-      assignedAgentId: targetAgentId,
-      status: "Pending",
-      phase: "Assigned",
-      createdAt: new Date().toISOString(),
-      completedAt: null,
-      result: null,
-      responseId: null,
-      runtimeModel: null,
-      totalTokens: null,
-      workspaceId: newTaskWorkspaceId,
-      changedFiles: [],
-      diff: null,
-      durationSeconds: null,
-      routingMode: newTaskRoutingMode,
-      routedFromAgentId:
-        newTaskRoutingMode === "automatic" ? selectedAgentId : null,
-      routingReason: route?.reason ?? null,
-      reviewAgentId: null,
-      reviewStatus: "Not Requested",
-      reviewResult: null,
-      reviewModel: null,
-      reviewDurationSeconds: null,
-      reviewedAt: null,
-    };
-
-    setAgents((currentAgents) =>
-      currentAgents.map((agent) =>
-        agent.id === targetAgentId
-          ? {
-              ...agent,
-              tasks: [...agent.tasks, newTask],
-              activity: [
-                createActivity(
-                  route
-                    ? `Task automatically routed here: ${trimmedTitle}`
-                    : `Task created: ${trimmedTitle}`,
-                ),
-                ...agent.activity,
-              ],
-            }
-          : agent,
-      ),
-    );
-
-    setNewTaskTitle("");
-    setNewTaskCategory(preferences.defaultTaskCategory);
-    setNewTaskPriority(preferences.defaultTaskPriority);
-    setNewTaskRoutingMode(preferences.defaultRoutingMode);
-    setNewTaskWorkspaceId(preferences.activeWorkspaceId);
-    if (targetAgentId !== selectedAgentId) {
-      setSelectedAgentId(targetAgentId);
-    }
-  }
-
-  function autoRouteTask(task: AgentTask) {
-    if (!selectedAgent) {
+    if (!newTaskWorkspaceId) {
+      setRuntimeError("Select a workspace before creating the task.");
       return;
     }
-    const route = executionRouteForTask(
-      activeRegistryAgents(agents),
-      models,
-      task.category,
-      selectedAgent.id,
-      preferences.activeAiProvider,
-      providerRegistry,
-    );
-    if (!route) {
-      setRuntimeError(
-        "No active agent has a model executable through the active provider for automatic routing.",
-      );
-      return;
-    }
-
-    const routedTask: AgentTask = {
-      ...task,
-      assignedAgentId: route.agent.id,
-      routingMode: "automatic",
-      routedFromAgentId: selectedAgent.id,
-      routingReason: route.reason,
-    };
-    setAgents((currentAgents) =>
-      currentAgents.map((agent) => {
-        if (route.agent.id === selectedAgent.id && agent.id === selectedAgent.id) {
-          return {
-            ...agent,
-            tasks: agent.tasks.map((item) =>
-              item.id === task.id ? routedTask : item,
-            ),
-            activity: [
-              createActivity(`Routing confirmed for "${task.title}".`),
-              ...agent.activity,
-            ],
-          };
-        }
-        if (agent.id === selectedAgent.id) {
-          return {
-            ...agent,
-            tasks: agent.tasks.filter((item) => item.id !== task.id),
-            activity: [
-              createActivity(
-                `Routed "${task.title}" to ${route.agent.name}.`,
-              ),
-              ...agent.activity,
-            ],
-          };
-        }
-        if (agent.id === route.agent.id) {
-          return {
-            ...agent,
-            tasks: [...agent.tasks, routedTask],
-            activity: [
-              createActivity(
-                `Received automatically routed task "${task.title}".`,
-              ),
-              ...agent.activity,
-            ],
-          };
-        }
-        return agent;
-      }),
-    );
-    setSelectedAgentId(route.agent.id);
+    setTaskMutationBusy(true);
     setRuntimeError("");
+    try {
+      await onTaskMutation("create_routed_task", {
+        taskOwnerAgentId: selectedAgentId,
+        title: trimmedTitle,
+        category: newTaskCategory,
+        priority: newTaskPriority,
+        workspaceId: newTaskWorkspaceId,
+        routingMode: newTaskRoutingMode,
+        preferredAgentId: selectedAgentId,
+        selectedAgentId:
+          newTaskRoutingMode === "selected" ? selectedAgentId : null,
+      });
+      setNewTaskTitle("");
+      setNewTaskCategory(preferences.defaultTaskCategory);
+      setNewTaskPriority(preferences.defaultTaskPriority);
+      setNewTaskRoutingMode(preferences.defaultRoutingMode);
+      setNewTaskWorkspaceId(preferences.activeWorkspaceId);
+    } catch (error) {
+      setRuntimeError(persistenceErrorMessage(error));
+    } finally {
+      setTaskMutationBusy(false);
+    }
   }
 
-  function setTaskWorkflow(
-    taskId: number,
-    status: TaskStatus,
-    phase: TaskPhase,
+  async function rerouteTask(task: AgentTask, routingMode: RoutingMode) {
+    if (!selectedAgent || !task.workspaceId) {
+      setRuntimeError("The task owner or workspace is unavailable.");
+      return;
+    }
+    setTaskMutationBusy(true);
+    setRuntimeError("");
+    try {
+      await onTaskMutation("reroute_task", {
+        taskOwnerAgentId: selectedAgent.id,
+        taskId: task.id,
+        title: task.title,
+        category: task.category,
+        priority: task.priority,
+        workspaceId: task.workspaceId,
+        routingMode,
+        preferredAgentId: selectedAgent.id,
+        selectedAgentId:
+          routingMode === "selected" ? selectedAgent.id : null,
+      });
+    } catch (error) {
+      setRuntimeError(persistenceErrorMessage(error));
+    } finally {
+      setTaskMutationBusy(false);
+    }
+  }
+
+  async function setQueueDisposition(
+    task: AgentTask,
+    disposition: "hold" | "resume" | "resetTerminal",
   ) {
-    if (selectedAgentId === null) {
-      return;
-    }
-
-    setAgents((currentAgents) =>
-      currentAgents.map((agent) =>
-        agent.id === selectedAgentId
-          ? {
-              ...agent,
-              tasks: agent.tasks.map((task) => {
-                if (
-                  status === "Running" &&
-                  task.status === "Running" &&
-                  task.id !== taskId
-                ) {
-                  return {
-                    ...task,
-                    status: "Pending",
-                    phase: "Assigned",
-                  };
-                }
-
-                return task.id === taskId
-                  ? {
-                      ...task,
-                      status,
-                      phase,
-                      completedAt:
-                        status === "Completed" || status === "Failed"
-                          ? new Date().toISOString()
-                          : null,
-                    }
-                  : task;
-              }),
-              activity: [
-                createActivity(
-                  `Task "${
-                    agent.tasks.find((task) => task.id === taskId)?.title ??
-                    "Unknown"
-                  }" changed to ${phase}.`,
-                ),
-                ...agent.activity,
-              ],
-            }
-          : agent,
-      ),
-    );
-  }
-
-  function advanceTask(task: AgentTask) {
-    if (task.phase === "Assigned") {
-      setTaskWorkflow(task.id, "Running", "Specialist Work");
-      return;
-    }
-
-    if (task.phase === "Specialist Work") {
-      setTaskWorkflow(task.id, "Under Review", "Senior Review");
-      return;
-    }
-
-    if (task.phase === "Senior Review") {
-      setTaskWorkflow(task.id, "Under Review", "Team Leader Review");
-      return;
-    }
-
-    if (task.phase === "Team Leader Review") {
-      setTaskWorkflow(task.id, "Under Review", "Supervisor Approval");
-      return;
-    }
-
-    if (task.phase === "Supervisor Approval") {
-      setTaskWorkflow(task.id, "Completed", "Finished");
+    if (!selectedAgent) return;
+    setTaskMutationBusy(true);
+    setRuntimeError("");
+    try {
+      await onTaskMutation("set_task_queue_disposition", {
+        taskOwnerAgentId: selectedAgent.id,
+        taskId: task.id,
+        disposition,
+      });
+    } catch (error) {
+      setRuntimeError(persistenceErrorMessage(error));
+    } finally {
+      setTaskMutationBusy(false);
     }
   }
 
@@ -1854,59 +1669,17 @@ function AgentsPage({
       return;
     }
 
-    const selectedModelAvailability = resolveModelAvailability(
-      models,
-      selectedAgent.model,
-      providerRegistry,
-      preferences.activeAiProvider,
-    );
-    if (!selectedModelAvailability.eligible) {
-      setRuntimeError(
-        `The model assigned to ${selectedAgent.name} is unavailable: ${selectedModelAvailability.reason}`,
-      );
+    const executor = executorForTask(task);
+    if (!executor) {
+      setRuntimeError("The backend-selected task executor is unavailable.");
       return;
     }
-
-    const workspace = workspaceForTask(task);
-    if (!workspace) {
+    const entry = queueEntry(task);
+    if (!taskCanEnterExecuteSlot(entry, taskOrchestration.activeExecute)) {
       setRuntimeError(
-        "This task has no workspace. Add or select one in Settings first.",
-      );
-      return;
-    }
-
-    const assessment = taskSafetyAssessment(
-      task,
-      selectedAgent,
-      preferences.safetyMode,
-    );
-    if (assessment.blockedReason) {
-      setRuntimeError(assessment.blockedReason);
-      setAgents((currentAgents) =>
-        currentAgents.map((agent) =>
-          agent.id === selectedAgent.id
-            ? {
-                ...agent,
-                status: "Waiting",
-                tasks: agent.tasks.map((item) =>
-                  item.id === task.id
-                    ? {
-                        ...item,
-                        status: "Blocked",
-                        phase: "Supervisor Approval",
-                        completedAt: null,
-                      }
-                    : item,
-                ),
-                activity: [
-                  createActivity(
-                    `Safety boundary blocked "${task.title}": ${assessment.blockedReason}`,
-                  ),
-                  ...agent.activity,
-                ],
-              }
-            : agent,
-        ),
+        entry?.queueState === "queued"
+          ? `Only queue position 1 can enter the execute slot. This task is ${queueStateLabel(entry).toLowerCase()}.`
+          : "This task is not queued for execute admission.",
       );
       return;
     }
@@ -1916,7 +1689,7 @@ function AgentsPage({
       authorization = await prepareBackendAuthorization(
         {
           kind: "runTask",
-          agentId: selectedAgent.id,
+          agentId: executor.id,
           taskOwnerAgentId: selectedAgent.id,
           taskId: task.id,
           runMode: "execute",
@@ -1931,6 +1704,7 @@ function AgentsPage({
       setRuntimeError(
         "This run is waiting for backend authorization. Open Approvals to approve or deny it.",
       );
+      onOpenApprovals();
       return;
     }
 
@@ -1942,7 +1716,7 @@ function AgentsPage({
         request: {
           runId,
           runMode: "execute",
-          agentId: selectedAgent.id,
+          agentId: executor.id,
           taskOwnerAgentId: selectedAgent.id,
           taskId: task.id,
         },
@@ -1983,13 +1757,14 @@ function AgentsPage({
     }
 
     try {
-      if (!selectedAgent) {
-        throw new Error("Select the task agent before opening workspace files.");
+      const executor = executorForTask(task);
+      if (!executor) {
+        throw new Error("The backend-selected task executor is unavailable.");
       }
       const authorization = await prepareBackendAuthorization(
         {
           kind: "openWorkspaceItem",
-          agentId: selectedAgent.id,
+          agentId: executor.id,
           workspaceId: workspace.id,
           itemPath,
         },
@@ -2004,7 +1779,7 @@ function AgentsPage({
       }
       await invoke("open_workspace_item", {
         request: {
-          agentId: selectedAgent.id,
+          agentId: executor.id,
           workspaceId: workspace.id,
           itemPath,
         },
@@ -2013,29 +1788,6 @@ function AgentsPage({
     } catch (error) {
       setRuntimeError(errorMessage(error));
     }
-  }
-
-  function deleteTask(taskId: number) {
-    if (selectedAgentId === null) {
-      return;
-    }
-
-    setAgents((currentAgents) =>
-      currentAgents.map((agent) =>
-        agent.id === selectedAgentId
-          ? {
-              ...agent,
-              tasks: agent.tasks.filter((task) => task.id !== taskId),
-              activity: [
-                createActivity(
-                  `Task deleted: ${agent.tasks.find((task) => task.id === taskId)?.title ?? "Unknown"}`,
-                ),
-                ...agent.activity,
-              ],
-            }
-          : agent,
-      ),
-    );
   }
 
   function clearActivity() {
@@ -2549,7 +2301,7 @@ function AgentsPage({
                   onChange={(event) => setNewTaskTitle(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
-                      addTask();
+                      void addTask();
                     }
                   }}
                   placeholder="Add a task for this agent"
@@ -2627,8 +2379,14 @@ function AgentsPage({
                 </select>
               </label>
 
-              <button className="primary-button" onClick={addTask}>
-                Add task
+              <button
+                className="primary-button"
+                disabled={
+                  taskMutationBusy || !authoritativeTaskOrchestration
+                }
+                onClick={() => void addTask()}
+              >
+                {taskMutationBusy ? "Updating queue…" : "Add task"}
               </button>
             </div>
 
@@ -2644,7 +2402,17 @@ function AgentsPage({
               </p>
             ) : (
               <div className="agent-list">
-                {selectedAgent.tasks.map((task) => (
+                {selectedAgent.tasks.map((task) => {
+                  const entry = queueEntry(task);
+                  const executor = executorForTask(task);
+                  const assessment = executor
+                    ? taskSafetyAssessment(
+                        task,
+                        executor,
+                        preferences.safetyMode,
+                      )
+                    : null;
+                  return (
                   <article className="agent-card task-card" key={task.id}>
                     <div className="task-card-content">
                       <div
@@ -2679,49 +2447,67 @@ function AgentsPage({
                       </p>
                       <small>
                         Phase: {task.phase} · Assigned to{" "}
-                        {agents.find(
-                          (agent) => agent.id === task.assignedAgentId,
-                        )?.name ?? "Unknown agent"} · Workspace:{" "}
+                        {executor?.name ?? "Unknown agent"} · Workspace:{" "}
                         {workspaceForTask(task)?.name ?? "Missing"}
                       </small>
 
-                      {task.routingMode === "automatic" && (
+                      <div className="routing-note">
+                        <strong>{queueStateLabel(entry)}</strong>
+                        <small>
+                          Owner: {selectedAgent.name} · Executor:{" "}
+                          {executor?.name ?? "Unavailable"}
+                          {task.enqueueSequence !== null
+                            ? ` · Enqueue sequence ${task.enqueueSequence}`
+                            : ""}
+                        </small>
+                      </div>
+
+                      {task.routingEvidence && (
                         <div className="routing-note">
-                          <strong>Automatically routed</strong>
+                          <strong>
+                            {task.routingMode === "automatic"
+                              ? "Backend automatic route"
+                              : "Backend selected-agent route"}
+                          </strong>
                           <small>
-                            {task.routingReason ??
-                              "Assigned to the best available matching agent."}
+                            {task.routingEvidence.reason}
                           </small>
+                          <details>
+                            <summary>
+                              Routing evidence · {task.routingEvidence.outcomeCode}
+                            </summary>
+                            <small>
+                              Algorithm {task.routingEvidence.algorithmVersion} ·{" "}
+                              {task.routingEvidence.manualOverride
+                                ? "user override recorded"
+                                : "no user override"}
+                            </small>
+                            <ul>
+                              {task.routingEvidence.candidates.map((candidate) => (
+                                <li key={candidate.agentId}>
+                                  {candidate.agentName}: {candidate.eligible
+                                    ? `eligible, score ${candidate.score}, workload ${candidate.workload}/${candidate.queueThreshold}`
+                                    : candidate.disqualifications
+                                        .map((item) => item.code)
+                                        .join(", ")}
+                                  {candidate.selectionExcludedCode
+                                    ? ` · ${candidate.selectionExcludedCode}`
+                                    : ""}
+                                </li>
+                              ))}
+                            </ul>
+                          </details>
                         </div>
                       )}
 
-                      <div
-                        className={`safety-summary risk-${taskSafetyAssessment(
-                          task,
-                          selectedAgent,
-                          preferences.safetyMode,
-                        ).riskLevel.toLowerCase()}`}
+                      {assessment && <div
+                        className={`safety-summary risk-${assessment.riskLevel.toLowerCase()}`}
                       >
                         <div>
                           <strong>
-                            Safety check ·{" "}
-                            {
-                              taskSafetyAssessment(
-                                task,
-                                selectedAgent,
-                                preferences.safetyMode,
-                              ).riskLevel
-                            } risk
+                            Safety preview · {assessment.riskLevel} risk
                           </strong>
-                          <small>
-                            {
-                              taskSafetyAssessment(
-                                task,
-                                selectedAgent,
-                                preferences.safetyMode,
-                              ).reason
-                            }
-                          </small>
+                          <small>{assessment.reason}</small>
                         </div>
                         {latestApprovalForTask(task) && (
                           <span
@@ -2734,7 +2520,7 @@ function AgentsPage({
                               : latestApprovalForTask(task)?.status}
                           </span>
                         )}
-                      </div>
+                      </div>}
 
                       {runningTaskId === task.id && runtimeProgress.length > 0 && (
                         <div className="run-progress" aria-live="polite">
@@ -2843,8 +2629,7 @@ function AgentsPage({
                     </div>
 
                     <div className="task-card-actions">
-                      {task.status === "Blocked" &&
-                        latestApprovalForTask(task)?.status === "Pending" && (
+                      {latestApprovalForTask(task)?.status === "Pending" && (
                           <button
                             className="primary-button"
                             disabled={runActive}
@@ -2854,42 +2639,44 @@ function AgentsPage({
                           </button>
                         )}
 
-                      {task.routingMode !== "automatic" &&
-                        task.status === "Pending" &&
-                        task.reviewStatus === "Not Requested" &&
-                        !awaitingRunApproval(task) && (
+                      {(task.queueState === "queued" ||
+                        task.queueState === "held") && (
                           <button
                             className="secondary-button"
-                            disabled={runActive}
-                            onClick={() => autoRouteTask(task)}
+                            disabled={runActive || taskMutationBusy}
+                            onClick={() =>
+                              void rerouteTask(
+                                task,
+                                task.routingMode === "automatic"
+                                  ? "selected"
+                                  : "automatic",
+                              )
+                            }
                           >
-                            Auto-route
+                            {task.routingMode === "automatic"
+                              ? "Assign to owner"
+                              : "Auto-route"}
                           </button>
                         )}
 
-                      {task.status !== "Blocked" && (
+                      {task.queueState === "queued" && (
                         <button
-                          className={
-                            task.reviewStatus === "Pending" ||
-                            task.reviewStatus === "Failed"
-                              ? "secondary-button"
-                              : "primary-button"
+                          className="primary-button"
+                          disabled={
+                            runActive ||
+                            taskMutationBusy ||
+                            !taskCanEnterExecuteSlot(
+                              entry,
+                              taskOrchestration.activeExecute,
+                            )
                           }
-                          disabled={runActive}
-                          onClick={() => runTaskWithAgent(task)}
+                          onClick={() => void runTaskWithAgent(task)}
                         >
                           {runningTaskId === task.id
-                            ? activeRunKind === "review"
-                              ? "Reviewer working…"
-                              : "Agent working…"
-                            : task.reviewStatus === "Changes Requested"
-                              ? "Run revisions"
-                            : task.reviewStatus === "Pending" ||
-                                task.reviewStatus === "Failed"
-                              ? "Run specialist again"
-                            : task.result
-                              ? "Run again"
-                              : "Run Codex agent"}
+                            ? "Agent working…"
+                            : entry?.queuePosition === 1
+                              ? "Run queued task"
+                              : `Waiting at queue #${entry?.queuePosition ?? "—"}`}
                         </button>
                       )}
 
@@ -2897,7 +2684,7 @@ function AgentsPage({
                         <button
                           className="danger-button"
                           disabled={cancelRequested}
-                          onClick={cancelActiveRun}
+                          onClick={() => void cancelActiveRun()}
                         >
                           {cancelRequested ? "Stopping…" : "Stop agent"}
                         </button>
@@ -2911,117 +2698,53 @@ function AgentsPage({
                           <button
                             className="primary-button"
                             disabled={runActive}
-                            onClick={() => runSeniorReview(task)}
+                            onClick={() => void runSeniorReview(task)}
                           >
                             Run senior review
                           </button>
                         )}
 
-                      {!awaitingRunApproval(task) &&
-                        task.reviewStatus === "Not Requested" &&
-                        task.phase !== "Finished" &&
-                        task.phase !== "Failed" && (
+                      {task.queueState === "queued" && (
                           <button
                             className="secondary-button"
-                            disabled={runActive}
-                            onClick={() => advanceTask(task)}
-                          >
-                            {task.phase === "Assigned"
-                              ? "Start"
-                              : task.phase === "Specialist Work"
-                                ? "Send to Senior"
-                                : task.phase === "Senior Review"
-                                  ? "Send to Team Leader"
-                                  : task.phase === "Team Leader Review"
-                                    ? "Send to Supervisor"
-                                    : "Approve"}
-                          </button>
-                        )}
-
-                      {!awaitingRunApproval(task) &&
-                        task.reviewStatus === "Not Requested" &&
-                        task.status !== "Blocked" &&
-                        task.status !== "Completed" &&
-                        task.status !== "Failed" && (
-                          <button
-                            className="secondary-button"
-                            disabled={runActive}
+                            disabled={runActive || taskMutationBusy}
                             onClick={() =>
-                              setTaskWorkflow(
-                                task.id,
-                                "Blocked",
-                                task.phase,
-                              )
+                              void setQueueDisposition(task, "hold")
                             }
                           >
-                            Block
+                            Hold
                           </button>
                         )}
 
-                      {task.status === "Blocked" &&
-                        task.reviewStatus === "Not Requested" &&
-                        !awaitingRunApproval(task) && (
-                        <button
-                          className="secondary-button"
-                          disabled={runActive}
-                          onClick={() =>
-                            setTaskWorkflow(
-                              task.id,
-                              "Pending",
-                              "Assigned",
-                            )
-                          }
-                        >
-                          Unblock
-                        </button>
-                      )}
-
-                      {!awaitingRunApproval(task) &&
-                        task.reviewStatus === "Not Requested" &&
-                        task.status !== "Failed" &&
-                        task.status !== "Completed" && (
+                      {task.queueState === "held" && (
                           <button
                             className="secondary-button"
-                            disabled={runActive}
+                            disabled={runActive || taskMutationBusy}
                             onClick={() =>
-                              setTaskWorkflow(
-                                task.id,
-                                "Failed",
-                                "Failed",
-                              )
+                              void setQueueDisposition(task, "resume")
                             }
                           >
-                            Fail
+                            Resume in original queue age
                           </button>
                         )}
 
-                      {(task.status === "Failed" ||
-                        task.status === "Completed") && (
+                      {task.queueState === "notQueued" &&
+                        (task.status === "Failed" ||
+                          task.status === "Completed") && (
                         <button
                           className="secondary-button"
-                          disabled={runActive}
+                          disabled={runActive || taskMutationBusy}
                           onClick={() =>
-                            setTaskWorkflow(
-                              task.id,
-                              "Pending",
-                              "Assigned",
-                            )
+                            void setQueueDisposition(task, "resetTerminal")
                           }
                         >
-                          Reset
+                          Reset with new queue age
                         </button>
                       )}
-
-                      <button
-                        className="danger-button"
-                        disabled={runActive}
-                        onClick={() => deleteTask(task.id)}
-                      >
-                        Delete
-                      </button>
                     </div>
                   </article>
-                ))}
+                  );
+                })}
               </div>
             )}
           </section>
@@ -3401,17 +3124,15 @@ function AgentsPage({
 
 function TasksPage({
   agents,
-  setAgents,
-  retentionDays,
-  setRetentionDays,
+  taskOrchestration,
+  onTaskMutation,
+  runActive,
   setApprovalRequests,
 }: {
   agents: Agent[];
-  setAgents: React.Dispatch<React.SetStateAction<Agent[]>>;
-  retentionDays: HistoryRetentionDays;
-  setRetentionDays: React.Dispatch<
-    React.SetStateAction<HistoryRetentionDays>
-  >;
+  taskOrchestration: TaskOrchestrationSnapshot;
+  onTaskMutation: TaskOrchestrationMutation;
+  runActive: boolean;
   setApprovalRequests: React.Dispatch<
     React.SetStateAction<ApprovalRequest[]>
   >;
@@ -3420,231 +3141,117 @@ function TasksPage({
     useState<TaskStatus | "All">("All");
   const [categoryFilter, setCategoryFilter] =
     useState<TaskCategory | "All">("All");
+  const [taskMutationKey, setTaskMutationKey] = useState("");
+  const [taskMessage, setTaskMessage] = useState("");
 
-  const allTasks = agents.flatMap((agent) =>
-    agent.tasks.map((task) => ({
+  const allTasks = agents.flatMap((owner) =>
+    owner.tasks.map((task) => ({
       task,
-      agent,
+      owner,
+      executor:
+        agents.find((agent) => agent.id === task.assignedAgentId) ?? null,
+      entry: queueEntryForTask(taskOrchestration, owner.id, task.id),
     })),
   );
 
-  const filteredTasks = allTasks.filter(({ task }) => {
-    const matchesStatus =
-      statusFilter === "All" || task.status === statusFilter;
-    const matchesCategory =
-      categoryFilter === "All" || task.category === categoryFilter;
-
-    return matchesStatus && matchesCategory;
-  });
-
-  const phaseOrder: TaskPhase[] = [
-    "Assigned",
-    "Specialist Work",
-    "Senior Review",
-    "Team Leader Review",
-    "Supervisor Approval",
-    "Finished",
-    "Failed",
+  const authoritativeEntries = [
+    ...(taskOrchestration.activeExecute
+      ? [taskOrchestration.activeExecute]
+      : []),
+    ...taskOrchestration.executeQueue,
+    ...taskOrchestration.heldTasks,
   ];
+  const authoritativeOrder = new Map(
+    authoritativeEntries.map((entry, index) => [
+      `${entry.taskOwnerAgentId}:${entry.taskId}`,
+      index,
+    ]),
+  );
 
-  function updateGlobalTask(
-    ownerAgentId: number,
-    taskId: number,
-    status: TaskStatus,
-    phase: TaskPhase,
-  ) {
-    setAgents((currentAgents) =>
-      currentAgents.map((agent) =>
-        agent.id === ownerAgentId
-          ? {
-              ...agent,
-              tasks: agent.tasks.map((task) =>
-                task.id === taskId
-                  ? {
-                      ...task,
-                      status,
-                      phase,
-                      completedAt:
-                        status === "Completed" || status === "Failed"
-                          ? new Date().toISOString()
-                          : null,
-                    }
-                  : status === "Running" && task.status === "Running"
-                    ? {
-                        ...task,
-                        status: "Pending",
-                        phase: "Assigned",
-                      }
-                    : task,
-              ),
-              activity: [
-                {
-                  id: Date.now() + Math.floor(Math.random() * 1000),
-                  message: `Task "${
-                    agent.tasks.find((task) => task.id === taskId)?.title ??
-                    "Unknown"
-                  }" changed to ${phase}.`,
-                  createdAt: new Date().toISOString(),
-                },
-                ...agent.activity,
-              ],
-            }
-          : agent,
-      ),
-    );
-  }
-
-  function advanceGlobalTask(ownerAgentId: number, task: AgentTask) {
-    if (task.phase === "Assigned") {
-      updateGlobalTask(
-        ownerAgentId,
-        task.id,
-        "Running",
-        "Specialist Work",
+  const filteredTasks = allTasks
+    .filter(({ task }) => {
+      const matchesStatus =
+        statusFilter === "All" || task.status === statusFilter;
+      const matchesCategory =
+        categoryFilter === "All" || task.category === categoryFilter;
+      return matchesStatus && matchesCategory;
+    })
+    .sort((left, right) => {
+      const leftOrder =
+        authoritativeOrder.get(`${left.owner.id}:${left.task.id}`) ??
+        Number.MAX_SAFE_INTEGER;
+      const rightOrder =
+        authoritativeOrder.get(`${right.owner.id}:${right.task.id}`) ??
+        Number.MAX_SAFE_INTEGER;
+      return (
+        leftOrder - rightOrder ||
+        right.task.createdAt.localeCompare(left.task.createdAt) ||
+        left.task.id - right.task.id
       );
-      return;
-    }
-
-    if (task.phase === "Specialist Work") {
-      updateGlobalTask(
-        ownerAgentId,
-        task.id,
-        "Under Review",
-        "Senior Review",
-      );
-      return;
-    }
-
-    if (task.phase === "Senior Review") {
-      updateGlobalTask(
-        ownerAgentId,
-        task.id,
-        "Under Review",
-        "Team Leader Review",
-      );
-      return;
-    }
-
-    if (task.phase === "Team Leader Review") {
-      updateGlobalTask(
-        ownerAgentId,
-        task.id,
-        "Under Review",
-        "Supervisor Approval",
-      );
-      return;
-    }
-
-    if (task.phase === "Supervisor Approval") {
-      updateGlobalTask(
-        ownerAgentId,
-        task.id,
-        "Completed",
-        "Finished",
-      );
-    }
-  }
+    });
 
   const summary = {
     total: allTasks.length,
-    active: allTasks.filter(
-      ({ task }) =>
-        task.status === "Running" ||
-        task.status === "Under Review",
-    ).length,
-    pending: allTasks.filter(
-      ({ task }) => task.status === "Pending",
-    ).length,
-    blocked: allTasks.filter(
-      ({ task }) => task.status === "Blocked",
-    ).length,
+    active: taskOrchestration.activeExecute ? 1 : 0,
+    pending: taskOrchestration.executeQueue.length,
+    blocked: taskOrchestration.heldTasks.length,
   };
 
-  function deleteGlobalTask(ownerAgentId: number, taskId: number) {
-    setAgents((currentAgents) =>
-      currentAgents.map((agent) =>
-        agent.id === ownerAgentId
-          ? {
-              ...agent,
-              tasks: agent.tasks.filter((task) => task.id !== taskId),
-            }
-          : agent,
-      ),
-    );
+  async function setQueueDisposition(
+    ownerAgentId: number,
+    task: AgentTask,
+    disposition: "hold" | "resume" | "resetTerminal",
+  ) {
+    const mutationKey = `${ownerAgentId}:${task.id}`;
+    setTaskMutationKey(mutationKey);
+    setTaskMessage("");
+    try {
+      await onTaskMutation("set_task_queue_disposition", {
+        taskOwnerAgentId: ownerAgentId,
+        taskId: task.id,
+        disposition,
+      });
+    } catch (error) {
+      setTaskMessage(persistenceErrorMessage(error));
+    } finally {
+      setTaskMutationKey("");
+    }
   }
 
-  function clearFinishedTasks() {
-    const shouldClear = window.confirm(
-      "Delete all completed and failed tasks from every agent?",
-    );
-
-    if (!shouldClear) {
+  async function requestTaskApproval(owner: Agent, task: AgentTask) {
+    const executor =
+      agents.find((agent) => agent.id === task.assignedAgentId) ?? null;
+    if (!executor) {
+      setTaskMessage("The backend-selected task executor is unavailable.");
       return;
     }
-
-    setAgents((currentAgents) =>
-      currentAgents.map((agent) => ({
-        ...agent,
-        tasks: agent.tasks.filter(
-          (task) =>
-            task.status !== "Completed" && task.status !== "Failed",
-        ),
-      })),
-    );
-  }
-
-  async function requestTaskApproval(agent: Agent, task: AgentTask) {
-    const assessment = taskSafetyAssessment(task, agent, "strict");
-    if (assessment.blockedReason) {
-      window.alert(assessment.blockedReason);
-      return;
-    }
+    setTaskMessage("");
     let authorization: AuthorizationReadiness;
     try {
       authorization = await prepareBackendAuthorization(
         {
           kind: "runTask",
-          agentId: agent.id,
-          taskOwnerAgentId: agent.id,
+          agentId: executor.id,
+          taskOwnerAgentId: owner.id,
           taskId: task.id,
           runMode: "execute",
         },
         setApprovalRequests,
       );
     } catch (error) {
-      window.alert(errorMessage(error));
+      setTaskMessage(errorMessage(error));
       return;
     }
     if (authorization.ready && !authorization.approval) {
-      window.alert("Current backend policy allows this task without an approval record.");
+      setTaskMessage(
+        "Current backend policy allows this task without an approval record.",
+      );
       return;
     }
-
-    setAgents((currentAgents) =>
-      currentAgents.map((currentAgent) =>
-        currentAgent.id === agent.id
-          ? {
-              ...currentAgent,
-              tasks: currentAgent.tasks.map((item) =>
-                item.id === task.id
-                  ? {
-                      ...item,
-                      status: authorization.ready ? "Pending" : "Blocked",
-                      phase: authorization.ready ? "Assigned" : "Supervisor Approval",
-                    }
-                  : item,
-              ),
-              activity: [
-                {
-                  id: Date.now() + Math.floor(Math.random() * 1000),
-                  message: `Backend authorization ${authorization.ready ? "is ready" : "was requested"} for task "${task.title}".`,
-                  createdAt: new Date().toISOString(),
-                },
-                ...currentAgent.activity,
-              ],
-            }
-          : currentAgent,
-      ),
+    setTaskMessage(
+      authorization.ready
+        ? "A one-use backend authorization is ready."
+        : "A one-use backend authorization is waiting for trusted approval.",
     );
   }
 
@@ -3655,7 +3262,7 @@ function TasksPage({
           <span className="eyebrow">GLOBAL WORKFLOW</span>
           <h1>Tasks</h1>
           <p className="page-message">
-            Track every task across every agent and review phase.
+            Inspect backend-owned routing, queue position, and lifecycle state.
           </p>
         </div>
       </header>
@@ -3670,19 +3277,19 @@ function TasksPage({
         <article className="summary-card">
           <span>Active</span>
           <strong>{summary.active}</strong>
-          <small>Working or under review</small>
+          <small>Single execute slot</small>
         </article>
 
         <article className="summary-card">
           <span>Pending</span>
           <strong>{summary.pending}</strong>
-          <small>Waiting to begin</small>
+          <small>Authoritative queue</small>
         </article>
 
         <article className="summary-card">
-          <span>Blocked</span>
+          <span>Held</span>
           <strong>{summary.blocked}</strong>
-          <small>Needs intervention</small>
+          <small>Outside admission</small>
         </article>
       </section>
 
@@ -3690,39 +3297,8 @@ function TasksPage({
         <div className="panel-heading">
           <div>
             <span className="eyebrow">FILTERS</span>
-            <h2>Task pipeline</h2>
+            <h2>Authoritative task queue</h2>
           </div>
-
-          <button className="danger-button" onClick={clearFinishedTasks}>
-            Clear finished tasks
-          </button>
-        </div>
-
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "minmax(220px, 320px)",
-            marginBottom: "16px",
-          }}
-        >
-          <label className="form-field">
-            <span>Finished-task retention</span>
-            <select
-              value={retentionDays}
-              onChange={(event) =>
-                setRetentionDays(
-                  event.target.value === "never"
-                    ? "never"
-                    : (Number(event.target.value) as 7 | 30 | 90),
-                )
-              }
-            >
-              <option value={7}>Delete after 7 days</option>
-              <option value={30}>Delete after 30 days</option>
-              <option value={90}>Delete after 90 days</option>
-              <option value="never">Never delete automatically</option>
-            </select>
-          </label>
         </div>
 
         <div
@@ -3777,40 +3353,22 @@ function TasksPage({
           </label>
         </div>
 
+        {taskMessage && (
+          <div className="runtime-message" role="status">
+            {taskMessage}
+          </div>
+        )}
+
         {filteredTasks.length === 0 ? (
           <p className="page-message">
             No tasks match the selected filters.
           </p>
         ) : (
-          <div style={{ display: "grid", gap: "22px" }}>
-            {phaseOrder.map((phase) => {
-              const phaseTasks = filteredTasks.filter(
-                ({ task }) => task.phase === phase,
-              );
-
-              if (phaseTasks.length === 0) {
-                return null;
-              }
-
-              return (
-                <div key={phase}>
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      marginBottom: "10px",
-                    }}
-                  >
-                    <h3 style={{ margin: 0 }}>{phase}</h3>
-                    <small>{phaseTasks.length} task(s)</small>
-                  </div>
-
-                  <div className="agent-list">
-                    {phaseTasks.map(({ task, agent }) => (
+          <div className="agent-list">
+                    {filteredTasks.map(({ task, owner, executor, entry }) => (
                       <article
                         className="agent-card task-card"
-                        key={`${agent.id}-${task.id}`}
+                        key={`${owner.id}-${task.id}`}
                       >
                         <div className="task-card-content">
                           <div
@@ -3845,7 +3403,8 @@ function TasksPage({
                             {task.category} · {task.priority} priority
                           </p>
                           <small>
-                            Assigned agent: {agent.name} · {agent.role}
+                            Owner: {owner.name} · Executor:{" "}
+                            {executor?.name ?? "Unavailable"}
                             {task.routingMode === "automatic"
                               ? " · Automatically routed"
                               : ""}
@@ -3853,109 +3412,95 @@ function TasksPage({
                               ? ` · Review: ${task.reviewStatus}`
                               : ""}
                           </small>
+                          <div className="routing-note">
+                            <strong>{queueStateLabel(entry)}</strong>
+                            <small>
+                              Phase: {task.phase}
+                              {task.enqueueSequence !== null
+                                ? ` · Enqueue sequence ${task.enqueueSequence}`
+                                : ""}
+                            </small>
+                            {task.routingReason && (
+                              <small>{task.routingReason}</small>
+                            )}
+                          </div>
                         </div>
 
                         <div className="task-card-actions">
-                          {task.reviewStatus === "Not Requested" &&
-                            task.phase !== "Finished" &&
-                            task.phase !== "Failed" && (
-                              <button
-                                className="primary-button"
-                                onClick={() =>
-                                  advanceGlobalTask(agent.id, task)
-                                }
-                              >
-                                {task.phase === "Assigned"
-                                  ? "Start"
-                                  : task.phase === "Specialist Work"
-                                    ? "Send to Senior"
-                                    : task.phase === "Senior Review"
-                                      ? "Send to Team Leader"
-                                      : task.phase ===
-                                          "Team Leader Review"
-                                        ? "Send to Supervisor"
-                                        : "Approve"}
-                              </button>
-                            )}
-
-                          {task.status !== "Blocked" &&
-                            task.status !== "Completed" &&
-                            task.status !== "Failed" && (
+                          {task.queueState === "queued" && (
                               <button
                                 className="secondary-button"
+                                disabled={
+                                  runActive ||
+                                  taskMutationKey === `${owner.id}:${task.id}`
+                                }
                                 onClick={() =>
-                                  updateGlobalTask(
-                                    agent.id,
-                                    task.id,
-                                    "Blocked",
-                                    task.phase,
+                                  void setQueueDisposition(
+                                    owner.id,
+                                    task,
+                                    "hold",
                                   )
                                 }
                               >
-                                Block
+                                Hold
                               </button>
                             )}
 
-                          {task.status === "Blocked" && (
+                          {task.queueState === "held" && (
+                              <button
+                                className="secondary-button"
+                                disabled={
+                                  runActive ||
+                                  taskMutationKey === `${owner.id}:${task.id}`
+                                }
+                                onClick={() =>
+                                  void setQueueDisposition(
+                                    owner.id,
+                                    task,
+                                    "resume",
+                                  )
+                                }
+                              >
+                                Resume
+                              </button>
+                            )}
+
+                          {task.queueState === "notQueued" &&
+                            (task.status === "Completed" ||
+                              task.status === "Failed") && (
                             <button
                               className="secondary-button"
+                              disabled={
+                                runActive ||
+                                taskMutationKey === `${owner.id}:${task.id}`
+                              }
                               onClick={() =>
-                                updateGlobalTask(
-                                  agent.id,
-                                  task.id,
-                                  "Pending",
-                                  "Assigned",
+                                void setQueueDisposition(
+                                  owner.id,
+                                  task,
+                                  "resetTerminal",
                                 )
                               }
                             >
-                              Unblock
+                              Reset with new queue age
                             </button>
                           )}
 
-                          {task.status !== "Failed" &&
-                            task.status !== "Completed" && (
+                          {(task.queueState === "queued" ||
+                            task.queueState === "held") && (
                               <button
                                 className="secondary-button"
+                                disabled={runActive}
                                 onClick={() =>
-                                  updateGlobalTask(
-                                    agent.id,
-                                    task.id,
-                                    "Failed",
-                                    "Failed",
-                                  )
-                                }
-                              >
-                                Fail
-                              </button>
-                            )}
-
-                          {task.status !== "Completed" &&
-                            task.status !== "Failed" && (
-                              <button
-                                className="secondary-button"
-                                onClick={() =>
-                                  requestTaskApproval(agent, task)
+                                  void requestTaskApproval(owner, task)
                                 }
                               >
                                 Request approval
                               </button>
                             )}
-
-                          <button
-                            className="danger-button"
-                            onClick={() =>
-                              deleteGlobalTask(agent.id, task.id)
-                            }
-                          >
-                            Delete
-                          </button>
                         </div>
                       </article>
                     ))}
-                  </div>
-                </div>
-              );
-            })}
           </div>
         )}
       </section>
@@ -3967,14 +3512,12 @@ function TasksPage({
 
 function ApprovalsPage({
   agents,
-  setAgents,
   approvalRequests,
   setApprovalRequests,
   workspaces,
   onOpenAgents,
 }: {
   agents: Agent[];
-  setAgents: React.Dispatch<React.SetStateAction<Agent[]>>;
   approvalRequests: ApprovalRequest[];
   setApprovalRequests: React.Dispatch<
     React.SetStateAction<ApprovalRequest[]>
@@ -4027,36 +3570,6 @@ function ApprovalsPage({
     }
     setApprovalRequests((currentRequests) =>
       upsertApprovalRequest(currentRequests, resolved),
-    );
-    setAgents((currentAgents) =>
-      currentAgents.map((agent) =>
-        agent.id === request.agentId
-          ? {
-              ...agent,
-              tasks: agent.tasks.map((task) =>
-                task.id === request.taskId
-                  ? {
-                      ...task,
-                      status: status === "Approved" ? "Pending" : "Blocked",
-                      phase:
-                        status === "Approved"
-                          ? "Assigned"
-                          : "Supervisor Approval",
-                      completedAt: null,
-                    }
-                  : task,
-              ),
-              activity: [
-                {
-                  id: Date.now() + Math.floor(Math.random() * 1000),
-                  message: `${status === "Approved" ? "Approved" : "Denied"} one-time authorization for "${request.taskSnapshot || request.title}".`,
-                  createdAt: new Date().toISOString(),
-                },
-                ...agent.activity,
-              ],
-            }
-          : agent,
-      ),
     );
   }
 
@@ -4145,15 +3658,16 @@ function ApprovalsPage({
         ) : (
           <div className="agent-list">
             {filteredRequests.map((request) => {
-              const agent =
+              const executor =
                 agents.find(
                   (item) => item.id === request.agentId,
                 ) ?? null;
-
-              const task =
-                agent?.tasks.find(
-                  (item) => item.id === request.taskId,
-                ) ?? null;
+              const ownedTask = agents
+                .flatMap((owner) =>
+                  owner.tasks.map((task) => ({ owner, task })),
+                )
+                .find(({ task }) => task.id === request.taskId);
+              const task = ownedTask?.task ?? null;
 
               return (
                 <article
@@ -4210,8 +3724,9 @@ function ApprovalsPage({
                       </span>
                     </div>
                     <small>
-                      Agent: {agent?.name ?? "Unknown"} · Role:{" "}
-                      {agent?.role ?? "Unknown"}
+                      Owner: {ownedTask?.owner.name ?? "Unknown"} · Executor:{" "}
+                      {executor?.name ?? "Unknown"} · Role:{" "}
+                      {executor?.role ?? "Unknown"}
                       {task
                         ? ` · Task phase: ${task.phase}`
                         : ""}
@@ -4642,6 +4157,7 @@ function ActivityPage({
 function VoiceControlPage({
   agents,
   setAgents,
+  onTaskMutation,
   setApprovalRequests,
   preferences,
   setPreferences,
@@ -4649,6 +4165,7 @@ function VoiceControlPage({
 }: {
   agents: Agent[];
   setAgents: React.Dispatch<React.SetStateAction<Agent[]>>;
+  onTaskMutation: TaskOrchestrationMutation;
   setApprovalRequests: React.Dispatch<
     React.SetStateAction<ApprovalRequest[]>
   >;
@@ -4751,59 +4268,33 @@ function VoiceControlPage({
     }
   }
 
-  function createCodingTask(request: string) {
+  async function createCodingTask(request: string) {
     if (!codingAgent) {
       setMessage("Lucy cannot route work because the Coding Agent is missing.");
       return;
     }
-
-    const task: AgentTask = {
-      id: Date.now(),
-      title: request,
-      category: "Development",
-      priority: preferences.defaultTaskPriority,
-      assignedAgentId: codingAgent.id,
-      status: "Pending",
-      phase: "Assigned",
-      createdAt: new Date().toISOString(),
-      completedAt: null,
-      result: null,
-      responseId: null,
-      runtimeModel: null,
-      totalTokens: null,
-      workspaceId: preferences.activeWorkspaceId,
-      changedFiles: [],
-      diff: null,
-      durationSeconds: null,
-      routingMode: "selected",
-      routedFromAgentId: pcAgent?.id ?? null,
-      routingReason: "Created by Lucy voice control.",
-      reviewAgentId: null,
-      reviewStatus: "Not Requested",
-      reviewResult: null,
-      reviewModel: null,
-      reviewDurationSeconds: null,
-      reviewedAt: null,
-    };
-    setAgents((current) =>
-      current.map((agent) =>
-        agent.id === codingAgent.id
-          ? {
-              ...agent,
-              tasks: [...agent.tasks, task],
-              activity: [
-                {
-                  id: Date.now() + 1,
-                  message: `Lucy created a coding task: ${request}`,
-                  createdAt: new Date().toISOString(),
-                },
-                ...agent.activity,
-              ],
-            }
-          : agent,
-      ),
-    );
-    setMessage(`Lucy queued a coding task for ${codingAgent.name}.`);
+    if (!preferences.activeWorkspaceId) {
+      setMessage("Select an active workspace before Lucy creates a task.");
+      return;
+    }
+    try {
+      await onTaskMutation("create_routed_task", {
+        taskOwnerAgentId: codingAgent.id,
+        title: request,
+        category: "Development",
+        priority: preferences.defaultTaskPriority,
+        workspaceId: preferences.activeWorkspaceId,
+        routingMode: "selected",
+        preferredAgentId: codingAgent.id,
+        selectedAgentId: codingAgent.id,
+      });
+      setMessage(
+        `Lucy submitted a backend-owned coding task for ${codingAgent.name}.`,
+      );
+    } catch (error) {
+      setMessage(persistenceErrorMessage(error));
+      setVoiceUiState("ERROR");
+    }
   }
 
   async function launchApplication(application: { key: string; label: string }) {
@@ -5112,7 +4603,7 @@ function VoiceControlPage({
     setVoiceUiState("PROCESSING");
     setMessage(`Processing: ${understood.transcript}`);
     if (understood.intent === "coding_request") {
-      createCodingTask(understood.entity);
+      void createCodingTask(understood.entity);
       return;
     }
     if (understood.intent === "open_folder") {
@@ -7257,24 +6748,14 @@ function SettingsPage({
             onChange={(strength) => updateDefaultPerformance({ strength })}
           />
           <RangeSetting
-            label="Default CPU limit"
-            value={preferences.defaultPerformance.cpuLimit}
-            minimum={10}
+            label="Default queue workload threshold"
+            value={preferences.defaultPerformance.queueThreshold}
+            minimum={1}
             maximum={100}
-            step={5}
-            suffix="%"
-            hint="Maximum CPU allocation for a new agent."
-            onChange={(cpuLimit) => updateDefaultPerformance({ cpuLimit })}
-          />
-          <RangeSetting
-            label="Default GPU limit"
-            value={preferences.defaultPerformance.gpuLimit}
-            minimum={0}
-            maximum={100}
-            step={5}
-            suffix="%"
-            hint="Set to 0% when GPU acceleration is not needed."
-            onChange={(gpuLimit) => updateDefaultPerformance({ gpuLimit })}
+            hint="Queued and active execute tasks assigned to an agent before overflow handling applies."
+            onChange={(queueThreshold) =>
+              updateDefaultPerformance({ queueThreshold })
+            }
           />
         </div>
 
@@ -7344,9 +6825,10 @@ function SettingsPage({
         <div className="panel-heading">
           <div>
             <span className="eyebrow">AGENT PERFORMANCE</span>
-            <h2>Strength and resource controls</h2>
+            <h2>Strength and workload controls</h2>
             <p className="page-message">
-              Tune each agent and choose where overloaded work should go.
+              Tune routing weight and choose what happens when assigned queue
+              workload reaches a real backend threshold.
             </p>
           </div>
         </div>
@@ -7399,27 +6881,13 @@ function SettingsPage({
                 }
               />
               <RangeSetting
-                label="CPU limit"
-                value={managedAgent.performance.cpuLimit}
-                minimum={10}
+                label="Queue workload threshold"
+                value={managedAgent.performance.queueThreshold}
+                minimum={1}
                 maximum={100}
-                step={5}
-                suffix="%"
-                hint="Maximum CPU share available to this agent."
-                onChange={(cpuLimit) =>
-                  updateManagedAgentPerformance({ cpuLimit })
-                }
-              />
-              <RangeSetting
-                label="GPU limit"
-                value={managedAgent.performance.gpuLimit}
-                minimum={0}
-                maximum={100}
-                step={5}
-                suffix="%"
-                hint="0% disables GPU use for this agent."
-                onChange={(gpuLimit) =>
-                  updateManagedAgentPerformance({ gpuLimit })
+                hint="Backend-counted queued and active execute tasks before this agent is overloaded."
+                onChange={(queueThreshold) =>
+                  updateManagedAgentPerformance({ queueThreshold })
                 }
               />
             </div>
@@ -7472,8 +6940,9 @@ function SettingsPage({
             </div>
 
             <p className="settings-note">
-              These controls are saved now and are ready for the agent runtime
-              to enforce when execution is connected.
+              Queue thresholds and overflow actions are enforced by backend
+              routing. CPU/GPU percentage metadata is retained only for data
+              compatibility and is not presented as an operating-system quota.
             </p>
           </>
         ) : (
@@ -7622,6 +7091,8 @@ function App() {
   const [aiProviderMessage, setAiProviderMessage] = useState("");
   const [runCoordinator, setRunCoordinator] =
     useState<RunCoordinatorUiState>(createRunCoordinatorUiState);
+  const [taskOrchestration, setTaskOrchestration] =
+    useState<TaskOrchestrationSnapshot>(emptyTaskOrchestrationSnapshot);
   const [persistencePhase, setPersistencePhase] = useState<
     "loading" | "mutating" | "hydrating" | "ready" | "error"
   >(desktopRuntime ? "loading" : "ready");
@@ -7705,6 +7176,15 @@ function App() {
         return [];
       }
     });
+
+  const setBackendApprovalRequests: React.Dispatch<
+    React.SetStateAction<ApprovalRequest[]>
+  > = (update) => {
+    if (desktopRuntime) {
+      suppressNextPersistenceWrite.current = true;
+    }
+    setApprovalRequests(update);
+  };
 
   const [reminders, setReminders] = useState<Reminder[]>(() => {
     if (desktopRuntime) {
@@ -7849,6 +7329,9 @@ function App() {
               routingMode?: RoutingMode;
               routedFromAgentId?: number | null;
               routingReason?: string | null;
+              queueState?: AgentTask["queueState"];
+              enqueueSequence?: number | null;
+              routingEvidence?: RoutingEvidence | null;
               reviewAgentId?: number | null;
               reviewStatus?: ReviewStatus;
               reviewResult?: string | null;
@@ -7860,6 +7343,35 @@ function App() {
             const legacyStatus =
               legacyTask.status ??
               (legacyTask.completed ? "Completed" : "Pending");
+            const queueState =
+              legacyTask.queueState === "queued" ||
+              legacyTask.queueState === "held" ||
+              legacyTask.queueState === "admitted" ||
+              legacyTask.queueState === "running" ||
+              legacyTask.queueState === "notQueued"
+                ? legacyTask.queueState
+                : legacyStatus === "Pending" || legacyStatus === "Planned"
+                  ? "queued"
+                  : legacyStatus === "Blocked"
+                    ? "held"
+                    : legacyStatus === "Running"
+                      ? "running"
+                      : "notQueued";
+            const enqueueSequence =
+              queueState === "notQueued"
+                ? null
+                : typeof legacyTask.enqueueSequence === "number" &&
+                    Number.isSafeInteger(legacyTask.enqueueSequence) &&
+                    legacyTask.enqueueSequence > 0
+                  ? legacyTask.enqueueSequence
+                  : legacyTask.id;
+            const routingEvidence =
+              legacyTask.routingEvidence &&
+              typeof legacyTask.routingEvidence.algorithmVersion ===
+                "string" &&
+              Array.isArray(legacyTask.routingEvidence.candidates)
+                ? legacyTask.routingEvidence
+                : null;
 
             return {
               id: legacyTask.id,
@@ -7949,6 +7461,9 @@ function App() {
                 typeof legacyTask.routingReason === "string"
                   ? legacyTask.routingReason
                   : null,
+              queueState,
+              enqueueSequence,
+              routingEvidence,
               reviewAgentId:
                 typeof legacyTask.reviewAgentId === "number"
                   ? legacyTask.reviewAgentId
@@ -8026,12 +7541,30 @@ function App() {
     setAgentRegistrySnapshot(snapshot);
   }
 
+  async function refreshTaskOrchestrationSnapshot() {
+    if (!desktopRuntime) return;
+    const snapshot = await invoke<TaskOrchestrationSnapshot>(
+      "task_orchestration_snapshot",
+    );
+    setTaskOrchestration(snapshot);
+  }
+
   async function refreshAgentRegistrySnapshotAfterCommit() {
     try {
       await refreshAgentRegistrySnapshot();
     } catch (error) {
       setPersistenceMessage(
         `Application state was updated, but agent templates could not be refreshed: ${persistenceErrorMessage(error)}`,
+      );
+    }
+  }
+
+  async function refreshTaskOrchestrationAfterCommit() {
+    try {
+      await refreshTaskOrchestrationSnapshot();
+    } catch (error) {
+      setPersistenceMessage(
+        `Application state was updated, but the task queue could not be refreshed: ${persistenceErrorMessage(error)}`,
       );
     }
   }
@@ -8077,6 +7610,9 @@ function App() {
         void refreshAgentRegistrySnapshot().catch((error: unknown) => {
           if (active) setPersistenceMessage(persistenceErrorMessage(error));
         });
+        void refreshTaskOrchestrationSnapshot().catch((error: unknown) => {
+          if (active) setPersistenceMessage(persistenceErrorMessage(error));
+        });
       })
       .catch((error: unknown) => {
         if (active) {
@@ -8111,11 +7647,14 @@ function App() {
       }
       refreshInFlight = true;
       try {
+        await persistenceWriter.current?.flush();
         const envelope = await invoke<StateEnvelope | null>(
           "load_application_state",
         );
         if (active && envelope) {
+          persistenceWriter.current?.adoptRevision(envelope.revision);
           applyAuthoritativeApplicationState(envelope.state);
+          await refreshTaskOrchestrationSnapshot();
         }
       } catch (error) {
         if (active) {
@@ -8189,6 +7728,7 @@ function App() {
       const envelope = await writer.importLegacyBackup(backupJson);
       hydrateApplicationState(envelope.state);
       await refreshAgentRegistrySnapshotAfterCommit();
+      await refreshTaskOrchestrationAfterCommit();
     } catch (error) {
       if (writer.hasFailed) {
         setPersistenceMessage(persistenceErrorMessage(error));
@@ -8212,6 +7752,7 @@ function App() {
       const envelope = await writer.reset(confirmation);
       hydrateApplicationState(envelope.state);
       await refreshAgentRegistrySnapshotAfterCommit();
+      await refreshTaskOrchestrationAfterCommit();
     } catch (error) {
       if (writer.hasFailed) {
         setPersistenceMessage(persistenceErrorMessage(error));
@@ -8238,6 +7779,7 @@ function App() {
       const envelope = await writer.mutateAgentRegistry(command, request);
       hydrateApplicationState(envelope.state);
       await refreshAgentRegistrySnapshotAfterCommit();
+      await refreshTaskOrchestrationAfterCommit();
     } catch (error) {
       if (writer.hasFailed) {
         setPersistenceMessage(persistenceErrorMessage(error));
@@ -8245,6 +7787,32 @@ function App() {
       } else {
         suppressNextPersistenceWrite.current = true;
         setPersistencePhase("ready");
+      }
+      throw error;
+    }
+  }
+
+  async function mutateTaskOrchestration(
+    command: TaskOrchestrationCommand,
+    request: Record<string, unknown>,
+  ) {
+    const writer = persistenceWriter.current;
+    if (!desktopRuntime || !writer) {
+      throw new Error(
+        "Authoritative task orchestration is available in the desktop app.",
+      );
+    }
+    setPersistenceMessage("");
+    try {
+      const envelope = await writer.mutateTaskOrchestration(command, request);
+      applyAuthoritativeApplicationState(envelope.state);
+      await refreshTaskOrchestrationAfterCommit();
+    } catch (error) {
+      if (writer.hasFailed) {
+        setPersistenceMessage(persistenceErrorMessage(error));
+        setPersistencePhase("error");
+      } else {
+        setPersistenceMessage(persistenceErrorMessage(error));
       }
       throw error;
     }
@@ -8367,7 +7935,7 @@ function App() {
 
     const now = Date.now();
     const taskCutoff =
-      taskRetentionDays === "never"
+      desktopRuntime || taskRetentionDays === "never"
         ? null
         : now - taskRetentionDays * 24 * 60 * 60 * 1000;
     const activityCutoff =
@@ -8413,7 +7981,7 @@ function App() {
       });
       return changed ? retainedAgents : currentAgents;
     });
-  }, [taskRetentionDays, activityRetentionDays]);
+  }, [taskRetentionDays, activityRetentionDays, desktopRuntime]);
 
   useEffect(() => {
     const state: ApplicationState = {
@@ -8640,6 +8208,7 @@ function App() {
           <DashboardPage
             agents={operationalAgents}
             approvalRequests={approvalRequests}
+            taskOrchestration={taskOrchestration}
             onOpenAgents={() => setActivePage("Agents")}
             onOpenTasks={() => setActivePage("Tasks")}
             onOpenApprovals={() => setActivePage("Approvals")}
@@ -8650,38 +8219,41 @@ function App() {
             setAgents={setAgents}
             templates={agentRegistrySnapshot?.templates ?? []}
             onRegistryMutation={mutateAgentRegistry}
+            onTaskMutation={mutateTaskOrchestration}
             authoritativeRegistry={desktopRuntime}
+            authoritativeTaskOrchestration={desktopRuntime}
+            taskOrchestration={taskOrchestration}
             models={models}
             providerRegistry={providerRegistry}
             preferences={preferences}
             runCoordinator={runCoordinator}
             setRunCoordinator={setRunCoordinator}
             approvalRequests={approvalRequests}
-            setApprovalRequests={setApprovalRequests}
+            setApprovalRequests={setBackendApprovalRequests}
             onOpenApprovals={() => setActivePage("Approvals")}
           />
         ) : activePage === "Voice Control" ? (
           <VoiceControlPage
             agents={operationalAgents}
             setAgents={setAgents}
-            setApprovalRequests={setApprovalRequests}
+            onTaskMutation={mutateTaskOrchestration}
+            setApprovalRequests={setBackendApprovalRequests}
             preferences={preferences}
             setPreferences={setPreferences}
           />
         ) : activePage === "Tasks" ? (
           <TasksPage
             agents={operationalAgents}
-            setAgents={setAgents}
-            retentionDays={taskRetentionDays}
-            setRetentionDays={setTaskRetentionDays}
-            setApprovalRequests={setApprovalRequests}
+            taskOrchestration={taskOrchestration}
+            onTaskMutation={mutateTaskOrchestration}
+            runActive={Boolean(globalActiveRun)}
+            setApprovalRequests={setBackendApprovalRequests}
           />
         ) : activePage === "Approvals" ? (
           <ApprovalsPage
             agents={operationalAgents}
-            setAgents={setAgents}
             approvalRequests={approvalRequests}
-            setApprovalRequests={setApprovalRequests}
+            setApprovalRequests={setBackendApprovalRequests}
             workspaces={preferences.workspaces}
             onOpenAgents={() => setActivePage("Agents")}
           />
@@ -8739,7 +8311,8 @@ function App() {
           <VoiceControlPage
             agents={operationalAgents}
             setAgents={setAgents}
-            setApprovalRequests={setApprovalRequests}
+            onTaskMutation={mutateTaskOrchestration}
+            setApprovalRequests={setBackendApprovalRequests}
             preferences={preferences}
             setPreferences={setPreferences}
             visible={false}

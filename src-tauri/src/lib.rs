@@ -7,6 +7,7 @@ mod persistence;
 mod policy;
 mod provider_runtime;
 mod run_coordinator;
+mod task_orchestration;
 mod workspace_tools;
 
 use agent_registry::{
@@ -62,6 +63,10 @@ use std::{
     },
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
+};
+use task_orchestration::{
+    CreateRoutedTaskRequest, RerouteTaskRequest, SetTaskQueueDispositionRequest,
+    TaskOrchestrationSnapshot,
 };
 use tauri::{
     menu::{Menu, MenuItem},
@@ -3164,6 +3169,39 @@ async fn restore_agent_template(
 }
 
 #[tauri::command]
+async fn create_routed_task(
+    state: State<'_, PersistenceService>,
+    request: CreateRoutedTaskRequest,
+) -> Result<StateEnvelope, PersistenceError> {
+    let providers = provider_registry_status().await;
+    state.inner().create_routed_task(request, providers).await
+}
+
+#[tauri::command]
+async fn reroute_task(
+    state: State<'_, PersistenceService>,
+    request: RerouteTaskRequest,
+) -> Result<StateEnvelope, PersistenceError> {
+    let providers = provider_registry_status().await;
+    state.inner().reroute_task(request, providers).await
+}
+
+#[tauri::command]
+async fn set_task_queue_disposition(
+    state: State<'_, PersistenceService>,
+    request: SetTaskQueueDispositionRequest,
+) -> Result<StateEnvelope, PersistenceError> {
+    state.inner().set_task_queue_disposition(request).await
+}
+
+#[tauri::command]
+async fn task_orchestration_snapshot(
+    state: State<'_, PersistenceService>,
+) -> Result<TaskOrchestrationSnapshot, PersistenceError> {
+    state.inner().task_orchestration_snapshot().await
+}
+
+#[tauri::command]
 async fn request_authorization(
     state: State<'_, PersistenceService>,
     intent: ActionIntent,
@@ -3631,6 +3669,10 @@ pub fn run() {
             update_agent,
             delete_agent,
             restore_agent_template,
+            create_routed_task,
+            reroute_task,
+            set_task_queue_disposition,
+            task_orchestration_snapshot,
             request_authorization,
             resolve_approval,
             codex_runtime_status,

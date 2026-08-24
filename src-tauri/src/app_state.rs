@@ -1,8 +1,9 @@
 use crate::agent_registry::{normalize_legacy_agents, validate_agent_registry};
+use crate::task_orchestration::{RoutingEvidence, ROUTING_ALGORITHM_VERSION};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fmt};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 pub const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 pub const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -161,6 +162,8 @@ pub struct AgentPerformance {
     pub focus: String,
     pub cpu_limit: i64,
     pub gpu_limit: i64,
+    #[serde(default = "default_queue_threshold")]
+    pub queue_threshold: i64,
     pub overflow_action: String,
     pub redirect_agent_id: Option<i64>,
 }
@@ -238,6 +241,12 @@ pub struct AgentTask {
     pub routing_mode: String,
     pub routed_from_agent_id: Option<i64>,
     pub routing_reason: Option<String>,
+    #[serde(default = "default_task_queue_state")]
+    pub queue_state: String,
+    #[serde(default)]
+    pub enqueue_sequence: Option<i64>,
+    #[serde(default)]
+    pub routing_evidence: Option<RoutingEvidence>,
     pub review_agent_id: Option<i64>,
     pub review_status: String,
     pub review_result: Option<String>,
@@ -342,6 +351,14 @@ fn default_registry_state() -> String {
     "active".to_string()
 }
 
+pub(crate) const fn default_queue_threshold() -> i64 {
+    10
+}
+
+fn default_task_queue_state() -> String {
+    "notQueued".to_string()
+}
+
 impl fmt::Display for StateValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}: {}", self.path, self.message)
@@ -397,6 +414,7 @@ pub fn application_state_from_legacy(
     }
 
     downgrade_legacy_approvals(&mut state);
+    normalize_legacy_task_orchestration(&mut state);
     validate_application_state(&state)?;
     Ok(state)
 }
@@ -442,6 +460,7 @@ pub fn application_state_from_legacy_backup(
     normalize_legacy_agents(&mut state.agents);
     append_missing_ollama_model(&mut state)?;
     downgrade_legacy_approvals(&mut state);
+    normalize_legacy_task_orchestration(&mut state);
     validate_application_state(&state)?;
     Ok(state)
 }
@@ -480,6 +499,57 @@ fn append_missing_ollama_model(state: &mut ApplicationState) -> Result<(), State
         provider: "Ollama".to_string(),
     });
     Ok(())
+}
+
+fn normalize_legacy_task_orchestration(state: &mut ApplicationState) {
+    let mut queued = state
+        .agents
+        .iter()
+        .enumerate()
+        .flat_map(|(agent_index, agent)| {
+            agent
+                .tasks
+                .iter()
+                .enumerate()
+                .filter(|(_, task)| {
+                    matches!(task.status.as_str(), "Pending" | "Blocked" | "Running")
+                })
+                .map(move |(task_index, task)| {
+                    (
+                        task.created_at.clone(),
+                        agent.id,
+                        task.id,
+                        agent_index,
+                        task_index,
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    queued.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+
+    for agent in &mut state.agents {
+        for task in &mut agent.tasks {
+            task.queue_state = "notQueued".to_string();
+            task.enqueue_sequence = None;
+            task.routing_evidence = None;
+        }
+    }
+    for (position, (_, _, _, agent_index, task_index)) in queued.into_iter().enumerate() {
+        let task = &mut state.agents[agent_index].tasks[task_index];
+        task.queue_state = match task.status.as_str() {
+            "Pending" => "queued",
+            "Blocked" => "held",
+            "Running" => "running",
+            _ => "notQueued",
+        }
+        .to_string();
+        task.enqueue_sequence = Some(position as i64 + 1);
+    }
 }
 
 fn downgrade_legacy_approvals(state: &mut ApplicationState) {
@@ -527,6 +597,7 @@ pub fn validate_application_state(state: &ApplicationState) -> Result<(), StateV
     )?;
 
     let mut agent_ids = HashSet::new();
+    let mut enqueue_sequences = HashSet::new();
     let mut total_tasks = 0;
     let mut total_activity = 0;
     for (agent_index, agent) in state.agents.iter().enumerate() {
@@ -594,6 +665,14 @@ pub fn validate_application_state(state: &ApplicationState) -> Result<(), StateV
                     format!("{task_path}.id"),
                     "task id must be unique within its agent",
                 ));
+            }
+            if let Some(sequence) = task.enqueue_sequence {
+                if !enqueue_sequences.insert(sequence) {
+                    return Err(StateValidationError::new(
+                        format!("{task_path}.enqueueSequence"),
+                        "enqueue sequence must be globally unique",
+                    ));
+                }
             }
         }
 
@@ -989,6 +1068,38 @@ fn validate_task(path: &str, task: &AgentTask) -> Result<(), StateValidationErro
         &["selected", "automatic"],
     )?;
     validate_enum(
+        &format!("{path}.queueState"),
+        &task.queue_state,
+        &["queued", "held", "admitted", "running", "notQueued"],
+    )?;
+    validate_optional_id(&format!("{path}.enqueueSequence"), task.enqueue_sequence)?;
+    let requires_sequence = matches!(
+        task.queue_state.as_str(),
+        "queued" | "held" | "admitted" | "running"
+    );
+    if requires_sequence != task.enqueue_sequence.is_some() {
+        return Err(StateValidationError::new(
+            format!("{path}.enqueueSequence"),
+            "queued lifecycle states require a sequence and notQueued forbids one",
+        ));
+    }
+    let lifecycle_matches = match task.queue_state.as_str() {
+        "queued" | "admitted" => task.status == "Pending",
+        "held" => matches!(task.status.as_str(), "Pending" | "Blocked"),
+        "running" => task.status == "Running",
+        "notQueued" => !matches!(task.status.as_str(), "Pending" | "Running" | "Blocked"),
+        _ => false,
+    };
+    if !lifecycle_matches {
+        return Err(StateValidationError::new(
+            format!("{path}.queueState"),
+            "queue state does not match the task lifecycle status",
+        ));
+    }
+    if let Some(evidence) = &task.routing_evidence {
+        validate_routing_evidence(path, task, evidence)?;
+    }
+    validate_enum(
         &format!("{path}.reviewStatus"),
         &task.review_status,
         &[
@@ -1071,6 +1182,174 @@ fn validate_task(path: &str, task: &AgentTask) -> Result<(), StateValidationErro
     Ok(())
 }
 
+fn validate_routing_evidence(
+    path: &str,
+    task: &AgentTask,
+    evidence: &RoutingEvidence,
+) -> Result<(), StateValidationError> {
+    let evidence_path = format!("{path}.routingEvidence");
+    if evidence.algorithm_version != ROUTING_ALGORITHM_VERSION {
+        return Err(StateValidationError::new(
+            format!("{evidence_path}.algorithmVersion"),
+            "routing evidence uses an unsupported algorithm version",
+        ));
+    }
+    if evidence.routing_mode != task.routing_mode {
+        return Err(StateValidationError::new(
+            format!("{evidence_path}.routingMode"),
+            "routing evidence mode must match the task",
+        ));
+    }
+    validate_optional_id(
+        &format!("{evidence_path}.preferredAgentId"),
+        evidence.preferred_agent_id,
+    )?;
+    validate_optional_id(
+        &format!("{evidence_path}.selectedAgentId"),
+        evidence.selected_agent_id,
+    )?;
+    validate_id(
+        &format!("{evidence_path}.winningAgentId"),
+        evidence.winning_agent_id,
+    )?;
+    if evidence.winning_agent_id != task.assigned_agent_id {
+        return Err(StateValidationError::new(
+            format!("{evidence_path}.winningAgentId"),
+            "routing winner must match the assigned executor",
+        ));
+    }
+    validate_text(
+        &format!("{evidence_path}.outcomeCode"),
+        &evidence.outcome_code,
+        MAX_SHORT_TEXT,
+        false,
+    )?;
+    validate_text(
+        &format!("{evidence_path}.reason"),
+        &evidence.reason,
+        MAX_LARGE_TEXT,
+        false,
+    )?;
+    validate_count(
+        &format!("{evidence_path}.candidates"),
+        evidence.candidates.len(),
+        MAX_AGENTS,
+    )?;
+    if evidence.candidates.is_empty() {
+        return Err(StateValidationError::new(
+            format!("{evidence_path}.candidates"),
+            "routing evidence must include evaluated candidates",
+        ));
+    }
+
+    let mut candidate_ids = HashSet::new();
+    let mut winner_is_eligible = false;
+    for (candidate_index, candidate) in evidence.candidates.iter().enumerate() {
+        let candidate_path = format!("{evidence_path}.candidates[{candidate_index}]");
+        validate_id(&format!("{candidate_path}.agentId"), candidate.agent_id)?;
+        if !candidate_ids.insert(candidate.agent_id) {
+            return Err(StateValidationError::new(
+                format!("{candidate_path}.agentId"),
+                "routing candidate agent ids must be unique",
+            ));
+        }
+        for (name, value) in [
+            ("agentName", candidate.agent_name.as_str()),
+            ("category", candidate.category.as_str()),
+            ("role", candidate.role.as_str()),
+            ("model", candidate.model.as_str()),
+            ("overflowAction", candidate.overflow_action.as_str()),
+        ] {
+            validate_text(
+                &format!("{candidate_path}.{name}"),
+                value,
+                MAX_SHORT_TEXT,
+                false,
+            )?;
+        }
+        validate_range(
+            &format!("{candidate_path}.queueThreshold"),
+            candidate.queue_threshold,
+            1,
+            100,
+        )?;
+        if candidate.workload < 0 {
+            return Err(StateValidationError::new(
+                format!("{candidate_path}.workload"),
+                "routing workload cannot be negative",
+            ));
+        }
+        validate_optional_id(
+            &format!("{candidate_path}.redirectAgentId"),
+            candidate.redirect_agent_id,
+        )?;
+        validate_optional_text(
+            &format!("{candidate_path}.selectionExcludedCode"),
+            candidate.selection_excluded_code.as_deref(),
+            MAX_SHORT_TEXT,
+        )?;
+        if candidate.disqualifications.len() > 32 || candidate.score_components.len() > 32 {
+            return Err(StateValidationError::new(
+                candidate_path,
+                "routing candidate evidence exceeds the bounded reason count",
+            ));
+        }
+        for (reason_index, reason) in candidate.disqualifications.iter().enumerate() {
+            validate_text(
+                &format!("{candidate_path}.disqualifications[{reason_index}].code"),
+                &reason.code,
+                MAX_SHORT_TEXT,
+                false,
+            )?;
+            validate_text(
+                &format!("{candidate_path}.disqualifications[{reason_index}].message"),
+                &reason.message,
+                MAX_LARGE_TEXT,
+                false,
+            )?;
+        }
+        let mut computed_score = 0i64;
+        for (component_index, component) in candidate.score_components.iter().enumerate() {
+            validate_text(
+                &format!("{candidate_path}.scoreComponents[{component_index}].code"),
+                &component.code,
+                MAX_SHORT_TEXT,
+                false,
+            )?;
+            computed_score = computed_score
+                .checked_add(component.points)
+                .ok_or_else(|| {
+                    StateValidationError::new(
+                        format!("{candidate_path}.score"),
+                        "routing score exceeds the supported range",
+                    )
+                })?;
+        }
+        if computed_score != candidate.score {
+            return Err(StateValidationError::new(
+                format!("{candidate_path}.score"),
+                "routing score does not equal its recorded components",
+            ));
+        }
+        if candidate.eligible != candidate.disqualifications.is_empty() {
+            return Err(StateValidationError::new(
+                format!("{candidate_path}.eligible"),
+                "routing eligibility conflicts with disqualification evidence",
+            ));
+        }
+        if candidate.agent_id == evidence.winning_agent_id && candidate.eligible {
+            winner_is_eligible = true;
+        }
+    }
+    if !winner_is_eligible {
+        return Err(StateValidationError::new(
+            format!("{evidence_path}.winningAgentId"),
+            "routing winner must be present and hard-eligible",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_performance(
     path: &str,
     performance: &AgentPerformance,
@@ -1078,6 +1357,12 @@ fn validate_performance(
     validate_range(&format!("{path}.strength"), performance.strength, 1, 10)?;
     validate_range(&format!("{path}.cpuLimit"), performance.cpu_limit, 10, 100)?;
     validate_range(&format!("{path}.gpuLimit"), performance.gpu_limit, 0, 100)?;
+    validate_range(
+        &format!("{path}.queueThreshold"),
+        performance.queue_threshold,
+        1,
+        100,
+    )?;
     validate_enum(
         &format!("{path}.focus"),
         &performance.focus,

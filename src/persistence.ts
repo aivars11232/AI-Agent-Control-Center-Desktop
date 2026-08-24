@@ -28,6 +28,11 @@ export type BootstrapResult = {
   cleanupWarning: string | null;
 };
 
+export type TaskOrchestrationCommand =
+  | "create_routed_task"
+  | "reroute_task"
+  | "set_task_queue_disposition";
+
 export function collectLegacyRendererState(
   storage: StorageReader,
 ): LegacyRendererState {
@@ -168,6 +173,30 @@ export class ApplicationStateWriter {
     });
     this.revision = envelope.revision;
     return envelope;
+  }
+
+  async mutateTaskOrchestration(
+    command: TaskOrchestrationCommand,
+    request: Record<string, unknown>,
+  ): Promise<StateEnvelope> {
+    await this.flush();
+    const envelope = await this.invoke<StateEnvelope>(command, {
+      request: {
+        ...request,
+        expectedRevision: this.revision,
+      },
+    });
+    this.revision = envelope.revision;
+    return envelope;
+  }
+
+  adoptRevision(revision: number): void {
+    if (this.drainPromise || this.pendingState) {
+      throw new Error(
+        "Cannot adopt an authoritative revision while a state write is pending.",
+      );
+    }
+    this.revision = revision;
   }
 
   private async drain(): Promise<void> {
