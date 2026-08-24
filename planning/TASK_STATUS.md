@@ -29,8 +29,8 @@ ready merely because its predecessor's code was edited.
 | TASK-0005 | TASK-0004 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Single-run coordinator, task lifecycle, ledger, and bounded output |
 | TASK-0006 | TASK-0005 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Truthful provider registry and common runtime contract |
 | TASK-0007 | TASK-0006 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Codex runtime isolation, cancellation, and evidence hardening |
-| TASK-0008 | TASK-0007 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Ollama discovery, transport, cancellation, and safe workspace tools |
-| TASK-0009 | TASK-0008 | NOT STARTED | NO | NOT STARTED | — | — | Dynamic agent registry and valid organizational hierarchy |
+| TASK-0008 | TASK-0007 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Ollama discovery, transport, cancellation, and safe workspace tools |
+| TASK-0009 | TASK-0008 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Dynamic agent registry and valid organizational hierarchy |
 | TASK-0010 | TASK-0009 | NOT STARTED | NO | NOT STARTED | — | — | Deterministic routing, queueing, workload, and sequential scheduling |
 | TASK-0011 | TASK-0010 | NOT STARTED | NO | NOT STARTED | — | — | Structured multi-level review, revisions, and recovery |
 | TASK-0012 | TASK-0011 | NOT STARTED | NO | NOT STARTED | — | — | Complete workspace change evidence and Git/non-Git inspection |
@@ -413,6 +413,87 @@ ready merely because its predecessor's code was edited.
   packaged-platform acceptance remain with TASK-0020; descriptor-confined
   workspace tools intentionally fail closed outside Linux; full-file hashing
   and patching reject files above the explicit 8 MiB bound
+- Git closure: implementation commit
+  <code>9ebbe5b740715e53b048fed8b3ab8847601c2f92</code>
+  (<code>task8</code>) was identified from actual Git history, was the checked-out
+  <code>main</code> HEAD, and was reachable from <code>origin/main</code> at the
+  TASK-0009 preflight. Checked-out <code>main</code> and
+  <code>origin/main</code> both resolved to that commit with zero ahead/behind
+  and a clean working tree on 2026-08-24. Its 16-file implementation scope
+  matched the retained TASK-0008 evidence with no unexplained intervening
+  state, so all seven successor-preflight closure conditions passed.
+
+## TASK-0009 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>9ebbe5b740715e53b048fed8b3ab8847601c2f92</code>
+  (<code>task8</code>)
+- Starting status: clean; <code>main</code> matched <code>origin/main</code> with
+  zero ahead/behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0008 as
+  recorded above; its actual 16-file implementation commit and scope were
+  verified rather than inferred from the stale tracker label
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0009 AS PLANNED.</code>
+- Added schema version 4 and migration 0004 for unique stable template keys,
+  active/unassigned/deleted registry lifecycle, bounded repair issues, deletion
+  timestamps, role-derived authority, legacy-edge quarantine, and a durable
+  monotonic JavaScript-safe agent-ID allocator
+- Added backend-authoritative revision-checked create, update, logical-delete,
+  and explicit default-template restore IPC. Generic whole-state saves cannot
+  create, delete, rename, change lifecycle, alter role/category/authority, or
+  rewrite reporting relationships
+- Enforced active higher-authority managers and rejected self-parenting,
+  multi-agent cycles, dangling/inactive managers, unknown roles, and
+  role/authority mismatch. Legacy invalid agents remain visible as paused
+  Needs assignment records; deliberately absent defaults are not appended
+- Logical deletion preserves identity/history, requires compatible direct-report
+  reassignment, clears redirects/reminder bindings, reconciles nonterminal task
+  and review references, and expires pending/approved approvals. Default agents
+  return only through explicit template restore; current backup lifecycle fields
+  survive import
+- Replaced fixed default-ID groups and display-name runtime lookup with dynamic
+  category/ancestor projections, stable template identity, active-registry
+  selectors, role-derived manager choices, and a visited-set hierarchy view.
+  Dashboard, routing, review, voice, approvals, reminders, and settings use the
+  same active registry truth; deleted records remain available to backup export
+- Added focused UI/domain tests for custom-agent visibility, lifecycle
+  separation, stable renamed-template lookup, compatible managers, cycle and
+  dangling legacy repair, plus serialized registry IPC revisions
+- Added backend tests for full CRUD, monotonic identity, template restoration,
+  database reopen persistence, self/cycle/dangling/authority rejection,
+  renderer-bypass denial, legacy absence/quarantine, and backup tombstone
+  preservation
+- No dependency, package-lock, Cargo manifest/lock, provider runtime, routing
+  scoring, message bus, live platform, installer, or release-version change was
+  required
+- Focused verification passed on 2026-08-24: 6 TASK-0009 Rust tests, the
+  legacy-backup regression, 2 frontend files/12 tests, TypeScript, and rustfmt
+- Complete fast gate: <code>npm run verify:fast</code> passed with 6 frontend
+  files/39 tests and 93 locked/offline Rust tests
+- Full non-live gate: <code>npm run verify:full</code> passed on 2026-08-24 with
+  6 frontend files/39 tests, TypeScript, rustfmt, 93 locked/offline Rust tests,
+  a 40-module production build, Clippy with warnings denied,
+  shell/Python/strict-JSON checks, npm/Cargo dependency trees, and production
+  plus full npm audits reporting zero vulnerabilities
+- Rust advisory result: **indeterminate** because <code>cargo-audit</code> is
+  unavailable; the full route records the skip explicitly and this
+  environmental limitation is not a pass
+- Live Codex/Ollama generation, provider authentication, microphone/listener,
+  portal, install/remove, desktop package, and desktop/system-control actions:
+  not run
+- Minor in-scope corrections during implementation: explicit lifecycle fields
+  are preserved during legacy-backup normalization, and the renderer consumes
+  its persistence-write suppression immediately after authoritative hydration
+  so the next ordinary change is not skipped
+- Remaining limits: TASK-0010 owns deterministic routing/queue scheduling;
+  TASK-0011 owns structured multi-level review/revision; TASK-0014 owns the
+  strict future backup format and full lifecycle UX; installed/live acceptance
+  remains with TASK-0020
 - Git closure: **PENDING USER** review, commit, push, and clean-tree evidence
 
 ## Successor-preflight closure rule

@@ -25,7 +25,7 @@ class MemoryStorage implements StorageReader {
 
 function envelope(revision = 1): StateEnvelope {
   return {
-    schemaVersion: 1,
+    schemaVersion: 4,
     revision,
     state: createDefaultApplicationState(),
     migration: {
@@ -161,7 +161,7 @@ describe("serialized application-state writes", () => {
     expect(
       (saves[0].args?.request as { expectedRevision: number }).expectedRevision,
     ).toBe(1);
-    saves[0].resolve({ schemaVersion: 1, revision: 2 });
+    saves[0].resolve({ schemaVersion: 4, revision: 2 });
     await Promise.resolve();
     await Promise.resolve();
     expect(saves).toHaveLength(2);
@@ -171,7 +171,7 @@ describe("serialized application-state writes", () => {
     };
     expect(secondRequest.expectedRevision).toBe(2);
     expect(secondRequest.state.preferences.theme).toBe("system");
-    saves[1].resolve({ schemaVersion: 1, revision: 3 });
+    saves[1].resolve({ schemaVersion: 4, revision: 3 });
 
     await writer.flush();
     expect(failure).not.toHaveBeenCalled();
@@ -196,5 +196,41 @@ describe("serialized application-state writes", () => {
 
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(failure).toHaveBeenCalledTimes(1);
+  });
+
+  it("flushes pending state before an authoritative registry mutation and advances its revision", async () => {
+    const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    const invoke: InvokeFunction = async <T>(
+      command: string,
+      args?: Record<string, unknown>,
+    ) => {
+      calls.push({ command, args });
+      if (command === "save_application_state") {
+        return { schemaVersion: 4, revision: 6 } as T;
+      }
+      return envelope(7) as T;
+    };
+    const writer = new ApplicationStateWriter(invoke, 5, vi.fn());
+    writer.enqueue(createDefaultApplicationState());
+
+    await writer.mutateAgentRegistry("create_agent", {
+      name: "Custom Builder",
+      description: "Builds custom workspace features",
+      role: "Specialist",
+      category: "Development",
+      reportsTo: 3,
+    });
+    await writer.mutateAgentRegistry("delete_agent", {
+      agentId: 12,
+      replacementManagerId: null,
+    });
+
+    expect(calls.map((call) => call.command)).toEqual([
+      "save_application_state",
+      "create_agent",
+      "delete_agent",
+    ]);
+    expect(calls[1].args?.request).toMatchObject({ expectedRevision: 6 });
+    expect(calls[2].args?.request).toMatchObject({ expectedRevision: 7 });
   });
 });

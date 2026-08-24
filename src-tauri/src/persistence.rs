@@ -1,3 +1,7 @@
+use crate::agent_registry::{
+    authority_for_role, template_summaries, AgentRegistrySnapshot, CreateAgentRequest,
+    DeleteAgentRequest, RestoreAgentTemplateRequest, UpdateAgentRequest,
+};
 use crate::app_state::{
     application_state_from_legacy, application_state_from_legacy_backup, default_application_state,
     validate_application_state, ActivityEntry, Agent, AgentApprovals, AgentCapabilities,
@@ -31,6 +35,7 @@ const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_application_sta
 const AUTHORIZATION_MIGRATION: &str =
     include_str!("../migrations/0002_authoritative_approvals.sql");
 const RUN_COORDINATION_MIGRATION: &str = include_str!("../migrations/0003_run_coordination.sql");
+const AGENT_REGISTRY_MIGRATION: &str = include_str!("../migrations/0004_agent_registry.sql");
 const MAX_AUTHORIZATION_RECORDS: i64 = 10_000;
 
 #[derive(Debug, Clone)]
@@ -83,7 +88,10 @@ impl PersistenceError {
     fn validation(error: StateValidationError) -> Self {
         Self::new(
             "STATE_VALIDATION_FAILED",
-            format!("Stored application state is invalid at {}.", error.path),
+            format!(
+                "Stored application state is invalid at {}: {}",
+                error.path, error.message
+            ),
             true,
         )
     }
@@ -207,6 +215,42 @@ impl PersistenceService {
         expected_revision: i64,
     ) -> PersistenceResult<StateEnvelope> {
         self.run(move |repository| repository.acknowledge_legacy_cleanup(expected_revision))
+            .await
+    }
+
+    pub async fn agent_registry_snapshot(&self) -> PersistenceResult<AgentRegistrySnapshot> {
+        self.run(StateRepository::agent_registry_snapshot).await
+    }
+
+    pub async fn create_agent(
+        &self,
+        request: CreateAgentRequest,
+    ) -> PersistenceResult<StateEnvelope> {
+        self.run(move |repository| repository.create_agent(request))
+            .await
+    }
+
+    pub async fn update_agent(
+        &self,
+        request: UpdateAgentRequest,
+    ) -> PersistenceResult<StateEnvelope> {
+        self.run(move |repository| repository.update_agent(request))
+            .await
+    }
+
+    pub async fn delete_agent(
+        &self,
+        request: DeleteAgentRequest,
+    ) -> PersistenceResult<StateEnvelope> {
+        self.run(move |repository| repository.delete_agent(request))
+            .await
+    }
+
+    pub async fn restore_agent_template(
+        &self,
+        request: RestoreAgentTemplateRequest,
+    ) -> PersistenceResult<StateEnvelope> {
+        self.run(move |repository| repository.restore_agent_template(request))
             .await
     }
 
@@ -408,6 +452,394 @@ impl StateRepository {
         Ok(Some(envelope))
     }
 
+    pub fn agent_registry_snapshot(&mut self) -> PersistenceResult<AgentRegistrySnapshot> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(PersistenceError::database)?;
+        let meta = application_meta_from(&transaction)?;
+        if !meta.initialized {
+            return Err(PersistenceError::new(
+                "APPLICATION_STATE_UNINITIALIZED",
+                "Application state must be initialized before loading the agent registry.",
+                true,
+            ));
+        }
+        let state = read_application_state(&transaction)?;
+        let defaults = default_application_state().map_err(PersistenceError::validation)?;
+        let snapshot = AgentRegistrySnapshot {
+            revision: meta.state_revision,
+            templates: template_summaries(&defaults.agents, &state.agents),
+        };
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(snapshot)
+    }
+
+    fn mutate_agent_registry<F>(
+        &mut self,
+        expected_revision: i64,
+        operation: F,
+    ) -> PersistenceResult<StateEnvelope>
+    where
+        F: FnOnce(&Transaction<'_>, &mut ApplicationState) -> PersistenceResult<()>,
+    {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let meta = application_meta_from(&transaction)?;
+        ensure_expected_revision(&meta, expected_revision)?;
+        ensure_run_mutation_idle(&transaction)?;
+        let mut state = read_application_state(&transaction)?;
+        operation(&transaction, &mut state)?;
+        validate_application_state(&state).map_err(PersistenceError::validation)?;
+        write_application_state(
+            &transaction,
+            &state,
+            "renderer_prototype",
+            &HashMap::new(),
+            false,
+        )?;
+        let revision = next_revision(meta.state_revision)?;
+        transaction
+            .execute(
+                "UPDATE application_meta SET state_revision = ?1 WHERE singleton = 1",
+                [revision],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        self.load()?.ok_or_else(|| {
+            PersistenceError::new(
+                "AGENT_REGISTRY_MUTATION_FAILED",
+                "Agent registry state was not available after the mutation committed.",
+                false,
+            )
+        })
+    }
+
+    pub fn create_agent(
+        &mut self,
+        request: CreateAgentRequest,
+    ) -> PersistenceResult<StateEnvelope> {
+        self.mutate_agent_registry(request.expected_revision, move |transaction, state| {
+            let authority_level = authority_for_role(&request.role).ok_or_else(|| {
+                PersistenceError::new("AGENT_ROLE_INVALID", "Select a supported agent role.", true)
+            })?;
+            let id = allocate_agent_id(transaction)?;
+            let reports_to = if request.role == "Supervisor" {
+                None
+            } else {
+                request.reports_to
+            };
+            state.agents.push(Agent {
+                id,
+                template_key: None,
+                registry_state: "active".to_string(),
+                registry_issue: None,
+                deleted_at_unix_ms: None,
+                name: request.name.trim().to_string(),
+                description: request.description.trim().to_string(),
+                status: state.preferences.default_agent_status.clone(),
+                role: request.role,
+                category: request.category,
+                reports_to,
+                authority_level,
+                model: state.preferences.default_model.clone(),
+                memory: String::new(),
+                tasks: Vec::new(),
+                activity: Vec::new(),
+                performance: state.preferences.default_performance.clone(),
+                capabilities: AgentCapabilities {
+                    files: "read".to_string(),
+                    internet: "none".to_string(),
+                    clipboard: "none".to_string(),
+                    terminal: "none".to_string(),
+                    system: "none".to_string(),
+                },
+                approvals: AgentApprovals {
+                    files: "ask".to_string(),
+                    internet: "ask".to_string(),
+                    clipboard: "ask".to_string(),
+                    terminal: "ask".to_string(),
+                    system: "ask".to_string(),
+                },
+            });
+            Ok(())
+        })
+    }
+
+    pub fn update_agent(
+        &mut self,
+        request: UpdateAgentRequest,
+    ) -> PersistenceResult<StateEnvelope> {
+        self.mutate_agent_registry(request.expected_revision, move |_transaction, state| {
+            let authority_level = authority_for_role(&request.role).ok_or_else(|| {
+                PersistenceError::new("AGENT_ROLE_INVALID", "Select a supported agent role.", true)
+            })?;
+            let agent = state
+                .agents
+                .iter_mut()
+                .find(|agent| agent.id == request.agent_id)
+                .ok_or_else(|| {
+                    PersistenceError::new(
+                        "AGENT_NOT_FOUND",
+                        "The selected agent no longer exists.",
+                        true,
+                    )
+                })?;
+            if agent.registry_state == "deleted" {
+                return Err(PersistenceError::new(
+                    "AGENT_DELETED",
+                    "Deleted agents cannot be edited.",
+                    true,
+                ));
+            }
+            agent.name = request.name.trim().to_string();
+            agent.description = request.description.trim().to_string();
+            agent.role = request.role;
+            agent.category = request.category;
+            agent.reports_to = if agent.role == "Supervisor" {
+                None
+            } else {
+                request.reports_to
+            };
+            agent.authority_level = authority_level;
+            agent.registry_state = "active".to_string();
+            agent.registry_issue = None;
+            agent.deleted_at_unix_ms = None;
+            Ok(())
+        })
+    }
+
+    pub fn delete_agent(
+        &mut self,
+        request: DeleteAgentRequest,
+    ) -> PersistenceResult<StateEnvelope> {
+        let timestamp = now_unix_ms()?;
+        self.mutate_agent_registry(request.expected_revision, move |transaction, state| {
+            let target_index = state
+                .agents
+                .iter()
+                .position(|agent| agent.id == request.agent_id)
+                .ok_or_else(|| {
+                    PersistenceError::new(
+                        "AGENT_NOT_FOUND",
+                        "The selected agent no longer exists.",
+                        true,
+                    )
+                })?;
+            if state.agents[target_index].registry_state == "deleted" {
+                return Err(PersistenceError::new(
+                    "AGENT_ALREADY_DELETED",
+                    "The selected agent is already deleted.",
+                    true,
+                ));
+            }
+
+            let direct_report_ids = state
+                .agents
+                .iter()
+                .filter(|agent| {
+                    agent.registry_state == "active" && agent.reports_to == Some(request.agent_id)
+                })
+                .map(|agent| agent.id)
+                .collect::<Vec<_>>();
+            if !direct_report_ids.is_empty() && request.replacement_manager_id.is_none() {
+                return Err(PersistenceError::new(
+                    "AGENT_REASSIGNMENT_REQUIRED",
+                    "Reassign this agent's direct reports before deleting it.",
+                    true,
+                ));
+            }
+            if request.replacement_manager_id == Some(request.agent_id) {
+                return Err(PersistenceError::new(
+                    "AGENT_REASSIGNMENT_INVALID",
+                    "The deleted agent cannot be its own replacement manager.",
+                    true,
+                ));
+            }
+            if let Some(replacement_manager_id) = request.replacement_manager_id {
+                for agent in &mut state.agents {
+                    if direct_report_ids.contains(&agent.id) {
+                        agent.reports_to = Some(replacement_manager_id);
+                    }
+                }
+            }
+
+            let resolved_at = format_unix_ms(timestamp);
+            for agent in &mut state.agents {
+                if agent.performance.redirect_agent_id == Some(request.agent_id) {
+                    agent.performance.redirect_agent_id = None;
+                    agent.performance.overflow_action = "queue".to_string();
+                }
+                for task in &mut agent.tasks {
+                    let nonterminal = !matches!(task.status.as_str(), "Completed" | "Failed");
+                    let deleted_owner = agent.id == request.agent_id && nonterminal;
+                    if deleted_owner {
+                        task.status = "Failed".to_string();
+                        task.phase = "Failed".to_string();
+                        task.completed_at = Some(resolved_at.clone());
+                        task.result =
+                            Some("Task closed because its owning agent was deleted.".to_string());
+                    } else if task.assigned_agent_id == request.agent_id && nonterminal {
+                        task.assigned_agent_id = agent.id;
+                        task.status = "Pending".to_string();
+                        task.phase = "Assigned".to_string();
+                    }
+                    if task.routed_from_agent_id == Some(request.agent_id) {
+                        task.routed_from_agent_id = None;
+                    }
+                    if deleted_owner
+                        || (task.review_agent_id == Some(request.agent_id)
+                            && !matches!(
+                                task.review_status.as_str(),
+                                "Approved" | "Changes Requested"
+                            ))
+                    {
+                        task.review_agent_id = None;
+                        task.review_status = "Not Requested".to_string();
+                        task.review_result = None;
+                        task.review_model = None;
+                        task.review_duration_seconds = None;
+                        task.reviewed_at = None;
+                    }
+                }
+            }
+            if state.preferences.default_performance.redirect_agent_id == Some(request.agent_id) {
+                state.preferences.default_performance.redirect_agent_id = None;
+                state.preferences.default_performance.overflow_action = "queue".to_string();
+            }
+            for reminder in &mut state.reminders {
+                if reminder.agent_id == Some(request.agent_id) {
+                    reminder.agent_id = None;
+                    reminder.task_id = None;
+                }
+            }
+
+            let target = &mut state.agents[target_index];
+            target.registry_state = "deleted".to_string();
+            target.registry_issue = None;
+            target.deleted_at_unix_ms = Some(timestamp);
+            target.status = "Paused".to_string();
+            target.reports_to = None;
+
+            transaction
+                .execute(
+                    "UPDATE approval_requests
+                     SET status = 'Expired', resolved_at = COALESCE(resolved_at, ?1)
+                     WHERE agent_id = ?2 AND status IN ('Pending', 'Approved')",
+                    params![resolved_at, request.agent_id],
+                )
+                .map_err(PersistenceError::database)?;
+            Ok(())
+        })
+    }
+
+    pub fn restore_agent_template(
+        &mut self,
+        request: RestoreAgentTemplateRequest,
+    ) -> PersistenceResult<StateEnvelope> {
+        let defaults = default_application_state().map_err(PersistenceError::validation)?;
+        let template = defaults
+            .agents
+            .iter()
+            .find(|agent| agent.template_key.as_deref() == Some(request.template_key.as_str()))
+            .cloned()
+            .ok_or_else(|| {
+                PersistenceError::new(
+                    "AGENT_TEMPLATE_UNKNOWN",
+                    "The requested agent template is not recognized.",
+                    true,
+                )
+            })?;
+        self.mutate_agent_registry(request.expected_revision, move |transaction, state| {
+            let existing_index = state.agents.iter().position(|agent| {
+                agent.template_key.as_deref() == Some(request.template_key.as_str())
+            });
+            if existing_index
+                .and_then(|index| state.agents.get(index))
+                .is_some_and(|agent| agent.registry_state == "active")
+            {
+                return Err(PersistenceError::new(
+                    "AGENT_TEMPLATE_ACTIVE",
+                    "That agent template already has an active instance.",
+                    true,
+                ));
+            }
+
+            let reports_to = if template.role == "Supervisor" {
+                None
+            } else if request.reports_to.is_some() {
+                request.reports_to
+            } else {
+                let manager_template_key = template
+                    .reports_to
+                    .and_then(|manager_id| defaults.agents.iter().find(|agent| agent.id == manager_id))
+                    .and_then(|agent| agent.template_key.as_deref())
+                    .ok_or_else(|| {
+                        PersistenceError::new(
+                            "AGENT_TEMPLATE_MANAGER_MISSING",
+                            "Select a compatible manager before restoring this template.",
+                            true,
+                        )
+                    })?;
+                Some(
+                    state
+                        .agents
+                        .iter()
+                        .find(|agent| {
+                            agent.registry_state == "active"
+                                && agent.template_key.as_deref() == Some(manager_template_key)
+                        })
+                        .map(|agent| agent.id)
+                        .ok_or_else(|| {
+                            PersistenceError::new(
+                                "AGENT_TEMPLATE_MANAGER_MISSING",
+                                "Restore the template's manager or select a compatible manager first.",
+                                true,
+                            )
+                        })?,
+                )
+            };
+
+            let redirect_agent_id = template.performance.redirect_agent_id.and_then(|template_id| {
+                defaults
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id == template_id)
+                    .and_then(|agent| agent.template_key.as_deref())
+                    .and_then(|template_key| {
+                        state
+                            .agents
+                            .iter()
+                            .find(|agent| {
+                                agent.registry_state == "active"
+                                    && agent.template_key.as_deref() == Some(template_key)
+                            })
+                            .map(|agent| agent.id)
+                    })
+            });
+
+            let mut restored = template.clone();
+            restored.reports_to = reports_to;
+            restored.performance.redirect_agent_id = redirect_agent_id;
+            restored.registry_state = "active".to_string();
+            restored.registry_issue = None;
+            restored.deleted_at_unix_ms = None;
+            if let Some(index) = existing_index {
+                restored.id = state.agents[index].id;
+                restored.tasks = std::mem::take(&mut state.agents[index].tasks);
+                restored.activity = std::mem::take(&mut state.agents[index].activity);
+                restored.memory = std::mem::take(&mut state.agents[index].memory);
+                state.agents[index] = restored;
+            } else {
+                restored.id = allocate_agent_id(transaction)?;
+                state.agents.push(restored);
+            }
+            Ok(())
+        })
+    }
+
     pub fn initialize_fresh(&mut self) -> PersistenceResult<StateEnvelope> {
         let state = default_application_state().map_err(PersistenceError::validation)?;
         let timestamp = now_unix_ms()?;
@@ -602,6 +1034,7 @@ impl StateRepository {
         ensure_expected_revision(&meta, expected_revision)?;
         expire_authoritative_approvals(&transaction, timestamp)?;
         let current = read_application_state(&transaction)?;
+        ensure_agent_registry_structure_unchanged(&current, state)?;
         let protected_state = protect_run_owned_state(&transaction, &current, state, timestamp)?;
         validate_application_state(&protected_state).map_err(PersistenceError::validation)?;
         if let Some(summary) = protected_security_change_summary(&current, &protected_state) {
@@ -1675,6 +2108,7 @@ impl StateRepository {
                     "authoritative_run_coordination",
                     RUN_COORDINATION_MIGRATION,
                 )?,
+                3 => self.apply_migration(4, "dynamic_agent_registry", AGENT_REGISTRY_MIGRATION)?,
                 version => {
                     return Err(PersistenceError::new(
                         "MIGRATION_PATH_MISSING",
@@ -3057,6 +3491,47 @@ fn next_revision(revision: i64) -> PersistenceResult<i64> {
         })
 }
 
+fn allocate_agent_id(transaction: &Transaction<'_>) -> PersistenceResult<i64> {
+    let next_id: i64 = transaction
+        .query_row(
+            "SELECT next_agent_id FROM agent_registry_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    if next_id >= MAX_SAFE_INTEGER {
+        return Err(PersistenceError::new(
+            "AGENT_ID_EXHAUSTED",
+            "No additional JavaScript-safe agent identifiers are available.",
+            false,
+        ));
+    }
+    transaction
+        .execute(
+            "UPDATE agent_registry_meta SET next_agent_id = ?1 WHERE singleton = 1",
+            [next_id + 1],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(next_id)
+}
+
+fn synchronize_agent_id_allocator(
+    transaction: &Transaction<'_>,
+    state: &ApplicationState,
+) -> PersistenceResult<()> {
+    let maximum_id = state.agents.iter().map(|agent| agent.id).max().unwrap_or(0);
+    let desired = maximum_id.saturating_add(1).min(MAX_SAFE_INTEGER);
+    transaction
+        .execute(
+            "UPDATE agent_registry_meta
+             SET next_agent_id = MAX(next_agent_id, ?1)
+             WHERE singleton = 1",
+            [desired],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
 fn ensure_expected_revision(
     meta: &ApplicationMeta,
     expected_revision: i64,
@@ -3074,6 +3549,40 @@ fn ensure_expected_revision(
             "Application state changed before this save could be committed.",
             true,
         ));
+    }
+    Ok(())
+}
+
+fn ensure_agent_registry_structure_unchanged(
+    current: &ApplicationState,
+    requested: &ApplicationState,
+) -> PersistenceResult<()> {
+    if current.agents.len() != requested.agents.len() {
+        return Err(PersistenceError::new(
+            "AGENT_REGISTRY_MUTATION_REQUIRED",
+            "Create and delete agents through the authoritative agent registry.",
+            true,
+        ));
+    }
+    for (current_agent, requested_agent) in current.agents.iter().zip(&requested.agents) {
+        if current_agent.id != requested_agent.id
+            || current_agent.template_key != requested_agent.template_key
+            || current_agent.registry_state != requested_agent.registry_state
+            || current_agent.registry_issue != requested_agent.registry_issue
+            || current_agent.deleted_at_unix_ms != requested_agent.deleted_at_unix_ms
+            || current_agent.name != requested_agent.name
+            || current_agent.description != requested_agent.description
+            || current_agent.role != requested_agent.role
+            || current_agent.category != requested_agent.category
+            || current_agent.reports_to != requested_agent.reports_to
+            || current_agent.authority_level != requested_agent.authority_level
+        {
+            return Err(PersistenceError::new(
+                "AGENT_REGISTRY_MUTATION_REQUIRED",
+                "Agent identity, lifecycle, and hierarchy can only change through the authoritative agent registry.",
+                true,
+            ));
+        }
     }
     Ok(())
 }
@@ -3863,6 +4372,7 @@ fn write_application_state(
             )
             .map_err(PersistenceError::database)?;
     }
+    synchronize_agent_id_allocator(transaction, state)?;
     Ok(())
 }
 
@@ -3946,16 +4456,21 @@ fn write_agent(
     transaction
         .execute(
             "INSERT INTO agents
-             (id, position, name, description, status, role, category, reports_to,
+             (id, template_key, registry_state, registry_issue, deleted_at_unix_ms,
+              position, name, description, status, role, category, reports_to,
               authority_level, model, memory, strength, focus, cpu_limit, gpu_limit,
               overflow_action, redirect_agent_id, capability_files, capability_internet,
               capability_clipboard, capability_terminal, capability_system, approval_files,
               approval_internet, approval_clipboard, approval_terminal, approval_system)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                     ?25, ?26, ?27)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
+                     ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
             params![
                 agent.id,
+                agent.template_key,
+                agent.registry_state,
+                agent.registry_issue,
+                agent.deleted_at_unix_ms,
                 position as i64,
                 agent.name,
                 agent.description,
@@ -4213,7 +4728,8 @@ fn read_workspaces(connection: &Connection) -> PersistenceResult<Vec<WorkspaceDe
 fn read_agents(connection: &Connection) -> PersistenceResult<Vec<Agent>> {
     let mut statement = connection
         .prepare(
-            "SELECT id, name, description, status, role, category, reports_to,
+            "SELECT id, template_key, registry_state, registry_issue, deleted_at_unix_ms,
+                    name, description, status, role, category, reports_to,
                     authority_level, model, memory, strength, focus, cpu_limit, gpu_limit,
                     overflow_action, redirect_agent_id, capability_files, capability_internet,
                     capability_clipboard, capability_terminal, capability_system, approval_files,
@@ -4225,38 +4741,42 @@ fn read_agents(connection: &Connection) -> PersistenceResult<Vec<Agent>> {
         .query_map([], |row| {
             Ok(Agent {
                 id: row.get(0)?,
-                name: row.get(1)?,
-                description: row.get(2)?,
-                status: row.get(3)?,
-                role: row.get(4)?,
-                category: row.get(5)?,
-                reports_to: row.get(6)?,
-                authority_level: row.get(7)?,
-                model: row.get(8)?,
-                memory: row.get(9)?,
+                template_key: row.get(1)?,
+                registry_state: row.get(2)?,
+                registry_issue: row.get(3)?,
+                deleted_at_unix_ms: row.get(4)?,
+                name: row.get(5)?,
+                description: row.get(6)?,
+                status: row.get(7)?,
+                role: row.get(8)?,
+                category: row.get(9)?,
+                reports_to: row.get(10)?,
+                authority_level: row.get(11)?,
+                model: row.get(12)?,
+                memory: row.get(13)?,
                 tasks: Vec::new(),
                 activity: Vec::new(),
                 performance: AgentPerformance {
-                    strength: row.get(10)?,
-                    focus: row.get(11)?,
-                    cpu_limit: row.get(12)?,
-                    gpu_limit: row.get(13)?,
-                    overflow_action: row.get(14)?,
-                    redirect_agent_id: row.get(15)?,
+                    strength: row.get(14)?,
+                    focus: row.get(15)?,
+                    cpu_limit: row.get(16)?,
+                    gpu_limit: row.get(17)?,
+                    overflow_action: row.get(18)?,
+                    redirect_agent_id: row.get(19)?,
                 },
                 capabilities: AgentCapabilities {
-                    files: row.get(16)?,
-                    internet: row.get(17)?,
-                    clipboard: row.get(18)?,
-                    terminal: row.get(19)?,
-                    system: row.get(20)?,
+                    files: row.get(20)?,
+                    internet: row.get(21)?,
+                    clipboard: row.get(22)?,
+                    terminal: row.get(23)?,
+                    system: row.get(24)?,
                 },
                 approvals: AgentApprovals {
-                    files: row.get(21)?,
-                    internet: row.get(22)?,
-                    clipboard: row.get(23)?,
-                    terminal: row.get(24)?,
-                    system: row.get(25)?,
+                    files: row.get(25)?,
+                    internet: row.get(26)?,
+                    clipboard: row.get(27)?,
+                    terminal: row.get(28)?,
+                    system: row.get(29)?,
                 },
             })
         })
@@ -4552,7 +5072,8 @@ mod tests {
                 vec![
                     (1, "initial_application_state".to_string()),
                     (2, "authoritative_approval_lifecycle".to_string()),
-                    (3, "authoritative_run_coordination".to_string())
+                    (3, "authoritative_run_coordination".to_string()),
+                    (4, "dynamic_agent_registry".to_string())
                 ]
             );
             let journal_mode: String = repository
@@ -4579,6 +5100,274 @@ mod tests {
         let reopened = repository.load().unwrap().expect("state should exist");
         assert_eq!(reopened.revision, 1);
         assert_eq!(reopened.state, expected);
+    }
+
+    #[test]
+    fn task_0009_registry_crud_is_monotonic_persistent_and_template_restorable() {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        let initialized = repository.initialize_fresh().unwrap();
+        let created = repository
+            .create_agent(CreateAgentRequest {
+                expected_revision: initialized.revision,
+                name: "Custom Builder".to_string(),
+                description: "Builds custom workspace features".to_string(),
+                role: "Specialist".to_string(),
+                category: "Development".to_string(),
+                reports_to: Some(3),
+            })
+            .unwrap();
+        let custom = created
+            .state
+            .agents
+            .iter()
+            .find(|agent| agent.name == "Custom Builder")
+            .unwrap();
+        assert_eq!(custom.id, 12);
+        assert_eq!(custom.template_key, None);
+        assert_eq!(custom.registry_state, "active");
+        let custom_id = custom.id;
+
+        let updated = repository
+            .update_agent(UpdateAgentRequest {
+                expected_revision: created.revision,
+                agent_id: custom_id,
+                name: "Custom Builder Renamed".to_string(),
+                description: "Builds custom workspace features safely".to_string(),
+                role: "Specialist".to_string(),
+                category: "General".to_string(),
+                reports_to: Some(3),
+            })
+            .unwrap();
+        assert_eq!(
+            updated
+                .state
+                .agents
+                .iter()
+                .find(|agent| agent.id == custom_id)
+                .unwrap()
+                .name,
+            "Custom Builder Renamed"
+        );
+
+        let deleted_custom = repository
+            .delete_agent(DeleteAgentRequest {
+                expected_revision: updated.revision,
+                agent_id: custom_id,
+                replacement_manager_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            deleted_custom
+                .state
+                .agents
+                .iter()
+                .find(|agent| agent.id == custom_id)
+                .unwrap()
+                .registry_state,
+            "deleted"
+        );
+
+        let deleted_browser = repository
+            .delete_agent(DeleteAgentRequest {
+                expected_revision: deleted_custom.revision,
+                agent_id: 4,
+                replacement_manager_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            repository
+                .load()
+                .unwrap()
+                .unwrap()
+                .state
+                .agents
+                .iter()
+                .find(|agent| agent.id == 4)
+                .unwrap()
+                .registry_state,
+            "deleted"
+        );
+
+        let restored = repository
+            .restore_agent_template(RestoreAgentTemplateRequest {
+                expected_revision: deleted_browser.revision,
+                template_key: "browser".to_string(),
+                reports_to: None,
+            })
+            .unwrap();
+        let browser = restored
+            .state
+            .agents
+            .iter()
+            .find(|agent| agent.template_key.as_deref() == Some("browser"))
+            .unwrap();
+        assert_eq!(browser.id, 4);
+        assert_eq!(browser.registry_state, "active");
+        assert_eq!(browser.reports_to, Some(9));
+
+        let next = repository
+            .create_agent(CreateAgentRequest {
+                expected_revision: restored.revision,
+                name: "Second Builder".to_string(),
+                description: "Proves deleted identifiers are not reused".to_string(),
+                role: "Specialist".to_string(),
+                category: "Development".to_string(),
+                reports_to: Some(3),
+            })
+            .unwrap();
+        assert_eq!(
+            next.state
+                .agents
+                .iter()
+                .find(|agent| agent.name == "Second Builder")
+                .unwrap()
+                .id,
+            13
+        );
+    }
+
+    #[test]
+    fn task_0009_created_and_deleted_agents_survive_database_reopen() {
+        let directory = TestDirectory::new();
+        let path = directory.database_path();
+        {
+            let mut repository = StateRepository::open(&path).unwrap();
+            let initialized = repository.initialize_fresh().unwrap();
+            let created = repository
+                .create_agent(CreateAgentRequest {
+                    expected_revision: initialized.revision,
+                    name: "Persistent Custom Agent".to_string(),
+                    description: "Must remain present after a database reopen".to_string(),
+                    role: "Specialist".to_string(),
+                    category: "Development".to_string(),
+                    reports_to: Some(3),
+                })
+                .unwrap();
+            repository
+                .delete_agent(DeleteAgentRequest {
+                    expected_revision: created.revision,
+                    agent_id: 4,
+                    replacement_manager_id: None,
+                })
+                .unwrap();
+        }
+
+        let mut reopened = StateRepository::open(&path).unwrap();
+        let state = reopened.load().unwrap().unwrap().state;
+        assert!(state.agents.iter().any(|agent| {
+            agent.name == "Persistent Custom Agent" && agent.registry_state == "active"
+        }));
+        assert_eq!(
+            state
+                .agents
+                .iter()
+                .find(|agent| agent.id == 4)
+                .unwrap()
+                .registry_state,
+            "deleted"
+        );
+        let browser_template = reopened
+            .agent_registry_snapshot()
+            .unwrap()
+            .templates
+            .into_iter()
+            .find(|template| template.template_key == "browser")
+            .unwrap();
+        assert!(browser_template.restorable);
+        assert_eq!(browser_template.active_agent_id, None);
+    }
+
+    #[test]
+    fn task_0009_registry_rejects_invalid_hierarchy_and_renderer_bypass() {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        let initialized = repository.initialize_fresh().unwrap();
+        let error = repository
+            .update_agent(UpdateAgentRequest {
+                expected_revision: initialized.revision,
+                agent_id: 2,
+                name: "Coding Agent".to_string(),
+                description: "Builds and edits project files".to_string(),
+                role: "Specialist".to_string(),
+                category: "Development".to_string(),
+                reports_to: Some(2),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "STATE_VALIDATION_FAILED");
+        assert!(error.message.contains("cannot report to themselves"));
+        assert_eq!(
+            repository.load().unwrap().unwrap().revision,
+            initialized.revision
+        );
+
+        let mut bypass = initialized.state;
+        bypass.agents[1].name = "Renderer Renamed Agent".to_string();
+        assert_eq!(
+            repository
+                .save(initialized.revision, &bypass, false)
+                .unwrap_err()
+                .code,
+            "AGENT_REGISTRY_MUTATION_REQUIRED"
+        );
+
+        let receipt = repository
+            .save(initialized.revision, &authorization_state(), true)
+            .unwrap();
+        let deleted = repository
+            .delete_agent(DeleteAgentRequest {
+                expected_revision: receipt.revision,
+                agent_id: 2,
+                replacement_manager_id: None,
+            })
+            .unwrap();
+        let retained_task = &deleted
+            .state
+            .agents
+            .iter()
+            .find(|agent| agent.id == 2)
+            .unwrap()
+            .tasks[0];
+        assert_eq!(retained_task.status, "Failed");
+        assert_eq!(retained_task.phase, "Failed");
+        assert!(retained_task.completed_at.is_some());
+        assert_eq!(
+            retained_task.result.as_deref(),
+            Some("Task closed because its owning agent was deleted.")
+        );
+        assert_eq!(
+            repository
+                .request_authorization(&authorization_intent())
+                .unwrap_err()
+                .code,
+            "AGENT_REGISTRY_INACTIVE"
+        );
+    }
+
+    #[test]
+    fn task_0009_legacy_import_preserves_absence_and_quarantines_invalid_agents() {
+        let mut legacy = default_application_state().unwrap();
+        legacy.agents.retain(|agent| agent.id != 4);
+        let coding = legacy
+            .agents
+            .iter_mut()
+            .find(|agent| agent.id == 2)
+            .unwrap();
+        coding.reports_to = Some(999_999);
+        let legacy = legacy_renderer_state(&legacy);
+
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        let migrated = repository.migrate_legacy(&legacy).unwrap();
+        assert_eq!(migrated.state.agents.len(), 10);
+        assert!(migrated.state.agents.iter().all(|agent| agent.id != 4));
+        let coding = migrated
+            .state
+            .agents
+            .iter()
+            .find(|agent| agent.id == 2)
+            .unwrap();
+        assert_eq!(coding.registry_state, "unassigned");
+        assert_eq!(coding.registry_issue.as_deref(), Some("missing-manager"));
+        assert_eq!(coding.reports_to, None);
+        assert_eq!(coding.status, "Paused");
     }
 
     #[test]
@@ -4764,6 +5553,15 @@ mod tests {
         let initialized = repository.initialize_fresh().unwrap();
         let mut imported = initialized.state.clone();
         imported.preferences.theme = "light".to_string();
+        let deleted_browser = imported
+            .agents
+            .iter_mut()
+            .find(|agent| agent.id == 4)
+            .unwrap();
+        deleted_browser.registry_state = "deleted".to_string();
+        deleted_browser.status = "Paused".to_string();
+        deleted_browser.reports_to = None;
+        deleted_browser.deleted_at_unix_ms = Some(1_777_000_000_000);
         imported.approval_requests.push(ApprovalRequest {
             id: 200,
             agent_id: 1,
@@ -4799,6 +5597,16 @@ mod tests {
         assert_eq!(envelope.revision, 2);
         assert_eq!(envelope.state.preferences.theme, "light");
         assert_eq!(envelope.state.approval_requests[0].status, "Expired");
+        assert_eq!(
+            envelope
+                .state
+                .agents
+                .iter()
+                .find(|agent| agent.id == 4)
+                .unwrap()
+                .registry_state,
+            "deleted"
+        );
         assert_eq!(
             envelope.migration.source_kind.as_deref(),
             Some("legacy_backup")
@@ -5441,7 +6249,7 @@ mod tests {
         drop(connection);
 
         let repository = StateRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 3);
+        assert_eq!(repository.schema_version().unwrap(), 4);
         let upgraded: (String, i64, String) = repository
             .connection
             .query_row(
@@ -5639,7 +6447,6 @@ mod tests {
             .find(|agent| agent.name == "PC Control Agent")
             .unwrap();
         pc_agent.status = "Working".to_string();
-        pc_agent.role = "Senior Agent".to_string();
         pc_agent.capabilities.system = "full".to_string();
         pc_agent.approvals.system = "allow".to_string();
         elevated.preferences.workspaces.push(WorkspaceDefinition {
@@ -5655,7 +6462,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(summary.contains("agent \"PC Control Agent\" (ID 7)"));
-        assert!(summary.contains("role \"Specialist\" -> \"Senior Agent\""));
         assert!(summary.contains("system capability \"notifications\" -> \"full\""));
         assert!(summary.contains("system approval policy \"ask\" -> \"allow\""));
         assert!(

@@ -10,8 +10,9 @@
 > capability-gated Codex isolation, bounded protocol handling, and deterministic
 > Linux descendant cleanup. TASK-0008 adds fixed-loopback Ollama transport,
 > bounded discovery and cancellation, and descriptor-confined conflict-safe
-> workspace tools; later tasks still own voice semantics, packaging, and live
-> acceptance.
+> workspace tools. TASK-0009 adds backend-authoritative agent identity,
+> lifecycle, role-derived authority, and reporting validation; later tasks
+> still own voice semantics, packaging, and live acceptance.
 
 ## Security objective
 
@@ -40,7 +41,7 @@ when stored locally.
 | React renderer/WebView | Untrusted for authorization; may be compromised or hold stale/tampered state |
 | Imported backup and <code>localStorage</code> | Untrusted serialized input requiring validation and migration |
 | Tauri IPC | Untrusted request boundary; backend must authenticate semantics, not just types |
-| Rust backend | Authoritative approval/action-policy, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
+| Rust backend | Authoritative agent registry, approval/action-policy, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
 | Codex/Ollama output | Untrusted content and action proposals |
 | Selected workspace | Sensitive bounded filesystem root |
 | External/local provider process | Separate process/service with its own failure and trust model |
@@ -111,6 +112,17 @@ Static inspection and deterministic tests found these implemented controls:
 - per-run cancellation flags and bounded timeouts;
 - changed-file and Git diff capture where available;
 - typed, bounded backend validation for persisted application state;
+- dedicated revision-checked agent create/update/logical-delete/template-restore
+  IPC with renderer attempts to mutate registry structure through generic saves
+  rejected;
+- role-derived authority and active-manager validation that rejects
+  self-parenting, cycles, dangling/inactive managers, and incompatible
+  reporting edges;
+- migration quarantine that pauses and visibly detaches invalid legacy agents,
+  plus durable tombstones that prevent deleted defaults from silently
+  reappearing;
+- policy, routing, review, voice, approval, reminder, dashboard, and settings
+  projections that exclude non-active agent identities;
 - schema-versioned SQLite persistence with foreign keys, integrity checks,
   explicit migration evidence, atomic writes, and stale-revision rejection;
 - immediate-transaction admission of at most one execute/review attempt across
@@ -140,17 +152,18 @@ Static inspection and deterministic tests found these implemented controls:
 
 These controls establish the TASK-0004 authorization boundary, TASK-0005
 run-coordination boundary, TASK-0006 provider-identity boundary, TASK-0007
-Codex process/protocol boundary, and TASK-0008 Ollama transport/workspace-tool
-boundary. They do not establish production readiness or the later live
-provider/platform guarantees.
+Codex process/protocol boundary, TASK-0008 Ollama transport/workspace-tool
+boundary, and TASK-0009 agent-registry boundary. They do not establish
+production readiness or the later live provider/platform guarantees.
 
 ## Known current gaps
 
 ### State integrity and recovery
 
-Desktop core domain state now uses a backend-owned SQLite transaction boundary,
-schema/migration ledger, integrity check, and compare-and-swap revision. The
-renderer cannot fall back to WebView storage after desktop persistence starts
+Desktop core domain state and agent registry now use a backend-owned SQLite
+transaction boundary, schema/migration ledger, integrity check, and
+compare-and-swap revision. The renderer cannot fall back to WebView storage
+after desktop persistence starts
 or fails. Remaining lifecycle gaps include strict backup/export contracts,
 broader domain retention, recovery UX, and integrated live upgrade evidence.
 TASK-0014 owns those controls. The browser preview remains non-authoritative.
@@ -199,19 +212,21 @@ workspace tools fail closed outside Linux.
 
 ### Verification coverage
 
-The checked-in non-live suite contains 33 frontend tests and 87 Rust tests. It
+The checked-in non-live suite contains 39 frontend tests and 93 Rust tests. It
 covers frontend characterization plus backend policy, authorization, run
 coordination/recovery/bounds, provider identity/fake-adapter dispatch, Codex
 compatibility/command/protocol/descendant-process cases, strict IPC,
 CSP/capability, Ollama fake-server transport/discovery/cancellation, safe
-workspace operations, persistence validation, migration, corruption,
-concurrency, and rollback cases. These checks do not establish end-to-end,
+workspace operations, agent CRUD/reopen/template/lifecycle/hierarchy behavior,
+persistence validation, migration, corruption, concurrency, and rollback
+cases. These checks do not establish end-to-end,
 packaging, upgrade, or live acceptance. Rust advisory status remains
 indeterminate when <code>cargo-audit</code> is unavailable.
 
 ## Target security invariants
 
-The approval/action subset of invariants 2 through 5, the coordinator subset
+The agent-registry subset of invariant 1, the approval/action subset of
+invariants 2 through 5, the coordinator subset
 of invariant 6, the Ollama workspace subset of invariant 7, and the
 provider-identity/no-substitution plus Codex/Ollama adapter subsets of invariant
 8 are implemented for the current command surface. The full integrated
@@ -313,6 +328,8 @@ least-privilege workarounds before any code change.
 - Make retention and deletion behavior explicit and testable.
 - Keep Ollama local by default and make any network boundary visible.
 - Treat backup export as sensitive user data and validate imports before use.
+- Preserve deletion tombstones and explicit restore intent in lifecycle data;
+  do not resurrect absent defaults during normalization.
 
 ## Ownership and release gate
 

@@ -13,7 +13,6 @@ import type {
   ApprovalMode,
   ApprovalRequest,
   ApprovalRequestStatus,
-  AuthorityLevel,
   ExecutionFocus,
   HistoryRetentionDays,
   InterfaceDensity,
@@ -40,6 +39,7 @@ import type {
   StateEnvelope,
   AccentColor,
 } from "./applicationState";
+import { createDefaultApplicationState } from "./applicationState";
 export type {
   Agent,
   AgentPerformance,
@@ -77,6 +77,19 @@ import {
   unknownProviderRegistrySnapshot,
   type ProviderRegistrySnapshot,
 } from "./providerRegistry";
+import {
+  activeRegistryAgents,
+  authorityForRole,
+  availableAgentGroups,
+  findActiveTemplateAgent,
+  normalizeLegacyAgentRegistry,
+  normalizeLegacyAgentRegistrySet,
+  projectAgentGroup,
+  registryIssueMessage,
+  validManagerCandidates,
+  type AgentGroup,
+  type AgentRegistrySnapshot,
+} from "./agentRegistry";
 import logoUrl from "../AI-Agents.png";
 import "./App.css";
 
@@ -263,9 +276,8 @@ function DashboardPage({
   onOpenTasks: () => void;
   onOpenApprovals: () => void;
 }) {
-  const [activeAgentGroup, setActiveAgentGroup] = useState<
-    "Development" | "Finance and Events" | "Web and PC Control"
-  >("Development");
+  const [activeAgentGroup, setActiveAgentGroup] =
+    useState<AgentGroup>("Development");
   const activeAgentCount = agents.filter(
     (agent) => agent.status === "Working",
   ).length;
@@ -309,14 +321,18 @@ function DashboardPage({
     (request) => request.status === "Pending",
   ).length;
 
-  const groupAgentIds: Record<typeof activeAgentGroup, number[]> = {
-    Development: [1, 2, 3, 6],
-    "Finance and Events": [1, 5, 6, 8, 10, 11],
-    "Web and PC Control": [1, 4, 6, 7, 9, 11],
-  };
-  const groupedAgents = agents.filter((agent) =>
-    groupAgentIds[activeAgentGroup].includes(agent.id),
+  const configuredDashboardGroups = availableAgentGroups(agents).filter(
+    (group) => group !== "All agents" && group !== "Needs assignment",
   );
+  const dashboardGroups: AgentGroup[] =
+    configuredDashboardGroups.length > 0
+      ? configuredDashboardGroups
+      : ["All agents"];
+  const effectiveAgentGroup = dashboardGroups.includes(activeAgentGroup)
+    ? activeAgentGroup
+    : dashboardGroups[0];
+  const groupProjection = projectAgentGroup(agents, effectiveAgentGroup);
+  const groupedAgents = groupProjection.visibleAgents;
 
   return (
     <>
@@ -440,20 +456,21 @@ function DashboardPage({
         </div>
 
         <div className="dashboard-group-tabs" role="tablist" aria-label="Dashboard agent groups">
-          {(["Development", "Finance and Events", "Web and PC Control"] as const).map(
-            (group) => (
+          {dashboardGroups.map((group) => {
+            const memberCount = projectAgentGroup(agents, group).memberIds.size;
+            return (
               <button
                 key={group}
                 role="tab"
-                aria-selected={activeAgentGroup === group}
-                className={activeAgentGroup === group ? "dashboard-group-tab active" : "dashboard-group-tab"}
+                aria-selected={effectiveAgentGroup === group}
+                className={effectiveAgentGroup === group ? "dashboard-group-tab active" : "dashboard-group-tab"}
                 onClick={() => setActiveAgentGroup(group)}
               >
                 <strong>{group}</strong>
-                <small>{groupAgentIds[group].filter((id) => id !== 1 && id !== 6).length} specialists</small>
+                <small>{memberCount} configured</small>
               </button>
-            ),
-          )}
+            );
+          })}
         </div>
 
         {groupedAgents.length === 0 ? (
@@ -1066,6 +1083,9 @@ export function normalizePreferences(
 function AgentsPage({
   agents,
   setAgents,
+  templates,
+  onRegistryMutation,
+  authoritativeRegistry,
   models,
   providerRegistry,
   preferences,
@@ -1077,6 +1097,12 @@ function AgentsPage({
 }: {
   agents: Agent[];
   setAgents: React.Dispatch<React.SetStateAction<Agent[]>>;
+  templates: AgentRegistrySnapshot["templates"];
+  onRegistryMutation: (
+    command: "create_agent" | "update_agent" | "delete_agent" | "restore_agent_template",
+    request: Record<string, unknown>,
+  ) => Promise<void>;
+  authoritativeRegistry: boolean;
   models: ModelDefinition[];
   providerRegistry: ProviderRegistrySnapshot;
   preferences: AppPreferences;
@@ -1098,8 +1124,6 @@ function AgentsPage({
   const [agentCategory, setAgentCategory] =
     useState<AgentCategory>("General");
   const [agentReportsTo, setAgentReportsTo] = useState<number | null>(null);
-  const [agentAuthorityLevel, setAgentAuthorityLevel] =
-    useState<AuthorityLevel>(1);
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [newTaskCategory, setNewTaskCategory] =
     useState<TaskCategory>(preferences.defaultTaskCategory);
@@ -1111,9 +1135,8 @@ function AgentsPage({
     preferences.activeWorkspaceId,
   );
   const [selectedAgentId, setSelectedAgentId] = useState<number | null>(null);
-  const [activeAgentGroup, setActiveAgentGroup] = useState<
-    "Development" | "Finance and Events" | "Web and PC Control"
-  >("Development");
+  const [activeAgentGroup, setActiveAgentGroup] =
+    useState<AgentGroup>("All agents");
   const [activeWorkspaceTab, setActiveWorkspaceTab] =
     useState<WorkspaceTab>("Overview");
   const [runtimeError, setRuntimeError] = useState("");
@@ -1222,7 +1245,6 @@ function AgentsPage({
     setAgentRole("Specialist");
     setAgentCategory("General");
     setAgentReportsTo(null);
-    setAgentAuthorityLevel(1);
     setIsCreating(false);
     setEditingAgentId(null);
   }
@@ -1233,7 +1255,6 @@ function AgentsPage({
     setAgentRole("Specialist");
     setAgentCategory("General");
     setAgentReportsTo(null);
-    setAgentAuthorityLevel(1);
     setEditingAgentId(null);
     setIsCreating(true);
   }
@@ -1244,16 +1265,20 @@ function AgentsPage({
     setAgentRole(agent.role);
     setAgentCategory(agent.category);
     setAgentReportsTo(agent.reportsTo);
-    setAgentAuthorityLevel(agent.authorityLevel);
     setIsCreating(false);
     setEditingAgentId(agent.id);
   }
 
-  function saveAgent() {
+  async function saveAgent() {
     const trimmedName = agentName.trim();
     const trimmedDescription = agentDescription.trim();
 
     if (!trimmedName || !trimmedDescription) {
+      setRuntimeError("Agent name and description are required.");
+      return;
+    }
+    if (agentRole !== "Supervisor" && agentReportsTo === null) {
+      setRuntimeError("Select an active manager with greater authority.");
       return;
     }
 
@@ -1275,61 +1300,73 @@ function AgentsPage({
       }
     }
 
-    if (editingAgentId !== null) {
-      setAgents((currentAgents) =>
-        currentAgents.map((agent) =>
-          agent.id === editingAgentId
-            ? {
-                ...agent,
-                name: trimmedName,
-                description: trimmedDescription,
-                role: agentRole,
-                category: agentCategory,
-                reportsTo:
-                  agentReportsTo === editingAgentId ? null : agentReportsTo,
-                authorityLevel: agentAuthorityLevel,
-              }
-            : agent,
-        ),
-      );
-    } else {
-      const newAgent: Agent = {
-        id: Date.now(),
+    setRuntimeError("");
+    try {
+      const request = {
         name: trimmedName,
         description: trimmedDescription,
-        status: preferences.defaultAgentStatus,
         role: agentRole,
         category: agentCategory,
-        reportsTo: agentReportsTo,
-        authorityLevel: agentAuthorityLevel,
-        model: preferences.defaultModel,
-        memory: "",
-        tasks: [],
-        activity: [],
-        performance: {
-          ...preferences.defaultPerformance,
-        },
-
-        capabilities: {
-          files: "read",
-          internet: "none",
-          clipboard: "none",
-          terminal: "none",
-          system: "none",
-        },
-
-        approvals: {
-          files: "ask",
-          internet: "ask",
-          clipboard: "ask",
-          terminal: "ask",
-          system: "ask",
-        },
+        reportsTo: agentRole === "Supervisor" ? null : agentReportsTo,
       };
-      setAgents((currentAgents) => [...currentAgents, newAgent]);
+      if (authoritativeRegistry) {
+        await onRegistryMutation(
+          editingAgentId === null ? "create_agent" : "update_agent",
+          editingAgentId === null ? request : { ...request, agentId: editingAgentId },
+        );
+      } else if (editingAgentId !== null) {
+        setAgents((currentAgents) =>
+          currentAgents.map((agent) =>
+            agent.id === editingAgentId
+              ? {
+                  ...agent,
+                  ...request,
+                  authorityLevel: authorityForRole(agentRole),
+                  registryState: "active",
+                  registryIssue: null,
+                  deletedAtUnixMs: null,
+                }
+              : agent,
+          ),
+        );
+      } else {
+        setAgents((currentAgents) => [
+          ...currentAgents,
+          {
+            id: Math.max(0, ...currentAgents.map((agent) => agent.id)) + 1,
+            templateKey: null,
+            registryState: "active",
+            registryIssue: null,
+            deletedAtUnixMs: null,
+            ...request,
+            status: preferences.defaultAgentStatus,
+            authorityLevel: authorityForRole(agentRole),
+            model: preferences.defaultModel,
+            memory: "",
+            tasks: [],
+            activity: [],
+            performance: { ...preferences.defaultPerformance },
+            capabilities: {
+              files: "read",
+              internet: "none",
+              clipboard: "none",
+              terminal: "none",
+              system: "none",
+            },
+            approvals: {
+              files: "ask",
+              internet: "ask",
+              clipboard: "ask",
+              terminal: "ask",
+              system: "ask",
+            },
+          },
+        ]);
+      }
+      resetForm();
+    } catch (error) {
+      setRuntimeError(persistenceErrorMessage(error));
     }
-
-    resetForm();
   }
 
   function setAgentStatus(
@@ -1380,11 +1417,11 @@ function AgentsPage({
       ),
     );
 
-    if (key !== "system" || selectedAgent?.name !== "PC Control Agent") {
+    if (key !== "system") {
       return;
     }
     if (value !== "full") {
-      setSystemCapabilityMessage("Full desktop input is disabled. PC Control can no longer move the pointer or send clicks.");
+      setSystemCapabilityMessage("Full desktop input is disabled for this agent.");
       return;
     }
     if (!isDesktopRuntime()) {
@@ -1403,7 +1440,7 @@ function AgentsPage({
       return;
     }
     if (!selectedAgent) {
-      setSystemCapabilityMessage("Select PC Control Agent first.");
+      setSystemCapabilityMessage("Select an active agent first.");
       return;
     }
     setSystemCapabilityMessage("Requesting backend authorization...");
@@ -1498,7 +1535,7 @@ function AgentsPage({
     const route =
       newTaskRoutingMode === "automatic"
         ? executionRouteForTask(
-            agents,
+            activeRegistryAgents(agents),
             models,
             newTaskCategory,
             selectedAgentId,
@@ -1577,7 +1614,7 @@ function AgentsPage({
       return;
     }
     const route = executionRouteForTask(
-      agents,
+      activeRegistryAgents(agents),
       models,
       task.category,
       selectedAgent.id,
@@ -1738,7 +1775,7 @@ function AgentsPage({
 
     const workspace = workspaceForTask(task);
     const reviewer = reviewAgentForTask(
-      agents,
+      activeRegistryAgents(agents),
       selectedAgent.id,
       task.category,
       models,
@@ -2023,7 +2060,7 @@ function AgentsPage({
     );
   }
 
-  function deleteAgent(agentId: number) {
+  async function deleteAgent(agentId: number) {
     const agent = agents.find((item) => item.id === agentId);
 
     if (!agent) {
@@ -2038,9 +2075,119 @@ function AgentsPage({
       return;
     }
 
-    setAgents((currentAgents) =>
-      currentAgents.filter((item) => item.id !== agentId),
+    const directReports = agents.filter(
+      (item) => item.registryState === "active" && item.reportsTo === agentId,
     );
+    let replacementManagerId: number | null = null;
+    if (directReports.length > 0) {
+      const candidates = agents.filter(
+        (candidate) =>
+          candidate.registryState === "active" &&
+          candidate.id !== agentId &&
+          directReports.every(
+            (report) => candidate.authorityLevel > report.authorityLevel,
+          ),
+      );
+      if (candidates.length === 0) {
+        setRuntimeError(
+          "No active manager can accept this agent's direct reports. Reassign them first.",
+        );
+        return;
+      }
+      const entered = window.prompt(
+        `Reassign ${directReports.length} direct report(s) to one of these manager IDs:\n${candidates
+          .map((candidate) => `${candidate.id} · ${candidate.name}`)
+          .join("\n")}`,
+        String(candidates[0].id),
+      );
+      if (entered === null) return;
+      const selected = Number(entered);
+      if (!candidates.some((candidate) => candidate.id === selected)) {
+        setRuntimeError("Select one of the listed replacement managers.");
+        return;
+      }
+      replacementManagerId = selected;
+    }
+
+    setRuntimeError("");
+    try {
+      if (authoritativeRegistry) {
+        await onRegistryMutation("delete_agent", {
+          agentId,
+          replacementManagerId,
+        });
+      } else {
+        setAgents((currentAgents) =>
+          currentAgents.map((item) => {
+            if (item.id === agentId) {
+              return {
+                ...item,
+                registryState: "deleted",
+                registryIssue: null,
+                deletedAtUnixMs: Date.now(),
+                status: "Paused",
+                reportsTo: null,
+              };
+            }
+            if (item.reportsTo === agentId) {
+              return { ...item, reportsTo: replacementManagerId };
+            }
+            return item;
+          }),
+        );
+      }
+      setSelectedAgentId(null);
+    } catch (error) {
+      setRuntimeError(persistenceErrorMessage(error));
+    }
+  }
+
+  async function restoreTemplate(templateKey: string) {
+    setRuntimeError("");
+    try {
+      if (authoritativeRegistry) {
+        await onRegistryMutation("restore_agent_template", {
+          templateKey,
+          reportsTo: null,
+        });
+        return;
+      }
+      const defaults = createDefaultApplicationState().agents;
+      const template = defaults.find((agent) => agent.templateKey === templateKey);
+      if (!template) throw new Error("That template is not available.");
+      setAgents((currentAgents) => {
+        const existingIndex = currentAgents.findIndex(
+          (agent) => agent.templateKey === template.templateKey,
+        );
+        const managerTemplateKey = defaults.find(
+          (agent) => agent.id === template.reportsTo,
+        )?.templateKey;
+        const reportsTo = managerTemplateKey
+          ? currentAgents.find(
+              (agent) =>
+                agent.registryState === "active" &&
+                agent.templateKey === managerTemplateKey,
+            )?.id ?? null
+          : null;
+        const restored = {
+          ...template,
+          reportsTo,
+          id:
+            existingIndex >= 0
+              ? currentAgents[existingIndex].id
+              : Math.max(0, ...currentAgents.map((agent) => agent.id)) + 1,
+          tasks: existingIndex >= 0 ? currentAgents[existingIndex].tasks : [],
+          activity: existingIndex >= 0 ? currentAgents[existingIndex].activity : [],
+          memory: existingIndex >= 0 ? currentAgents[existingIndex].memory : "",
+        };
+        if (existingIndex < 0) return [...currentAgents, restored];
+        return currentAgents.map((agent, index) =>
+          index === existingIndex ? restored : agent,
+        );
+      });
+    } catch (error) {
+      setRuntimeError(persistenceErrorMessage(error));
+    }
   }
 
   if (selectedAgent) {
@@ -2340,7 +2487,7 @@ function AgentsPage({
                       </select>
                     </label>
                   </div>
-                  {selectedAgent.name === "PC Control Agent" && capability.key === "system" && (
+                  {capability.key === "system" && (
                     <div className="form-hint">
                       {selectedAgent.capabilities.system === "full"
                         ? "Full system access is selected. Enable KDE desktop input to allow pointer and keyboard actions across applications."
@@ -2923,51 +3070,12 @@ function AgentsPage({
     );
   }
 
-  function renderHierarchy(
-    managerId: number | null,
-    visibleIds: Set<number>,
-    depth = 0,
-  ): React.ReactNode[] {
-    return agents
-      .filter(
-        (agent) => agent.reportsTo === managerId && visibleIds.has(agent.id),
-      )
-      .flatMap((agent) => [
-        <article
-          className="agent-card hierarchy-card"
-          key={`hierarchy-${agent.id}`}
-          style={{ marginLeft: `${Math.min(depth, 4) * 28}px` }}
-          onClick={() => setSelectedAgentId(agent.id)}
-        >
-          <div>
-            <h3>{agent.name}</h3>
-            <p>{agent.description}</p>
-            <small>
-              {agent.role} · {agent.category} · Authority level {agent.authorityLevel}
-            </small>
-          </div>
-          <span className={`agent-status ${agent.status.toLowerCase()}`}>
-            {agent.status}
-          </span>
-        </article>,
-        ...renderHierarchy(agent.id, visibleIds, depth + 1),
-      ]);
-  }
-
-  function visibleAgentIdsForGroup(group: typeof activeAgentGroup) {
-    const ids = new Set<number>([1, 6]);
-    if (group === "Development") {
-      [2, 3].forEach((id) => ids.add(id));
-    } else if (group === "Finance and Events") {
-      [5, 8, 10, 11].forEach((id) => ids.add(id));
-    } else {
-      [4, 7, 9, 11].forEach((id) => ids.add(id));
-    }
-    return ids;
-  }
-
-  const visibleAgentIds = visibleAgentIdsForGroup(activeAgentGroup);
-  const visibleAgents = agents.filter((agent) => visibleAgentIds.has(agent.id));
+  const agentGroups = availableAgentGroups(agents);
+  const effectiveAgentGroup = agentGroups.includes(activeAgentGroup)
+    ? activeAgentGroup
+    : agentGroups[0];
+  const groupProjection = projectAgentGroup(agents, effectiveAgentGroup);
+  const visibleAgents = groupProjection.visibleAgents;
 
   return (
     <>
@@ -2982,6 +3090,8 @@ function AgentsPage({
         </button>
       </header>
 
+      {runtimeError && <div className="inline-error">{runtimeError}</div>}
+
       <section className="panel">
         <div className="panel-heading">
           <div>
@@ -2994,23 +3104,49 @@ function AgentsPage({
         </div>
 
         <div className="workspace-tabs agent-group-tabs" role="tablist" aria-label="Agent groups">
-          {(["Development", "Finance and Events", "Web and PC Control"] as const).map(
-            (group) => (
+          {agentGroups.map((group) => (
               <button
                 key={group}
                 role="tab"
-                aria-selected={activeAgentGroup === group}
-                className={activeAgentGroup === group ? "primary-button" : "secondary-button"}
+                aria-selected={effectiveAgentGroup === group}
+                className={effectiveAgentGroup === group ? "primary-button" : "secondary-button"}
                 onClick={() => setActiveAgentGroup(group)}
               >
                 {group}
               </button>
-            ),
-          )}
+            ))}
         </div>
 
         <div className="agent-list">
-          {renderHierarchy(null, visibleAgentIds)}
+          {groupProjection.rows.map(({ agent, depth, detached }) => (
+            <article
+              className="agent-card hierarchy-card"
+              key={`hierarchy-${agent.id}`}
+              style={{ marginLeft: `${depth * 28}px` }}
+              onClick={() =>
+                agent.registryState === "active"
+                  ? setSelectedAgentId(agent.id)
+                  : openEditAgent(agent)
+              }
+            >
+              <div>
+                <h3>{agent.name}</h3>
+                <p>{agent.description}</p>
+                <small>
+                  {agent.role} · {agent.category} · Authority level {agent.authorityLevel}
+                  {detached ? " · Detached hierarchy" : ""}
+                </small>
+                {agent.registryState === "unassigned" && (
+                  <small className="registry-warning">
+                    {registryIssueMessage(agent.registryIssue)}
+                  </small>
+                )}
+              </div>
+              <span className={`agent-status ${agent.status.toLowerCase()}`}>
+                {agent.registryState === "unassigned" ? "Needs assignment" : agent.status}
+              </span>
+            </article>
+          ))}
         </div>
       </section>
 
@@ -3021,8 +3157,12 @@ function AgentsPage({
               className="agent-card team-agent-card"
               key={agent.id}
               onClick={() => {
-                setSelectedAgentId(agent.id);
-                setActiveWorkspaceTab("Overview");
+                if (agent.registryState === "active") {
+                  setSelectedAgentId(agent.id);
+                  setActiveWorkspaceTab("Overview");
+                } else {
+                  openEditAgent(agent);
+                }
               }}
               style={{ cursor: "pointer" }}
             >
@@ -3045,10 +3185,10 @@ function AgentsPage({
                 <span
                   className={`agent-status ${agent.status.toLowerCase()}`}
                 >
-                  {agent.status}
+                  {agent.registryState === "unassigned" ? "Needs assignment" : agent.status}
                 </span>
 
-                {agent.status === "Working" ? (
+                {agent.registryState === "active" && (agent.status === "Working" ? (
                   <button
                     className="secondary-button"
                     onClick={(event) => {
@@ -3068,7 +3208,7 @@ function AgentsPage({
                   >
                     Start
                   </button>
-                )}
+                ))}
 
                 <button
                   className="secondary-button"
@@ -3084,7 +3224,7 @@ function AgentsPage({
                   className="danger-button"
                   onClick={(event) => {
                     event.stopPropagation();
-                    deleteAgent(agent.id);
+                    void deleteAgent(agent.id);
                   }}
                 >
                   Delete
@@ -3094,6 +3234,39 @@ function AgentsPage({
           ))}
         </div>
       </section>
+
+      {templates.some((template) => template.restorable) && (
+        <section className="panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">TEMPLATES</span>
+              <h2>Restore a default agent</h2>
+              <p className="page-message">
+                Deleted defaults stay deleted until you explicitly restore their template.
+              </p>
+            </div>
+          </div>
+          <div className="agent-list">
+            {templates
+              .filter((template) => template.restorable)
+              .map((template) => (
+                <article className="agent-card" key={template.templateKey}>
+                  <div>
+                    <h3>{template.name}</h3>
+                    <p>{template.description}</p>
+                    <small>{template.role} · {template.category}</small>
+                  </div>
+                  <button
+                    className="secondary-button"
+                    onClick={() => void restoreTemplate(template.templateKey)}
+                  >
+                    Restore template
+                  </button>
+                </article>
+              ))}
+          </div>
+        </section>
+      )}
 
       {isModalOpen && (
         <div className="modal-backdrop">
@@ -3190,9 +3363,10 @@ function AgentsPage({
                     )
                   }
                 >
-                  <option value="">User / Top level</option>
-                  {agents
-                    .filter((agent) => agent.id !== editingAgentId)
+                  <option value="">
+                    {agentRole === "Supervisor" ? "Top level" : "Select a manager"}
+                  </option>
+                  {validManagerCandidates(agents, agentRole, editingAgentId)
                     .map((agent) => (
                       <option value={agent.id} key={agent.id}>
                         {agent.name} · {agent.role}
@@ -3203,19 +3377,8 @@ function AgentsPage({
 
               <label className="form-field">
                 <span>Authority level</span>
-                <select
-                  value={agentAuthorityLevel}
-                  onChange={(event) =>
-                    setAgentAuthorityLevel(
-                      Number(event.target.value) as AuthorityLevel,
-                    )
-                  }
-                >
-                  <option value={1}>1 · Specialist</option>
-                  <option value={2}>2 · Senior</option>
-                  <option value={3}>3 · Team Leader</option>
-                  <option value={4}>4 · Supervisor</option>
-                </select>
+                <input value={authorityForRole(agentRole)} readOnly />
+                <small>Authority is derived from the selected role.</small>
               </label>
             </div>
 
@@ -4507,8 +4670,8 @@ function VoiceControlPage({
   const [desktopControl, setDesktopControl] = useState<DesktopControlStatus | null>(null);
   const submitCommandRef = useRef<(value: string) => void>(() => {});
   const desktopRestoreAttempted = useRef(false);
-  const pcAgent = agents.find((agent) => agent.name === "PC Control Agent") ?? null;
-  const codingAgent = agents.find((agent) => agent.name === "Coding Agent") ?? null;
+  const pcAgent = findActiveTemplateAgent(agents, "pc-control");
+  const codingAgent = findActiveTemplateAgent(agents, "coding");
   const appAliases: Record<string, { key: string; label: string }> = {
     firefox: { key: "firefox", label: "Firefox" },
     dolphin: { key: "dolphin", label: "Dolphin" },
@@ -5993,6 +6156,7 @@ function SettingsPage({
   models,
   setModels,
   agents,
+  applicationAgents,
   setAgents,
   approvalRequests,
   setApprovalRequests,
@@ -6014,6 +6178,7 @@ function SettingsPage({
   models: ModelDefinition[];
   setModels: React.Dispatch<React.SetStateAction<ModelDefinition[]>>;
   agents: Agent[];
+  applicationAgents: Agent[];
   setAgents: React.Dispatch<React.SetStateAction<Agent[]>>;
   approvalRequests: ApprovalRequest[];
   setApprovalRequests: React.Dispatch<
@@ -6281,7 +6446,7 @@ function SettingsPage({
     const backup = {
       version: 2,
       exportedAt: new Date().toISOString(),
-      agents,
+      agents: applicationAgents,
       models,
       approvalRequests,
       reminders,
@@ -6360,7 +6525,7 @@ function SettingsPage({
           ? normalizePreferences(parsed.preferences)
           : preferences;
         setAgents(
-          parsed.agents.map((agent) => ({
+          normalizeLegacyAgentRegistrySet(parsed.agents.map((agent) => ({
             ...agent,
             performance: normalizePerformance(agent.performance),
             tasks: Array.isArray(agent.tasks)
@@ -6420,7 +6585,7 @@ function SettingsPage({
                       : null,
                 }))
               : [],
-          })),
+          }))),
         );
         setModels(
           parsed.models.some(
@@ -7463,6 +7628,8 @@ function App() {
   const [persistenceMessage, setPersistenceMessage] = useState("");
   const persistenceWriter = useRef<ApplicationStateWriter | null>(null);
   const suppressNextPersistenceWrite = useRef(false);
+  const [agentRegistrySnapshot, setAgentRegistrySnapshot] =
+    useState<AgentRegistrySnapshot | null>(null);
 
   const [taskRetentionDays, setTaskRetentionDays] =
     useState<HistoryRetentionDays>(() => {
@@ -7635,408 +7802,15 @@ function App() {
     system: "ask",
   };
 
-  const defaultAgents: Agent[] = [
-    {
-      id: 1,
-      name: "Supervisor",
-      role: "Supervisor",
-      category: "Management",
-      reportsTo: null,
-      authorityLevel: 4,
-      description: "Coordinates tasks and delegates work",
-      status: "Working",
-      model: "gpt-5.6-terra",
-      memory: "",
-      tasks: [],
-      activity: [],
-      performance: {
-        strength: 8,
-        focus: "strength",
-        cpuLimit: 80,
-        gpuLimit: 60,
-        overflowAction: "queue",
-        redirectAgentId: null,
-      },
-      capabilities: {
-        files: "full",
-        internet: "read",
-        clipboard: "write",
-        terminal: "user",
-        system: "notifications",
-      },
-      approvals: {
-        files: "ask",
-        internet: "ask",
-        clipboard: "allow",
-        terminal: "ask",
-        system: "ask",
-      },
-    },
-    {
-      id: 2,
-      name: "Coding Agent",
-      role: "Specialist",
-      category: "Development",
-      reportsTo: 3,
-      authorityLevel: 1,
-      description: "Builds and edits project files",
-      status: "Working",
-      model: ollamaCodingModelName,
-      memory: "",
-      tasks: [],
-      activity: [],
-      performance: {
-        strength: 8,
-        focus: "balanced",
-        cpuLimit: 85,
-        gpuLimit: 70,
-        overflowAction: "redirect",
-        redirectAgentId: 3,
-      },
-      capabilities: {
-        files: "write",
-        internet: "read",
-        clipboard: "write",
-        terminal: "safe",
-        system: "none",
-      },
-      approvals: {
-        files: "allow",
-        internet: "ask",
-        clipboard: "allow",
-        terminal: "ask",
-        system: "deny",
-      },
-    },
-    {
-      id: 3,
-      name: "Debugging Agent",
-      role: "Senior Agent",
-      category: "Development",
-      reportsTo: 6,
-      authorityLevel: 2,
-      description: "Finds errors and verifies fixes",
-      status: "Waiting",
-      model: "gpt-5.6-terra",
-      memory: "",
-      tasks: [],
-      activity: [],
-      performance: {
-        strength: 7,
-        focus: "strength",
-        cpuLimit: 75,
-        gpuLimit: 60,
-        overflowAction: "redirect",
-        redirectAgentId: 1,
-      },
-      capabilities: {
-        files: "read",
-        internet: "none",
-        clipboard: "read",
-        terminal: "safe",
-        system: "none",
-      },
-      approvals: {
-        files: "ask",
-        internet: "deny",
-        clipboard: "ask",
-        terminal: "ask",
-        system: "deny",
-      },
-    },
-    {
-      id: 4,
-      name: "Browser Agent",
-      role: "Specialist",
-      category: "Browsing",
-      reportsTo: 9,
-      authorityLevel: 1,
-      description: "Uses websites when permission is granted",
-      status: "Paused",
-      model: "gpt-5.6-luna",
-      memory: "",
-      tasks: [],
-      activity: [],
-      performance: {
-        strength: 4,
-        focus: "speed",
-        cpuLimit: 45,
-        gpuLimit: 10,
-        overflowAction: "redirect",
-        redirectAgentId: 1,
-      },
-      capabilities: {
-        files: "none",
-        internet: "read",
-        clipboard: "read",
-        terminal: "none",
-        system: "none",
-      },
-      approvals: {
-        files: "deny",
-        internet: "ask",
-        clipboard: "ask",
-        terminal: "deny",
-        system: "deny",
-      },
-    },
-    {
-      id: 5,
-      name: "Financial Agent",
-      role: "Specialist",
-      category: "Finance",
-      reportsTo: 10,
-      authorityLevel: 1,
-      description: "Tracks financial tasks and reports",
-      status: "Paused",
-      model: "gpt-5.6-terra",
-      memory: "",
-      tasks: [],
-      activity: [],
-      performance: {
-        strength: 5,
-        focus: "balanced",
-        cpuLimit: 55,
-        gpuLimit: 25,
-        overflowAction: "redirect",
-        redirectAgentId: 1,
-      },
-      capabilities: {
-        files: "read",
-        internet: "none",
-        clipboard: "none",
-        terminal: "none",
-        system: "none",
-      },
-      approvals: {
-        files: "ask",
-        internet: "deny",
-        clipboard: "deny",
-        terminal: "deny",
-        system: "deny",
-      },
-    },
-    {
-      id: 6,
-      name: "Development Team Leader",
-      role: "Team Leader",
-      category: "Management",
-      reportsTo: 1,
-      authorityLevel: 3,
-      description: "Coordinates development work and reviews delivery progress",
-      status: "Waiting",
-      model: "gpt-5.6-terra",
-      memory: "",
-      tasks: [],
-      activity: [],
-      performance: {
-        strength: 8,
-        focus: "strength",
-        cpuLimit: 75,
-        gpuLimit: 55,
-        overflowAction: "queue",
-        redirectAgentId: null,
-      },
-      capabilities: {
-        files: "read",
-        internet: "none",
-        clipboard: "none",
-        terminal: "safe",
-        system: "none",
-      },
-      approvals: {
-        files: "ask",
-        internet: "deny",
-        clipboard: "deny",
-        terminal: "ask",
-        system: "deny",
-      },
-    },
-    {
-      id: 7,
-      name: "PC Control Agent",
-      role: "Specialist",
-      category: "System Control",
-      reportsTo: 11,
-      authorityLevel: 1,
-      description: "Handles safe computer-control requests with explicit approval",
-      status: "Paused",
-      model: "gpt-5.6-luna",
-      memory: "",
-      tasks: [],
-      activity: [],
-      performance: {
-        strength: 5,
-        focus: "speed",
-        cpuLimit: 50,
-        gpuLimit: 15,
-        overflowAction: "redirect",
-        redirectAgentId: 1,
-      },
-      capabilities: {
-        files: "read",
-        internet: "none",
-        clipboard: "read",
-        terminal: "none",
-        system: "notifications",
-      },
-      approvals: {
-        files: "ask",
-        internet: "deny",
-        clipboard: "ask",
-        terminal: "deny",
-        system: "ask",
-      },
-    },
-    {
-      id: 8,
-      name: "Event and Reminder Agent",
-      role: "Specialist",
-      category: "Business",
-      reportsTo: 11,
-      authorityLevel: 1,
-      description: "Organizes reminders, deadlines, and scheduled follow-up work",
-      status: "Paused",
-      model: "gpt-5.6-luna",
-      memory: "",
-      tasks: [],
-      activity: [],
-      performance: {
-        strength: 4,
-        focus: "speed",
-        cpuLimit: 45,
-        gpuLimit: 10,
-        overflowAction: "queue",
-        redirectAgentId: null,
-      },
-      capabilities: {
-        files: "read",
-        internet: "none",
-        clipboard: "none",
-        terminal: "none",
-        system: "notifications",
-      },
-      approvals: {
-        files: "ask",
-        internet: "deny",
-        clipboard: "deny",
-        terminal: "deny",
-        system: "ask",
-      },
-    },
-    {
-      id: 9,
-      name: "Research and Web Senior",
-      role: "Senior Agent",
-      category: "Browsing",
-      reportsTo: 6,
-      authorityLevel: 2,
-      description: "Guides research and browser work and verifies external findings",
-      status: "Waiting",
-      model: "gpt-5.6-terra",
-      memory: "",
-      tasks: [],
-      activity: [],
-      performance: {
-        strength: 7,
-        focus: "strength",
-        cpuLimit: 70,
-        gpuLimit: 45,
-        overflowAction: "queue",
-        redirectAgentId: null,
-      },
-      capabilities: {
-        files: "read",
-        internet: "read",
-        clipboard: "read",
-        terminal: "none",
-        system: "none",
-      },
-      approvals: {
-        files: "ask",
-        internet: "ask",
-        clipboard: "ask",
-        terminal: "deny",
-        system: "deny",
-      },
-    },
-    {
-      id: 10,
-      name: "Finance Senior",
-      role: "Senior Agent",
-      category: "Finance",
-      reportsTo: 6,
-      authorityLevel: 2,
-      description: "Reviews financial analysis, estimates, and reporting work",
-      status: "Waiting",
-      model: "gpt-5.6-terra",
-      memory: "",
-      tasks: [],
-      activity: [],
-      performance: {
-        strength: 7,
-        focus: "balanced",
-        cpuLimit: 65,
-        gpuLimit: 35,
-        overflowAction: "queue",
-        redirectAgentId: null,
-      },
-      capabilities: {
-        files: "read",
-        internet: "read",
-        clipboard: "none",
-        terminal: "none",
-        system: "none",
-      },
-      approvals: {
-        files: "ask",
-        internet: "ask",
-        clipboard: "deny",
-        terminal: "deny",
-        system: "deny",
-      },
-    },
-    {
-      id: 11,
-      name: "Operations Senior",
-      role: "Senior Agent",
-      category: "Business",
-      reportsTo: 6,
-      authorityLevel: 2,
-      description: "Reviews computer-control, scheduling, and operational work",
-      status: "Waiting",
-      model: "gpt-5.6-terra",
-      memory: "",
-      tasks: [],
-      activity: [],
-      performance: {
-        strength: 7,
-        focus: "balanced",
-        cpuLimit: 65,
-        gpuLimit: 35,
-        overflowAction: "queue",
-        redirectAgentId: null,
-      },
-      capabilities: {
-        files: "read",
-        internet: "none",
-        clipboard: "read",
-        terminal: "none",
-        system: "notifications",
-      },
-      approvals: {
-        files: "ask",
-        internet: "deny",
-        clipboard: "ask",
-        terminal: "deny",
-        system: "ask",
-      },
-    },
-  ];
+  const defaultAgents = createDefaultApplicationState().agents;
 
   function normalizeAgent(agent: Partial<Agent>): Agent {
-    return {
+    return normalizeLegacyAgentRegistry({
       id: typeof agent.id === "number" ? agent.id : Date.now(),
+      templateKey: agent.templateKey,
+      registryState: agent.registryState,
+      registryIssue: agent.registryIssue,
+      deletedAtUnixMs: agent.deletedAtUnixMs,
       name: agent.name ?? "Unnamed Agent",
       description: agent.description ?? "No description provided",
       status: agent.status ?? "Waiting",
@@ -8216,7 +7990,7 @@ function App() {
         ...defaultApprovals,
         ...agent.approvals,
       },
-    };
+    });
   }
 
   const [agents, setAgents] = useState<Agent[]>(() => {
@@ -8236,45 +8010,31 @@ function App() {
         return defaultAgents;
       }
 
-      const normalizedAgents = parsedAgents.map(normalizeAgent);
-      const existingNames = new Set(
-        normalizedAgents.map((agent) => agent.name.trim().toLowerCase()),
+      const normalizedAgents = normalizeLegacyAgentRegistrySet(
+        parsedAgents.map(normalizeAgent),
       );
-      const migratedAgents = normalizedAgents.map((agent) => {
-        const seniorForAgent: Record<string, number> = {
-          "Browser Agent": 9,
-          "Financial Agent": 10,
-          "PC Control Agent": 11,
-          "Event and Reminder Agent": 11,
-        };
-        const seniorId = seniorForAgent[agent.name];
-        if (seniorId && (agent.reportsTo === 1 || agent.reportsTo === null)) {
-          return { ...agent, reportsTo: seniorId };
-        }
-        if (
-          agent.name === "Coding Agent" &&
-          agent.reportsTo === 1 &&
-          normalizedAgents.some((item) => item.name === "Debugging Agent")
-        ) {
-          return { ...agent, reportsTo: 3 };
-        }
-        if (
-          agent.name === "Debugging Agent" &&
-          agent.reportsTo === 1
-        ) {
-          return { ...agent, reportsTo: 6 };
-        }
-        return agent;
-      });
-      const missingDefaults = defaultAgents.filter(
-        (agent) => !existingNames.has(agent.name.trim().toLowerCase()),
-      );
-
-      return [...migratedAgents, ...missingDefaults];
+      return normalizedAgents;
     } catch {
       return defaultAgents;
     }
   });
+  const operationalAgents = activeRegistryAgents(agents);
+
+  async function refreshAgentRegistrySnapshot() {
+    if (!desktopRuntime) return;
+    const snapshot = await invoke<AgentRegistrySnapshot>("agent_registry_snapshot");
+    setAgentRegistrySnapshot(snapshot);
+  }
+
+  async function refreshAgentRegistrySnapshotAfterCommit() {
+    try {
+      await refreshAgentRegistrySnapshot();
+    } catch (error) {
+      setPersistenceMessage(
+        `Application state was updated, but agent templates could not be refreshed: ${persistenceErrorMessage(error)}`,
+      );
+    }
+  }
 
   function applyAuthoritativeApplicationState(state: ApplicationState) {
     suppressNextPersistenceWrite.current = true;
@@ -8314,6 +8074,9 @@ function App() {
         );
         setPersistenceMessage(cleanupWarning ?? "");
         hydrateApplicationState(envelope.state);
+        void refreshAgentRegistrySnapshot().catch((error: unknown) => {
+          if (active) setPersistenceMessage(persistenceErrorMessage(error));
+        });
       })
       .catch((error: unknown) => {
         if (active) {
@@ -8425,11 +8188,13 @@ function App() {
     try {
       const envelope = await writer.importLegacyBackup(backupJson);
       hydrateApplicationState(envelope.state);
+      await refreshAgentRegistrySnapshotAfterCommit();
     } catch (error) {
       if (writer.hasFailed) {
         setPersistenceMessage(persistenceErrorMessage(error));
         setPersistencePhase("error");
       } else {
+        suppressNextPersistenceWrite.current = true;
         setPersistencePhase("ready");
       }
       throw error;
@@ -8446,11 +8211,39 @@ function App() {
     try {
       const envelope = await writer.reset(confirmation);
       hydrateApplicationState(envelope.state);
+      await refreshAgentRegistrySnapshotAfterCommit();
     } catch (error) {
       if (writer.hasFailed) {
         setPersistenceMessage(persistenceErrorMessage(error));
         setPersistencePhase("error");
       } else {
+        suppressNextPersistenceWrite.current = true;
+        setPersistencePhase("ready");
+      }
+      throw error;
+    }
+  }
+
+  async function mutateAgentRegistry(
+    command: "create_agent" | "update_agent" | "delete_agent" | "restore_agent_template",
+    request: Record<string, unknown>,
+  ) {
+    const writer = persistenceWriter.current;
+    if (!desktopRuntime || !writer) {
+      throw new Error("The authoritative agent registry is available in the desktop app.");
+    }
+    setPersistenceMessage("");
+    setPersistencePhase("mutating");
+    try {
+      const envelope = await writer.mutateAgentRegistry(command, request);
+      hydrateApplicationState(envelope.state);
+      await refreshAgentRegistrySnapshotAfterCommit();
+    } catch (error) {
+      if (writer.hasFailed) {
+        setPersistenceMessage(persistenceErrorMessage(error));
+        setPersistencePhase("error");
+      } else {
+        suppressNextPersistenceWrite.current = true;
         setPersistencePhase("ready");
       }
       throw error;
@@ -8680,6 +8473,7 @@ function App() {
     activityRetentionDays,
     preferences,
     desktopRuntime,
+    persistencePhase,
   ]);
 
   const globalActiveRun = runCoordinator.snapshot.activeAttempt;
@@ -8844,7 +8638,7 @@ function App() {
         )}
         {activePage === "Dashboard" ? (
           <DashboardPage
-            agents={agents}
+            agents={operationalAgents}
             approvalRequests={approvalRequests}
             onOpenAgents={() => setActivePage("Agents")}
             onOpenTasks={() => setActivePage("Tasks")}
@@ -8854,6 +8648,9 @@ function App() {
           <AgentsPage
             agents={agents}
             setAgents={setAgents}
+            templates={agentRegistrySnapshot?.templates ?? []}
+            onRegistryMutation={mutateAgentRegistry}
+            authoritativeRegistry={desktopRuntime}
             models={models}
             providerRegistry={providerRegistry}
             preferences={preferences}
@@ -8865,7 +8662,7 @@ function App() {
           />
         ) : activePage === "Voice Control" ? (
           <VoiceControlPage
-            agents={agents}
+            agents={operationalAgents}
             setAgents={setAgents}
             setApprovalRequests={setApprovalRequests}
             preferences={preferences}
@@ -8873,7 +8670,7 @@ function App() {
           />
         ) : activePage === "Tasks" ? (
           <TasksPage
-            agents={agents}
+            agents={operationalAgents}
             setAgents={setAgents}
             retentionDays={taskRetentionDays}
             setRetentionDays={setTaskRetentionDays}
@@ -8881,7 +8678,7 @@ function App() {
           />
         ) : activePage === "Approvals" ? (
           <ApprovalsPage
-            agents={agents}
+            agents={operationalAgents}
             setAgents={setAgents}
             approvalRequests={approvalRequests}
             setApprovalRequests={setApprovalRequests}
@@ -8890,7 +8687,7 @@ function App() {
           />
         ) : activePage === "Reminders" ? (
           <RemindersPage
-            agents={agents}
+            agents={operationalAgents}
             reminders={reminders}
             setReminders={setReminders}
           />
@@ -8915,7 +8712,8 @@ function App() {
           <SettingsPage
             models={models}
             setModels={setModels}
-            agents={agents}
+            agents={operationalAgents}
+            applicationAgents={agents}
             setAgents={setAgents}
             approvalRequests={approvalRequests}
             setApprovalRequests={setApprovalRequests}
@@ -8939,7 +8737,7 @@ function App() {
         )}
         {activePage !== "Voice Control" && (
           <VoiceControlPage
-            agents={agents}
+            agents={operationalAgents}
             setAgents={setAgents}
             setApprovalRequests={setApprovalRequests}
             preferences={preferences}

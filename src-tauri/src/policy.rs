@@ -271,6 +271,12 @@ pub fn evaluate_policy(
         .ok_or_else(|| {
             PolicyDenial::new("AGENT_NOT_FOUND", "The selected agent does not exist.")
         })?;
+    if agent.registry_state != "active" {
+        return Err(PolicyDenial::new(
+            "AGENT_REGISTRY_INACTIVE",
+            "Deleted or unassigned agents cannot execute privileged actions.",
+        ));
+    }
     if agent.status == "Paused" {
         return Err(PolicyDenial::new(
             "AGENT_PAUSED",
@@ -316,6 +322,12 @@ impl<'a> EvaluationContext<'a> {
                     .ok_or_else(|| {
                         PolicyDenial::new("TASK_OWNER_NOT_FOUND", "The task owner does not exist.")
                     })?;
+                if owner.registry_state != "active" {
+                    return Err(PolicyDenial::new(
+                        "TASK_OWNER_REGISTRY_INACTIVE",
+                        "Tasks owned by deleted or unassigned agents cannot run.",
+                    ));
+                }
                 let task = owner
                     .tasks
                     .iter()

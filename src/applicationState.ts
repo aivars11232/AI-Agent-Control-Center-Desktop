@@ -199,9 +199,32 @@ export type AgentCategory =
   | "System Control"
   | "General";
 export type AuthorityLevel = 1 | 2 | 3 | 4;
+export type AgentTemplateKey =
+  | "supervisor"
+  | "coding"
+  | "debugging"
+  | "browser"
+  | "financial"
+  | "development-team-leader"
+  | "pc-control"
+  | "event-reminder"
+  | "research-web-senior"
+  | "finance-senior"
+  | "operations-senior";
+export type AgentRegistryState = "active" | "unassigned" | "deleted";
+export type AgentRegistryIssue =
+  | "self-parent"
+  | "missing-manager"
+  | "manager-not-active"
+  | "manager-authority"
+  | "cycle";
 
 export type Agent = {
   id: number;
+  templateKey: AgentTemplateKey | null;
+  registryState: AgentRegistryState;
+  registryIssue: AgentRegistryIssue | null;
+  deletedAtUnixMs: number | null;
   name: string;
   description: string;
   status: AgentStatus;

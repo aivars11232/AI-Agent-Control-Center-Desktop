@@ -717,6 +717,21 @@ button:disabled {
   border-left: 3px solid var(--accent);
 }
 
+.registry-warning {
+  display: block;
+  margin-top: 6px;
+  color: var(--warning);
+}
+
+.inline-error {
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border));
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--warning) 9%, var(--surface));
+  color: var(--text);
+}
+
 .agent-card > * {
   min-width: 0;
 }

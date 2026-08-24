@@ -1,7 +1,8 @@
+use crate::agent_registry::{normalize_legacy_agents, validate_agent_registry};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fmt};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 pub const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 pub const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -298,6 +299,14 @@ pub struct AgentApprovals {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Agent {
     pub id: i64,
+    #[serde(default)]
+    pub template_key: Option<String>,
+    #[serde(default = "default_registry_state")]
+    pub registry_state: String,
+    #[serde(default)]
+    pub registry_issue: Option<String>,
+    #[serde(default)]
+    pub deleted_at_unix_ms: Option<i64>,
     pub name: String,
     pub description: String,
     pub status: String,
@@ -321,12 +330,16 @@ pub struct StateValidationError {
 }
 
 impl StateValidationError {
-    fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             path: path.into(),
             message: message.into(),
         }
     }
+}
+
+fn default_registry_state() -> String {
+    "active".to_string()
 }
 
 impl fmt::Display for StateValidationError {
@@ -364,7 +377,7 @@ pub fn application_state_from_legacy(
     }
     if let Some(value) = &legacy.agents {
         state.agents = parse_legacy_json("agents", value)?;
-        append_missing_default_agents(&mut state)?;
+        normalize_legacy_agents(&mut state.agents);
     }
     if let Some(value) = &legacy.models {
         state.models = parse_legacy_json("models", value)?;
@@ -426,7 +439,7 @@ pub fn application_state_from_legacy_backup(
             .preferences
             .unwrap_or_else(|| current.preferences.clone()),
     };
-    append_missing_default_agents(&mut state)?;
+    normalize_legacy_agents(&mut state.agents);
     append_missing_ollama_model(&mut state)?;
     downgrade_legacy_approvals(&mut state);
     validate_application_state(&state)?;
@@ -440,25 +453,6 @@ where
     serde_json::from_str(value).map_err(|_| {
         StateValidationError::new(path, "legacy renderer JSON is malformed or unsupported")
     })
-}
-
-fn append_missing_default_agents(state: &mut ApplicationState) -> Result<(), StateValidationError> {
-    let defaults = default_application_state()?.agents;
-    let existing_names = state
-        .agents
-        .iter()
-        .map(|agent| agent.name.trim().to_lowercase())
-        .collect::<HashSet<_>>();
-    let existing_ids = state
-        .agents
-        .iter()
-        .map(|agent| agent.id)
-        .collect::<HashSet<_>>();
-    state.agents.extend(defaults.into_iter().filter(|agent| {
-        !existing_names.contains(&agent.name.trim().to_lowercase())
-            && !existing_ids.contains(&agent.id)
-    }));
-    Ok(())
 }
 
 fn append_missing_ollama_model(state: &mut ApplicationState) -> Result<(), StateValidationError> {
@@ -629,6 +623,7 @@ pub fn validate_application_state(state: &ApplicationState) -> Result<(), StateV
     }
     validate_count("tasks", total_tasks, MAX_TASKS)?;
     validate_count("activity", total_activity, MAX_ACTIVITY)?;
+    validate_agent_registry(&state.agents)?;
 
     validate_models(&state.models)?;
     validate_approval_requests(&state.approval_requests)?;
@@ -1297,6 +1292,66 @@ mod tests {
         assert_eq!(
             validate_application_state(&state).unwrap_err().path,
             "preferences.activeWorkspaceId"
+        );
+    }
+
+    #[test]
+    fn task_0009_rejects_invalid_reporting_relationships() {
+        let mut state = default_application_state().expect("seed should be valid");
+        state.agents[1].reports_to = Some(state.agents[1].id);
+        assert_eq!(
+            validate_application_state(&state).unwrap_err().path,
+            "agents[1].reportsTo"
+        );
+
+        let mut state = default_application_state().expect("seed should be valid");
+        state.agents[1].reports_to = Some(999_999);
+        assert_eq!(
+            validate_application_state(&state).unwrap_err().path,
+            "agents[1].reportsTo"
+        );
+
+        let mut state = default_application_state().expect("seed should be valid");
+        state.agents[0].reports_to = Some(state.agents[1].id);
+        assert_eq!(
+            validate_application_state(&state).unwrap_err().path,
+            "agents[0].reportsTo"
+        );
+
+        let mut state = default_application_state().expect("seed should be valid");
+        state.agents[2].reports_to = Some(state.agents[1].id);
+        let error = validate_application_state(&state).unwrap_err();
+        assert_eq!(error.path, "agents[1].reportsTo");
+        assert!(error.message.contains("cycle"));
+    }
+
+    #[test]
+    fn task_0009_rejects_role_authority_mismatch() {
+        let mut state = default_application_state().expect("seed should be valid");
+        state.agents[1].authority_level = 4;
+        assert_eq!(
+            validate_application_state(&state).unwrap_err().path,
+            "agents[1].authorityLevel"
+        );
+
+        let mut state = default_application_state().expect("seed should be valid");
+        state.agents[1].registry_state = "unassigned".to_string();
+        state.agents[1].registry_issue = Some("unexpected".to_string());
+        state.agents[1].status = "Paused".to_string();
+        state.agents[1].reports_to = None;
+        assert_eq!(
+            validate_application_state(&state).unwrap_err().path,
+            "agents[1].registryIssue"
+        );
+
+        let mut state = default_application_state().expect("seed should be valid");
+        state.agents[1].registry_state = "deleted".to_string();
+        state.agents[1].deleted_at_unix_ms = Some(-1);
+        state.agents[1].status = "Paused".to_string();
+        state.agents[1].reports_to = None;
+        assert_eq!(
+            validate_application_state(&state).unwrap_err().path,
+            "agents[1].deletedAtUnixMs"
         );
     }
 }

@@ -70,6 +70,10 @@ export function agentFixture(overrides: AgentFixtureOverrides = {}): Agent {
 
   return {
     id: 1,
+    templateKey: null,
+    registryState: "active",
+    registryIssue: null,
+    deletedAtUnixMs: null,
     name: "Fixture Agent",
     description: "Deterministic characterization fixture",
     status: "Waiting",

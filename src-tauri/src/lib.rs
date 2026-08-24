@@ -1,3 +1,4 @@
+mod agent_registry;
 mod app_state;
 mod authorization;
 mod codex_runtime;
@@ -8,6 +9,10 @@ mod provider_runtime;
 mod run_coordinator;
 mod workspace_tools;
 
+use agent_registry::{
+    AgentRegistrySnapshot, CreateAgentRequest, DeleteAgentRequest, RestoreAgentTemplateRequest,
+    UpdateAgentRequest,
+};
 use app_state::{ApplicationState, LegacyRendererState};
 use ashpd::desktop::{
     remote_desktop::{
@@ -3120,6 +3125,45 @@ async fn acknowledge_legacy_cleanup(
 }
 
 #[tauri::command]
+async fn agent_registry_snapshot(
+    state: State<'_, PersistenceService>,
+) -> Result<AgentRegistrySnapshot, PersistenceError> {
+    state.inner().agent_registry_snapshot().await
+}
+
+#[tauri::command]
+async fn create_agent(
+    state: State<'_, PersistenceService>,
+    request: CreateAgentRequest,
+) -> Result<StateEnvelope, PersistenceError> {
+    state.inner().create_agent(request).await
+}
+
+#[tauri::command]
+async fn update_agent(
+    state: State<'_, PersistenceService>,
+    request: UpdateAgentRequest,
+) -> Result<StateEnvelope, PersistenceError> {
+    state.inner().update_agent(request).await
+}
+
+#[tauri::command]
+async fn delete_agent(
+    state: State<'_, PersistenceService>,
+    request: DeleteAgentRequest,
+) -> Result<StateEnvelope, PersistenceError> {
+    state.inner().delete_agent(request).await
+}
+
+#[tauri::command]
+async fn restore_agent_template(
+    state: State<'_, PersistenceService>,
+    request: RestoreAgentTemplateRequest,
+) -> Result<StateEnvelope, PersistenceError> {
+    state.inner().restore_agent_template(request).await
+}
+
+#[tauri::command]
 async fn request_authorization(
     state: State<'_, PersistenceService>,
     intent: ActionIntent,
@@ -3582,6 +3626,11 @@ pub fn run() {
             reset_application_state,
             import_legacy_backup,
             acknowledge_legacy_cleanup,
+            agent_registry_snapshot,
+            create_agent,
+            update_agent,
+            delete_agent,
+            restore_agent_template,
             request_authorization,
             resolve_approval,
             codex_runtime_status,

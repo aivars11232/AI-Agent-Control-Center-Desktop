@@ -155,6 +155,21 @@ export class ApplicationStateWriter {
     return envelope;
   }
 
+  async mutateAgentRegistry(
+    command: "create_agent" | "update_agent" | "delete_agent" | "restore_agent_template",
+    request: Record<string, unknown>,
+  ): Promise<StateEnvelope> {
+    await this.flush();
+    const envelope = await this.invoke<StateEnvelope>(command, {
+      request: {
+        ...request,
+        expectedRevision: this.revision,
+      },
+    });
+    this.revision = envelope.revision;
+    return envelope;
+  }
+
   private async drain(): Promise<void> {
     try {
       while (this.pendingState) {

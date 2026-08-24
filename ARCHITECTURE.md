@@ -32,6 +32,7 @@ The binding decision record is
     React renderer (src/App.tsx)
       |-- typed state/IPC adapter (src/applicationState.ts, src/persistence.ts)
       |-- provider availability/model projection (src/providerRegistry.ts)
+      |-- dynamic agent/group/hierarchy projection (src/agentRegistry.ts)
       |-- run snapshot/event projection (src/runCoordinator.ts)
       |-- browser-preview localStorage (non-authoritative compatibility only)
       |-- renderer presentation: routing/reviewer selection and task view state
@@ -40,6 +41,7 @@ The binding decision record is
       v
     Rust backend (src-tauri/src/lib.rs)
       |-- application state validation + SQLite repository/migrations
+      |-- authoritative agent registry/hierarchy (agent_registry.rs)
       |-- capability policy + authoritative one-use approvals
       |-- authoritative single-run coordinator + durable bounded ledger
       |-- provider registry/common contract (provider_runtime.rs)
@@ -68,6 +70,10 @@ transient progress/stop presentation state. <code>src/providerRegistry.ts</code>
 projects the common backend registry into truthful provider status and
 fail-closed model eligibility for assignment, defaults, routing, and review;
 it is presentation and preflight logic, not the dispatch authority.
+<code>src/agentRegistry.ts</code> projects active agents, dynamic category
+groups, ancestor context, repair rows, role-derived authority, compatible
+manager choices, and stable template identities. It does not authorize or
+persist registry mutations.
 
 ### Rust backend
 
@@ -75,6 +81,7 @@ it is presentation and preflight logic, not the dispatch authority.
 processes/transports, workspace resolution and tool access, run cancellation,
 diff/change capture, desktop actions, and voice process management. It
 also composes <code>app_state.rs</code>, <code>policy.rs</code>,
+<code>agent_registry.rs</code>,
 <code>authorization.rs</code>, <code>run_coordinator.rs</code>,
 <code>provider_runtime.rs</code>, <code>codex_runtime.rs</code>,
 <code>ollama_runtime.rs</code>, <code>workspace_tools.rs</code>, and
@@ -83,9 +90,11 @@ own the versioned state contract, normalized action intents, fail-closed
 capability evaluation, authoritative approval lifecycle, legal run transitions
 and evidence bounds, provider identity/contracts/dispatch, isolated Codex
 compatibility/process/protocol handling, bounded fixed-loopback Ollama
-transport/discovery, descriptor-confined conflict-safe workspace edits, SQLite
-schema/repository, legacy migration, and typed state IPC. The registry exposes only Codex and Ollama
-adapters and rejects provider/model mismatch without fallback. Non-run
+transport/discovery, descriptor-confined conflict-safe workspace edits,
+validated agent identity/lifecycle/hierarchy operations, SQLite
+schema/repository, legacy migration, and typed state IPC. The provider registry
+exposes only Codex and Ollama adapters and rejects provider/model mismatch
+without fallback. Non-run
 privileged command handlers consume backend authorization before their first
 side effect; run approvals are reserved at admission and consumed at successful
 provider startup.
@@ -93,8 +102,8 @@ provider startup.
 ### Persistence and migration
 
 The desktop database is <code>application-state.sqlite3</code> below Tauri's
-platform application-data directory. Migrations 0001 through 0003 establish
-schema version 3 plus a migration ledger. Repository writes replace one validated
+platform application-data directory. Migrations 0001 through 0004 establish
+schema version 4 plus a migration ledger. Repository writes replace one validated
 aggregate inside an immediate transaction and use a monotonically increasing
 revision to reject stale writers. Startup refuses corrupt or unsupported newer
 databases and retains the typed error for the renderer instead of silently
@@ -122,6 +131,17 @@ revision orders run projections independently from aggregate-state saves.
 Import/reset operations reject an active run; reset clears run-ledger data.
 Startup reconciliation distinguishes attempts that are safe to retry from
 ones that may have dispatched and require manual review.
+
+Schema v4 adds stable optional template keys, explicit active/unassigned/deleted
+lifecycle state, migration issues, deletion timestamps, and a durable monotonic
+agent-ID allocator. Create, update, logical delete, and template restore use
+dedicated compare-and-swap IPC transactions. Generic whole-state saves cannot
+change registry identity, lifecycle, name, role, category, authority, or
+reporting structure. Roles derive authority; active non-supervisors require an
+active higher-authority manager; self-parenting, cycles, dangling managers, and
+incompatible authority fail validation. Legacy invalid relationships are
+paused and detached for explicit repair, and absent/deleted defaults are not
+silently recreated.
 
 ### Voice runtime
 
@@ -232,7 +252,7 @@ task must choose the smallest structure supported by the code at that time.
 
 | Data or decision | Current owner | Planned authoritative owner |
 | --- | --- | --- |
-| Agents and hierarchy | Backend SQLite aggregate; renderer manages semantics | Validated backend agent registry (TASK-0009) |
+| Agents and hierarchy | Validated backend registry with transactional CRUD, lifecycle, role-derived authority, and reporting constraints; renderer projects views | Backend agent registry |
 | Tasks and results | Backend SQLite aggregate plus run-ledger-owned lifecycle/results; renderer still manages broader task semantics | Backend domain store and run ledger |
 | Approval records | Backend SQLite; backend-issued rows are authoritative and imported rows are expired history | Backend policy/approval store |
 | Approval match/consume | Backend exact-match transaction | Backend exact-match transaction |
@@ -289,9 +309,9 @@ The planned system-wide execution flow is sequential:
 TASK-0003 through TASK-0005 establish backend state, policy, and coordination.
 TASK-0006 establishes provider identity and the common contract; TASK-0007
 hardens the Codex adapter and TASK-0008 hardens the Ollama adapter.
-TASK-0009 through
-TASK-0012 establish hierarchy and orchestration. TASK-0013 and TASK-0014
-modularize UI/data lifecycle. TASK-0015 and TASK-0016 own system actions and
+TASK-0009 establishes the dynamic agent registry and valid hierarchy;
+TASK-0010 through TASK-0012 establish the remaining orchestration. TASK-0013
+and TASK-0014 modularize UI/data lifecycle. TASK-0015 and TASK-0016 own system actions and
 KDE/voice integration. TASK-0017 through TASK-0020 complete bounded roles,
 packaging, acceptance, and release.
 

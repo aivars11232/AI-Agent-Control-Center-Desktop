@@ -1,12 +1,12 @@
 # Current State
 
 > **Classification: Current static and fresh non-live evidence.** This snapshot
-> was refreshed for TASK-0008 on 2026-08-23 from starting commit
-> <code>4e06935bc9b4a7350e5ebca9970527f2f55cf2bd</code>
-> (<code>task7</code>) on branch <code>main</code>. At the TASK-0008 preflight,
+> was refreshed for TASK-0009 on 2026-08-24 from starting commit
+> <code>9ebbe5b740715e53b048fed8b3ab8847601c2f92</code>
+> (<code>task8</code>) on branch <code>main</code>. At the TASK-0009 preflight,
 > checked-out <code>main</code> and <code>origin/main</code> both resolved to that
 > commit, with zero ahead/behind and a clean working tree. Its actual scope
-> matched the retained TASK-0007 implementation evidence. Reverify later
+> matched the retained TASK-0008 implementation evidence. Reverify later
 > implementation facts when they may have drifted.
 
 This document owns statements about what is implemented now. Planned behavior
@@ -28,14 +28,19 @@ explicit command isolation, Linux process-lifecycle containment, bounded JSONL
 evidence parsing, and deterministic descendant cleanup. TASK-0008 adds
 contract-correct Ollama model inspection, bounded cancellable HTTP transport,
 per-model readiness, and descriptor-confined conflict-safe workspace tools.
+TASK-0009 adds a backend-authoritative dynamic agent registry, schema-v4
+lifecycle and template identity, validated role-derived reporting hierarchy,
+logical deletion/explicit restoration, and registry-driven renderer
+projections.
 Fresh deterministic checks establish the non-live verification baseline
 described below; they do not establish live runtime readiness.
 
-TASK-0008 did **not** run a live Codex task, Ollama, or another model/provider.
+TASK-0009 did **not** run a live Codex task, Ollama, or another model/provider.
 It also did not capture microphone input; import or start the Python listener;
 authorize a KDE/XDG portal; execute install/remove scripts; build a desktop
-package; or perform a desktop/system-control action. Its Ollama tests use
-isolated numeric-loopback fake servers and temporary workspaces; TASK-0007's
+package; or perform a desktop/system-control action. The retained TASK-0008
+Ollama tests use isolated numeric-loopback fake servers and temporary
+workspaces; TASK-0007's
 Codex subprocess tests use an isolated fake CLI. Earlier audit observations
 remain historical unless this document identifies a fresh result.
 
@@ -61,6 +66,7 @@ remain historical unless this document identifies a fresh result.
 | <code>src/App.tsx</code> | Main renderer UI, browser-preview compatibility, routing/review presentation, approval display, and typed intent IPC callers |
 | <code>src/applicationState.ts</code> / <code>src/application-state-seed.json</code> | Shared renderer state types and the canonical fresh-state seed |
 | <code>src/providerRegistry.ts</code> | Typed renderer projection of backend provider status, catalog bindings, and fail-closed model eligibility |
+| <code>src/agentRegistry.ts</code> | Dynamic active-agent, category-group, ancestor, hierarchy-repair, stable-template, and compatible-manager projections |
 | <code>src/runCoordinator.ts</code> | Typed renderer projection of authoritative run snapshots/events, stale-event rejection, and global stop state |
 | <code>src/persistence.ts</code> | Typed desktop bootstrap, one-time legacy cleanup, serialized writes, backup import, and reset adapter |
 | <code>src/App.css</code> | Main application styling and responsive behavior |
@@ -71,6 +77,7 @@ remain historical unless this document identifies a fresh result.
 | <code>src-tauri/src/ollama_runtime.rs</code> | Fixed-loopback Ollama discovery, per-model metadata, bounded async HTTP, task-deadline cancellation, and chat transport |
 | <code>src-tauri/src/workspace_tools.rs</code> | Linux descriptor-confined listing, ranged reads, hashes, create-only writes, preconditioned patches, and atomic conflict handling |
 | <code>src-tauri/src/app_state.rs</code> | Backend application-state types, validation, canonical seed loading, and legacy normalization |
+| <code>src-tauri/src/agent_registry.rs</code> | Agent-registry DTOs, template catalog, role authority, legacy repair, and hierarchy validation |
 | <code>src-tauri/src/policy.rs</code> / <code>src-tauri/src/authorization.rs</code> | Normalized action intents, capability evaluation, native confirmation, and approval IPC contracts |
 | <code>src-tauri/src/run_coordinator.rs</code> | Run states, legal transitions, ledger projections, and explicit evidence/retention bounds |
 | <code>src-tauri/src/persistence.rs</code> / <code>src-tauri/migrations/</code> | SQLite repository/service, schema migration, crash-safe transactions, and persistence tests |
@@ -108,9 +115,10 @@ backup through the UI; TASK-0014 still owns the strict long-term backup format.
 
 In the desktop runtime, core product state and the run ledger are stored in
 <code>application-state.sqlite3</code> below Tauri's operating-system-provided
-application data directory. Schema version 3 stores:
+application data directory. Schema version 4 stores:
 
-- agents and their nested tasks, activity, memory, roles, and policies;
+- agents, stable template identity, lifecycle/repair metadata, reporting
+  structure, and their nested tasks, activity, memory, roles, and policies;
 - approval requests;
 - models;
 - reminders;
@@ -123,7 +131,7 @@ The backend validates aggregate size, counts, identifiers, enums, numeric
 ranges, text bounds, and selected relationships before an atomic replacement.
 SQLite foreign keys, rollback-journal mode, full synchronous writes, integrity
 checks, transactional aggregate reads, a migration ledger,
-<code>PRAGMA user_version = 3</code>, and compare-and-swap revisions protect the
+<code>PRAGMA user_version = 4</code>, and compare-and-swap revisions protect the
 repository boundary. The database and its parent directory are restricted to
 the current user on Unix.
 
@@ -144,6 +152,15 @@ orders snapshots/events without creating false application-state revision
 conflicts. Terminal attempt rows are immutable by database trigger. The
 ledger retains at most 1,000 attempts and 256 MiB of counted evidence, prunes
 oldest terminal attempts, and exposes prune/truncation metadata.
+
+Migration 0004 adds optional unique template keys, active/unassigned/deleted
+registry lifecycle, bounded repair reasons, deletion timestamps, and a
+single-row monotonic ID allocator. It derives authority from role, maps the
+eleven legacy default identities without depending on display names, and
+quarantines invalid legacy reporting edges rather than hiding or dropping the
+affected agents. Dedicated revision-checked IPC owns create, update, logical
+delete, and explicit template restore. Generic renderer saves reject registry
+structure changes, and policy/routing projections exclude non-active agents.
 
 Privilege-increasing workspace-root, capability, approval-policy, review-role,
 safety-mode, approval-lifetime, and microphone changes require a trusted native
@@ -182,8 +199,18 @@ shape:
 | Specialist | PC Control Agent | Operations Senior |
 | Specialist | Event and Reminder Agent | Operations Senior |
 
-The hierarchy and role names exist as renderer data. They are not yet a
-backend-authoritative dynamic agent registry; TASK-0009 owns that outcome.
+The eleven records are initial templates, not an immortal fixed-ID roster.
+Custom agents receive monotonically allocated IDs and remain visible through
+dynamic category groups and ancestor projections. Display names may change
+without breaking voice lookup because default capabilities use stable template
+keys. Authority is derived from role (Supervisor 4, Team Leader 3, Senior Agent
+2, Specialist 1), and every active non-supervisor must report to an active
+higher-authority manager. Self-parenting, cycles, dangling managers, inactive
+managers, and incompatible authority are rejected; invalid legacy edges are
+paused in a visible Needs assignment state. Deletion is a durable logical
+tombstone, direct reports require a valid reassignment, affected live task and
+approval references are reconciled, and a default returns only through an
+explicit template restore.
 
 ## Provider behavior
 
@@ -401,12 +428,13 @@ and WebSocket endpoints.
 
 ## Verification inventory
 
-Five Vitest files contain 33 deterministic frontend tests for renderer, voice,
+Six Vitest files contain 39 deterministic frontend tests for renderer, voice,
 legacy migration, serialization, revision, fail-closed writer behavior,
-authoritative run projection, provider binding, readiness, and model
-eligibility.
+authoritative run projection, provider binding, readiness, model eligibility,
+dynamic agent visibility, lifecycle separation, legacy hierarchy repair,
+stable template lookup, compatible managers, and registry IPC serialization.
 
-The Rust library contains 87 passing tests. They add Codex compatibility,
+The Rust library contains 93 passing tests. They add Codex compatibility,
 command-isolation, bounded protocol, fake-process descendant cleanup, provider
 registry, fake-adapter dispatch, exact identity, typed failure, run-state,
 concurrent admission, idempotency, approval-boundary, cancellation, timeout,
@@ -425,11 +453,11 @@ The repository-root entry points are:
   Clippy, shell/Python/strict-JSON syntax checks, npm/Cargo dependency trees,
   and production plus full npm audits.
 
-TASK-0008 focused checks passed on 2026-08-23: 16 task-specific Rust tests, 6
-provider-registry frontend tests, TypeScript, rustfmt, and Clippy with warnings
-denied. The complete <code>npm run verify:fast</code> and
-<code>npm run verify:full</code> routes passed with 33 frontend tests, 87
-locked/offline Rust tests, a 37-module production build, Clippy with warnings
+TASK-0009 focused checks passed on 2026-08-24: 6 task-specific Rust tests, the
+legacy-backup lifecycle regression, 12 agent-registry/persistence frontend
+tests, TypeScript, and rustfmt. The complete <code>npm run verify:fast</code> and
+<code>npm run verify:full</code> routes passed with 39 frontend tests, 93
+locked/offline Rust tests, a 40-module production build, Clippy with warnings
 denied, shell/Python/JSON checks, dependency trees, and both npm audits reporting
 zero vulnerabilities. Exact task evidence is recorded in
 [planning/TASK_STATUS.md](planning/TASK_STATUS.md).
@@ -446,7 +474,7 @@ belongs to TASK-0019.
 | Mandatory installed/CI Rust advisory tooling | TASK-0019 |
 | Live Codex compatibility, authentication, model, and packaged-platform acceptance | TASK-0020 |
 | Live Ollama connectivity, installed-model behavior, cancellation, and packaged-platform acceptance | TASK-0020 |
-| Dynamic hierarchy, routing, review, and workspace evidence | TASK-0009–TASK-0012 |
+| Deterministic routing, review, and workspace evidence | TASK-0010–TASK-0012 |
 | Frontend modularity, strict backup, and full data lifecycle | TASK-0013–TASK-0014 |
 | Voice/system policy and KDE/XDG integration | TASK-0015–TASK-0016 |
 | Bounded specialist capabilities and management handoffs | TASK-0017–TASK-0018 |
