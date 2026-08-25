@@ -1,12 +1,12 @@
 # Current State
 
 > **Classification: Current static and fresh non-live evidence.** This snapshot
-> was refreshed for TASK-0010 on 2026-08-24 from starting commit
-> <code>fbf7108c0ea69c4634f83a4080027899021f90a9</code>
-> (<code>task9</code>) on branch <code>main</code>. At the TASK-0010 preflight,
+> was refreshed for TASK-0011 on 2026-08-25 from starting commit
+> <code>080c5883ac88ae58093fc8e1580ab21b0d413ac0</code>
+> (<code>task10</code>) on branch <code>main</code>. At the TASK-0011 preflight,
 > checked-out <code>main</code> and <code>origin/main</code> both resolved to that
 > commit, with zero ahead/behind and a clean working tree. Its actual scope
-> matched the retained TASK-0009 implementation evidence. Reverify later
+> matched the retained TASK-0010 implementation evidence. Reverify later
 > implementation facts when they may have drifted.
 
 This document owns statements about what is implemented now. Planned behavior
@@ -34,11 +34,14 @@ logical deletion/explicit restoration, and registry-driven renderer
 projections. TASK-0010 adds schema-v5 backend-authoritative task creation,
 deterministic routing and evidence, workload overflow decisions, one durable
 global execute queue, and queue-head admission into the existing single-run
-coordinator.
+coordinator. TASK-0011 adds schema-v6 structured review flows and attempts,
+strict bound request/result protocols, exact sequential reporting-chain
+reviewers, bounded revisions and review retries, trusted human decisions, and
+deterministic restart recovery.
 Fresh deterministic checks establish the non-live verification baseline
 described below; they do not establish live runtime readiness.
 
-TASK-0010 did **not** run a live Codex task, Ollama, or another model/provider.
+TASK-0011 did **not** run a live Codex task, Ollama, or another model/provider.
 It also did not capture microphone input; import or start the Python listener;
 authorize a KDE/XDG portal; execute install/remove scripts; build a desktop
 package; or perform a desktop/system-control action. The retained TASK-0008
@@ -71,6 +74,7 @@ remain historical unless this document identifies a fresh result.
 | <code>src/providerRegistry.ts</code> | Typed renderer projection of backend provider status, catalog bindings, and fail-closed model eligibility |
 | <code>src/agentRegistry.ts</code> | Dynamic active-agent, category-group, ancestor, hierarchy-repair, stable-template, and compatible-manager projections |
 | <code>src/taskOrchestration.ts</code> | Typed projection of backend queue order, positions, state, head admission, and routing evidence |
+| <code>src/reviewOrchestration.ts</code> | Typed projection of backend review flows, levels, attempts, human fallback, and revision state |
 | <code>src/runCoordinator.ts</code> | Typed renderer projection of authoritative run snapshots/events, stale-event rejection, and global stop state |
 | <code>src/persistence.ts</code> | Typed desktop bootstrap, one-time legacy cleanup, serialized writes, backup import, and reset adapter |
 | <code>src/App.css</code> | Main application styling and responsive behavior |
@@ -83,6 +87,7 @@ remain historical unless this document identifies a fresh result.
 | <code>src-tauri/src/app_state.rs</code> | Backend application-state types, validation, canonical seed loading, and legacy normalization |
 | <code>src-tauri/src/agent_registry.rs</code> | Agent-registry DTOs, template catalog, role authority, legacy repair, and hierarchy validation |
 | <code>src-tauri/src/task_orchestration.rs</code> | Deterministic routing eligibility/scoring, workload/overflow decisions, and queue DTOs |
+| <code>src-tauri/src/review_orchestration.rs</code> | Versioned review schemas, exact reporting-chain selection, prompt/protocol validation, and review DTOs |
 | <code>src-tauri/src/policy.rs</code> / <code>src-tauri/src/authorization.rs</code> | Normalized action intents, capability evaluation, native confirmation, and approval IPC contracts |
 | <code>src-tauri/src/run_coordinator.rs</code> | Run states, legal transitions, ledger projections, and explicit evidence/retention bounds |
 | <code>src-tauri/src/persistence.rs</code> / <code>src-tauri/migrations/</code> | SQLite repository/service, schema migration, crash-safe transactions, and persistence tests |
@@ -120,7 +125,7 @@ backup through the UI; TASK-0014 still owns the strict long-term backup format.
 
 In the desktop runtime, core product state and the run ledger are stored in
 <code>application-state.sqlite3</code> below Tauri's operating-system-provided
-application data directory. Schema version 5 stores:
+application data directory. Schema version 6 stores:
 
 - agents, stable template identity, lifecycle/repair metadata, reporting
   structure, and their nested tasks, activity, memory, roles, and policies;
@@ -131,6 +136,8 @@ application data directory. Schema version 5 stores:
 - task/activity retention preferences and routing/review preferences;
 - task routing inputs/evidence, executor assignment, queue state/order,
   thresholds, overflow policy, and orchestration allocators/revision;
+- normalized review flows, revision rounds, structured stage attempts,
+  request/result bindings, and review-orchestration revision;
 - immutable terminal run attempts, bounded progress/evidence, approval
   reservations, and coordinator metadata.
 
@@ -138,7 +145,7 @@ The backend validates aggregate size, counts, identifiers, enums, numeric
 ranges, text bounds, and selected relationships before an atomic replacement.
 SQLite foreign keys, rollback-journal mode, full synchronous writes, integrity
 checks, transactional aggregate reads, a migration ledger,
-<code>PRAGMA user_version = 5</code>, and compare-and-swap revisions protect the
+<code>PRAGMA user_version = 6</code>, and compare-and-swap revisions protect the
 repository boundary. The database and its parent directory are restricted to
 the current user on Unix.
 
@@ -176,6 +183,14 @@ revision. Dedicated compare-and-swap IPC creates and routes tasks, reroutes
 queued/held tasks without changing their age, and owns hold/resume/reset queue
 transitions. Generic renderer saves cannot create, remove, relocate, reroute,
 or forge task queue/lifecycle/evidence state.
+
+Migration 0006 adds normalized review flows and immutable terminal stage
+attempts, binds review runs to one flow, round, stage, and request fingerprint,
+and adds a separate review revision. A conservative upgrade converts ambiguous
+legacy in-flight review state to <code>awaiting_human</code>; it does not infer a
+provider verdict or resume dispatch. Dedicated backend commands start the exact
+next stage and record natively confirmed human decisions. Generic renderer
+saves preserve the normalized review ledger and cannot complete a review flow.
 
 Privilege-increasing workspace-root, capability, approval-policy, review-role,
 safety-mode, approval-lifetime, and microphone changes require a trusted native
@@ -310,17 +325,19 @@ The persisted <code>activeAiProvider</code> is an authoritative hard gate. The
 backend resolves exactly one catalog row by model name, rejects missing or
 duplicate identities, rejects unsupported provider labels, and rejects a model
 whose adapter does not match the active provider. It does not silently switch
-providers or fall back. The policy fingerprint now includes catalog model ID,
-catalog provider, runtime provider, and active provider under
-<code>policy-v3</code>; an older approval therefore fails exact matching rather
-than authorizing a changed provider decision.
+providers or fall back. The policy and intent fingerprints collectively bind
+catalog model ID, catalog provider, runtime provider, active provider, and any
+exact review-stage context under <code>policy-v4</code>/<code>intent-v2</code>;
+an older or stale approval therefore fails exact matching rather than
+authorizing a changed provider or review decision.
 
 <code>provider_registry_status</code> returns common provider descriptors,
 capabilities, readiness, versions, discovered runtime models with per-model
 availability/reasons, and all catalog bindings. Backend routing consumes that
 registry truth; the renderer projects the same snapshot for the provider
-selector, model catalog, assignments, defaults, routing evidence, and
-senior-review selection. Codex catalog models are eligible only when Codex
+selector, model catalog, assignments, defaults, and routing evidence. The
+backend consumes it when selecting the exact reporting-chain reviewer. Codex
+catalog models are eligible only when Codex
 reports ready and remain subject to CLI model validation at run start. Ollama
 models additionally must be discovered locally, have readable show metadata,
 and report tool support. Existing unavailable catalog entries and assignments
@@ -340,8 +357,8 @@ was checked in TASK-0008.
 - The backend owns task creation, rerouting, candidate eligibility, scores,
   workload and overflow decisions, executor assignment, routing evidence,
   queue state/order, and execute-head admission. The renderer requests these
-  decisions and displays their evidence; TASK-0011 still owns structured
-  multi-level reviewer selection and revision flow.
+  decisions and displays their evidence. It also owns structured review flow,
+  reviewer selection, revision state, and terminal review decisions.
 - Hard routing eligibility requires an active, unpaused agent with compatible
   workspace, policy/capability, and exact provider/model availability; Ollama
   execution also requires tool support. Eligible candidates are ordered by
@@ -351,9 +368,10 @@ was checked in TASK-0008.
   sequence, owner ID, and task ID. Held tasks retain their age; rerouting does
   not reorder them; resetting a terminal task allocates a new sequence. Queue
   snapshots expose backend-computed positions and the active execute task.
-- The renderer sends an <code>AgentRunRequest</code> containing only a run ID,
-  agent ID, task-owner ID, task ID, and run mode. Unknown legacy authorization
-  or policy fields are rejected.
+- The renderer sends an <code>AgentRunRequest</code> containing a run ID, agent
+  ID, task-owner ID, task ID, run mode, and—for review only—the exact
+  backend-issued flow/stage/round/level/request-fingerprint context. Unknown
+  legacy authorization or policy fields are rejected.
 - The backend admits an execute attempt only for the current queue head, then
   acquires the one system-wide run slot through the existing immediate
   transaction. Review bypasses execute-queue ordering but shares that same run
@@ -374,12 +392,37 @@ was checked in TASK-0008.
 - The backend keeps only the live cancellation handle in memory. Admission,
   cancellation requests, task projections, events, outcomes, usage, changed
   paths, diffs, errors, and recovery disposition are durable in SQLite.
-- Review requests are backend-checked for read-only files, no terminal access,
-  no elevated scopes, and no destructive approval.
+- A Specialist result follows Senior → Team Leader → Supervisor; a Senior result
+  follows Team Leader → Supervisor; a Team Leader result follows Supervisor;
+  and a Supervisor result requires a trusted human decision. Each agent stage
+  uses the exact active <code>reportsTo</code> identity, requires a distinct
+  active/unpaused read-capable reviewer with a ready exact provider/model, and
+  never substitutes another candidate.
+- <code>ReviewRequestV1</code> binds task, executor, execution attempt, revision
+  round, level, stage, bounded evidence, and a SHA-256 request fingerprint.
+  <code>ReviewResultV1</code> must be one duplicate-key-free, unknown-field-free
+  JSON object with an exact bound <code>approved</code> or
+  <code>changesRequested</code> verdict and requirements, correctness,
+  verification, security, and scope checks. Markdown fences, trailing text,
+  missing or colliding verdicts, unknown evidence, incomplete agent evidence,
+  and stale bindings cannot approve.
+- Agent review stages are read-only, have no terminal or elevated scopes, and
+  cannot grant authorization. At most three agent attempts may address one
+  stage. A changes verdict queues a fresh execution with a fresh sequence and
+  fresh policy/approval evaluation; at most three revision executions are
+  allowed before explicit human adjudication.
+- Human approve/request-changes decisions are revalidated against the current
+  flow revision and shown through the trusted native KDialog confirmation
+  boundary. Missing confirmation, unavailable reviewers, exhausted attempts,
+  incomplete legacy bindings, or uncertain dispatch fail closed to
+  <code>awaiting_human</code>.
 - Startup reconciliation marks pre-dispatch attempts interrupted and safe to
   retry; dispatching/running/cancel-requested attempts become interrupted and
-  require manual review. Legacy tasks found in a running/reviewing state get a
-  synthetic interrupted ledger record instead of being silently reset.
+  require manual review. A safe pre-dispatch review interruption returns to the
+  exact pending stage without dispatch; uncertain review execution moves to
+  human adjudication. Legacy tasks found in a running/reviewing state get a
+  synthetic interrupted ledger record and an unbound review migrates to human
+  review instead of being silently reset or resumed.
 - Pre-dispatch/startup failure returns an execute task to its original queue
   age. A post-dispatch uncertain recovery holds the task for explicit user
   action. Terminal completion removes it from the queue.
@@ -441,6 +484,11 @@ The backend currently:
 - rejects paused, missing, wrong-task, and ineligible review agents;
 - rejects administrator terminal access and forces review runs to be
   read-only with no elevated authorization;
+- requires an exact backend-issued review flow/stage/round/fingerprint binding,
+  strict structured verdict checks, sequential reporting-chain identity, and
+  bounded retries before any review transition;
+- requires a current trusted native confirmation for human review decisions and
+  never treats renderer visibility or provider text as approval authority;
 - blocks task text containing a bounded list of privileged, package, power,
   mount, permission, and system-control command patterns;
 - resolves the selected workspace and constrains Codex with an explicit Codex
@@ -463,14 +511,14 @@ and WebSocket endpoints.
 
 ## Verification inventory
 
-Seven Vitest files contain 41 deterministic frontend tests for renderer, voice,
+Eight Vitest files contain 41 deterministic frontend tests for renderer, voice,
 legacy migration, serialization, revision, fail-closed writer behavior,
 authoritative run projection, provider binding, readiness, model eligibility,
 dynamic agent visibility, lifecycle separation, legacy hierarchy repair,
 stable template lookup, compatible managers, registry IPC serialization, queue
 projection, and execute-head gating.
 
-The Rust library contains 105 passing tests. They add Codex compatibility,
+The Rust library contains 120 passing tests. They add Codex compatibility,
 command-isolation, bounded protocol, fake-process descendant cleanup, provider
 registry, fake-adapter dispatch, exact identity, typed failure, run-state,
 concurrent admission, idempotency, approval-boundary, cancellation, timeout,
@@ -483,6 +531,14 @@ they do not contact a live provider. Twelve TASK-0010 Rust tests cover routing
 eligibility/scoring/overflow, global ordering, queue-head admission,
 concurrency, restart, allocator rollback, reroute age, reset, and failure
 recovery.
+Fifteen TASK-0011 Rust tests cover strict/duplicate-free protocol parsing,
+bound evidence and verdicts, exact role pipelines and reporting-chain identity,
+schema-v5 migration, complete sequential approval, stale revisions, invalid
+output, cancellation, unavailable reviewers, revision/attempt caps, trusted
+human adjudication, and safe versus uncertain restart recovery. Two frontend
+tests cover authoritative flow projection and human-fallback presentation. The
+review retention case proves that generic ledger pruning preserves execution
+evidence referenced by an active flow.
 
 The repository-root entry points are:
 
@@ -492,11 +548,12 @@ The repository-root entry points are:
   Clippy, shell/Python/strict-JSON syntax checks, npm/Cargo dependency trees,
   and production plus full npm audits.
 
-TASK-0010 focused checks passed on 2026-08-24: 6 routing and 6
-persistence/concurrency/restart Rust tests, 3 frontend files/21 tests,
-TypeScript, and rustfmt. The complete <code>npm run verify:fast</code> and
-<code>npm run verify:full</code> routes passed with 41 frontend tests, 105
-locked/offline Rust tests, a 41-module production build, Clippy with warnings
+TASK-0011 focused checks passed on 2026-08-25: 15 structured-review protocol,
+migration, policy, lifecycle, cancellation, and recovery Rust tests; 2 review
+projection tests; all 41 frontend tests; TypeScript; and rustfmt. The complete
+<code>npm run verify:fast</code> and <code>npm run verify:full</code> routes
+passed with 41 frontend tests, 120 locked/offline Rust tests, a 42-module
+production build, Clippy with warnings
 denied, shell/Python/JSON checks, dependency trees, and both npm audits reporting
 zero vulnerabilities. Exact task evidence is recorded in
 [planning/TASK_STATUS.md](planning/TASK_STATUS.md).
@@ -513,7 +570,7 @@ belongs to TASK-0019.
 | Mandatory installed/CI Rust advisory tooling | TASK-0019 |
 | Live Codex compatibility, authentication, model, and packaged-platform acceptance | TASK-0020 |
 | Live Ollama connectivity, installed-model behavior, cancellation, and packaged-platform acceptance | TASK-0020 |
-| Structured multi-level review/revision and workspace evidence | TASK-0011–TASK-0012 |
+| Complete Git/non-Git workspace change evidence | TASK-0012 |
 | Frontend modularity, strict backup, and full data lifecycle | TASK-0013–TASK-0014 |
 | Voice/system policy and KDE/XDG integration | TASK-0015–TASK-0016 |
 | Bounded specialist capabilities and management handoffs | TASK-0017–TASK-0018 |

@@ -15,6 +15,13 @@ use crate::authorization::{
 };
 use crate::policy::{evaluate_policy, ActionIntent, PolicyDisposition, PolicyEvaluation};
 use crate::provider_runtime::ProviderRegistrySnapshot;
+use crate::review_orchestration::{
+    build_review_request, human_review_result, next_required_level, parse_review_result,
+    required_levels_for_role, select_reviewer, HumanReviewDecisionRequest, ReviewActor,
+    ReviewFlowProjection, ReviewIntentContext, ReviewLevel, ReviewOrchestrationSnapshot,
+    ReviewRequestV1, ReviewResultV1, ReviewStageAttemptProjection, ReviewStageStart, ReviewVerdict,
+    StartReviewStageRequest, MAX_REVISION_ROUNDS, MAX_STAGE_ATTEMPTS, REVIEW_PIPELINE_VERSION,
+};
 use crate::run_coordinator::{
     bound_diff, bound_paths, validate_request_id, BoundedText, RunAttemptMode,
     RunAttemptProjection, RunAttemptStatus, RunCompletion, RunCoordinatorSnapshot,
@@ -43,6 +50,8 @@ const RUN_COORDINATION_MIGRATION: &str = include_str!("../migrations/0003_run_co
 const AGENT_REGISTRY_MIGRATION: &str = include_str!("../migrations/0004_agent_registry.sql");
 const TASK_ORCHESTRATION_MIGRATION: &str =
     include_str!("../migrations/0005_task_orchestration.sql");
+const REVIEW_ORCHESTRATION_MIGRATION: &str =
+    include_str!("../migrations/0006_review_orchestration.sql");
 const MAX_AUTHORIZATION_RECORDS: i64 = 10_000;
 
 #[derive(Debug, Clone)]
@@ -50,6 +59,7 @@ pub struct RunAdmission {
     pub attempt: RunAttemptProjection,
     pub authorization: Option<AuthorizationGrant>,
     pub application_state: ApplicationState,
+    pub review_request_json: Option<String>,
     pub duplicate: bool,
 }
 
@@ -291,6 +301,38 @@ impl PersistenceService {
         &self,
     ) -> PersistenceResult<TaskOrchestrationSnapshot> {
         self.run(StateRepository::task_orchestration_snapshot).await
+    }
+
+    pub async fn review_orchestration_snapshot(
+        &self,
+    ) -> PersistenceResult<ReviewOrchestrationSnapshot> {
+        self.run(StateRepository::review_orchestration_snapshot)
+            .await
+    }
+
+    pub async fn start_review_stage(
+        &self,
+        request: StartReviewStageRequest,
+        providers: ProviderRegistrySnapshot,
+    ) -> PersistenceResult<ReviewStageStart> {
+        self.run(move |repository| repository.start_review_stage(request, &providers))
+            .await
+    }
+
+    pub async fn human_review_confirmation(
+        &self,
+        request: HumanReviewDecisionRequest,
+    ) -> PersistenceResult<ApprovalConfirmation> {
+        self.run(move |repository| repository.human_review_confirmation(&request))
+            .await
+    }
+
+    pub async fn record_human_review_decision(
+        &self,
+        request: HumanReviewDecisionRequest,
+    ) -> PersistenceResult<ReviewOrchestrationSnapshot> {
+        self.run(move |repository| repository.record_human_review_decision(request))
+            .await
     }
 
     pub async fn request_authorization(
@@ -1005,6 +1047,11 @@ impl StateRepository {
         let meta = application_meta_from(&transaction)?;
         ensure_expected_revision(&meta, request.expected_revision)?;
         ensure_task_has_no_active_run(&transaction, request.task_owner_agent_id, request.task_id)?;
+        ensure_task_has_no_active_review_flow(
+            &transaction,
+            request.task_owner_agent_id,
+            request.task_id,
+        )?;
         let mut state = read_application_state(&transaction)?;
         let (owner_index, task_index) =
             find_task_indexes(&state, request.task_owner_agent_id, request.task_id)?;
@@ -1098,6 +1145,11 @@ impl StateRepository {
         let meta = application_meta_from(&transaction)?;
         ensure_expected_revision(&meta, request.expected_revision)?;
         ensure_task_has_no_active_run(&transaction, request.task_owner_agent_id, request.task_id)?;
+        ensure_review_queue_mutation_allowed(
+            &transaction,
+            request.task_owner_agent_id,
+            request.task_id,
+        )?;
         let mut state = read_application_state(&transaction)?;
         let (owner_index, task_index) =
             find_task_indexes(&state, request.task_owner_agent_id, request.task_id)?;
@@ -1249,6 +1301,463 @@ impl StateRepository {
         })
     }
 
+    pub fn review_orchestration_snapshot(
+        &mut self,
+    ) -> PersistenceResult<ReviewOrchestrationSnapshot> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(PersistenceError::database)?;
+        ensure_state_initialized(&transaction)?;
+        let snapshot = read_review_orchestration_snapshot(&transaction)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(snapshot)
+    }
+
+    pub fn start_review_stage(
+        &mut self,
+        request: StartReviewStageRequest,
+        providers: &ProviderRegistrySnapshot,
+    ) -> PersistenceResult<ReviewStageStart> {
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_state_initialized(&transaction)?;
+        ensure_expected_review_revision(&transaction, request.expected_revision)?;
+        ensure_task_has_no_active_run(&transaction, request.task_owner_agent_id, request.task_id)?;
+        let flow = read_active_review_flow_binding(
+            &transaction,
+            request.task_owner_agent_id,
+            request.task_id,
+        )?;
+        if flow.state == "awaiting_human" {
+            let snapshot = read_review_orchestration_snapshot(&transaction)?;
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(ReviewStageStart {
+                snapshot,
+                stage: None,
+                context: None,
+                blocked_code: flow.last_error_code,
+                blocked_message: flow.last_error_message,
+            });
+        }
+        if flow.state != "awaiting_review" {
+            return Err(PersistenceError::new(
+                "REVIEW_STATE_CONFLICT",
+                "The review flow is not waiting for a reviewer stage.",
+                true,
+            ));
+        }
+        let level = flow.current_level.ok_or_else(|| {
+            PersistenceError::new(
+                "REVIEW_LEDGER_INVALID",
+                "The active review flow has no current review level.",
+                false,
+            )
+        })?;
+        let attempt_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM review_stage_attempts
+                 WHERE flow_id = ?1 AND revision_round = ?2 AND level = ?3
+                   AND actor = 'agent'",
+                params![flow.id, flow.revision_round, level.as_storage()],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        if attempt_count >= MAX_STAGE_ATTEMPTS {
+            mark_review_awaiting_human(
+                &transaction,
+                &flow,
+                "REVIEW_STAGE_ATTEMPTS_EXHAUSTED",
+                "The current review stage exhausted its three bounded agent attempts.",
+                timestamp,
+            )?;
+            let snapshot = read_review_orchestration_snapshot(&transaction)?;
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(ReviewStageStart {
+                snapshot,
+                stage: None,
+                context: None,
+                blocked_code: Some("REVIEW_STAGE_ATTEMPTS_EXHAUSTED".to_string()),
+                blocked_message: Some(
+                    "The current review stage exhausted its three bounded agent attempts."
+                        .to_string(),
+                ),
+            });
+        }
+
+        let state = read_application_state(&transaction)?;
+        let prior_reviewer_ids = read_prior_reviewer_ids(&transaction, flow.id, level)?;
+        let reviewer = match select_reviewer(
+            &state,
+            providers,
+            flow.executor_agent_id,
+            level,
+            &prior_reviewer_ids,
+        ) {
+            Ok(reviewer) => reviewer.clone(),
+            Err(error) => {
+                mark_review_awaiting_human(
+                    &transaction,
+                    &flow,
+                    &error.code,
+                    &error.message,
+                    timestamp,
+                )?;
+                let snapshot = read_review_orchestration_snapshot(&transaction)?;
+                transaction.commit().map_err(PersistenceError::database)?;
+                return Ok(ReviewStageStart {
+                    snapshot,
+                    stage: None,
+                    context: None,
+                    blocked_code: Some(error.code),
+                    blocked_message: Some(error.message),
+                });
+            }
+        };
+        let owner = state
+            .agents
+            .iter()
+            .find(|agent| agent.id == request.task_owner_agent_id)
+            .ok_or_else(|| {
+                PersistenceError::new(
+                    "TASK_OWNER_NOT_FOUND",
+                    "The task owner no longer exists.",
+                    true,
+                )
+            })?;
+        let task = owner
+            .tasks
+            .iter()
+            .find(|task| task.id == request.task_id)
+            .ok_or_else(|| {
+                PersistenceError::new(
+                    "TASK_NOT_FOUND",
+                    "The selected task no longer exists.",
+                    true,
+                )
+            })?;
+        let executor = state
+            .agents
+            .iter()
+            .find(|agent| agent.id == flow.executor_agent_id)
+            .ok_or_else(|| {
+                PersistenceError::new(
+                    "REVIEW_EXECUTOR_NOT_FOUND",
+                    "The task executor no longer exists.",
+                    true,
+                )
+            })?;
+        let execution_attempt_id = flow.latest_execution_attempt_id.ok_or_else(|| {
+            PersistenceError::new(
+                "REVIEW_EVIDENCE_MISSING",
+                "The review flow has no successful execution evidence.",
+                false,
+            )
+        })?;
+        let execution = read_run_attempt(&transaction, execution_attempt_id)?;
+        if execution.status != RunAttemptStatus::Succeeded
+            || execution.run_mode != RunAttemptMode::Execute
+        {
+            return Err(PersistenceError::new(
+                "REVIEW_EVIDENCE_INVALID",
+                "The bound review evidence is not a successful execution attempt.",
+                false,
+            ));
+        }
+        let stage_attempt_id = allocate_review_stage_id(&transaction)?;
+        let review_request = build_review_request(
+            flow.id,
+            stage_attempt_id,
+            flow.revision_round,
+            level,
+            task,
+            executor,
+            &execution,
+        )
+        .map_err(review_protocol_error)?;
+        let request_json = serde_json::to_string(&review_request).map_err(|_| {
+            PersistenceError::new(
+                "REVIEW_REQUEST_INVALID",
+                "The authoritative review request could not be stored.",
+                false,
+            )
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO review_stage_attempts
+                 (id, flow_id, revision_round, level, attempt_number, actor,
+                  reviewer_agent_id, state, request_json, request_fingerprint,
+                  created_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'agent', ?6, 'pending', ?7, ?8, ?9)",
+                params![
+                    stage_attempt_id,
+                    flow.id,
+                    flow.revision_round,
+                    level.as_storage(),
+                    attempt_count + 1,
+                    reviewer.id,
+                    request_json,
+                    review_request.request_fingerprint,
+                    timestamp
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction
+            .execute(
+                "UPDATE review_flows
+                 SET state = 'review_pending', last_error_code = NULL,
+                     last_error_message = NULL, updated_at_unix_ms = ?1
+                 WHERE id = ?2 AND state = 'awaiting_review'",
+                params![timestamp, flow.id],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction
+            .execute(
+                "UPDATE agent_tasks
+                 SET status = 'Under Review', phase = ?1, review_agent_id = ?2,
+                     review_status = 'Pending', review_model = NULL,
+                     review_duration_seconds = NULL, reviewed_at = NULL
+                 WHERE owner_agent_id = ?3 AND id = ?4",
+                params![
+                    level.task_phase(),
+                    reviewer.id,
+                    request.task_owner_agent_id,
+                    request.task_id
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        advance_review_revision(&transaction)?;
+        advance_task_orchestration_revision(&transaction)?;
+        let snapshot = read_review_orchestration_snapshot(&transaction)?;
+        let stage = snapshot
+            .flows
+            .iter()
+            .find(|candidate| candidate.id == flow.id)
+            .and_then(|candidate| {
+                candidate
+                    .stages
+                    .iter()
+                    .find(|stage| stage.id == stage_attempt_id)
+            })
+            .cloned();
+        let context = Some(review_request.intent_context());
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(ReviewStageStart {
+            snapshot,
+            stage,
+            context,
+            blocked_code: None,
+            blocked_message: None,
+        })
+    }
+
+    pub fn human_review_confirmation(
+        &mut self,
+        request: &HumanReviewDecisionRequest,
+    ) -> PersistenceResult<ApprovalConfirmation> {
+        validate_human_review_request(request)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(PersistenceError::database)?;
+        ensure_state_initialized(&transaction)?;
+        ensure_expected_review_revision(&transaction, request.expected_revision)?;
+        let flow = read_active_review_flow_binding(
+            &transaction,
+            request.task_owner_agent_id,
+            request.task_id,
+        )?;
+        ensure_human_review_flow(&flow, request.flow_id)?;
+        let task_title: String = transaction
+            .query_row(
+                "SELECT title FROM agent_tasks WHERE owner_agent_id = ?1 AND id = ?2",
+                params![request.task_owner_agent_id, request.task_id],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(ApprovalConfirmation {
+            title: "Confirm human review decision".to_string(),
+            message: format!(
+                "Task: {} (ID {})\nReview flow: {}\nRevision round: {} of {}\nDecision: {}\nFeedback: {}\n\nThis trusted decision can complete the task or queue another execution revision. Continue?",
+                dialog_literal(&task_title),
+                request.task_id,
+                request.flow_id,
+                flow.revision_round,
+                MAX_REVISION_ROUNDS,
+                match request.verdict {
+                    ReviewVerdict::Approved => "Approve",
+                    ReviewVerdict::ChangesRequested => "Request changes",
+                },
+                if request.feedback.trim().is_empty() {
+                    "None".to_string()
+                } else {
+                    dialog_literal(request.feedback.trim())
+                }
+            ),
+        })
+    }
+
+    pub fn record_human_review_decision(
+        &mut self,
+        request: HumanReviewDecisionRequest,
+    ) -> PersistenceResult<ReviewOrchestrationSnapshot> {
+        validate_human_review_request(&request)?;
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_state_initialized(&transaction)?;
+        ensure_expected_review_revision(&transaction, request.expected_revision)?;
+        ensure_task_has_no_active_run(&transaction, request.task_owner_agent_id, request.task_id)?;
+        let flow = read_active_review_flow_binding(
+            &transaction,
+            request.task_owner_agent_id,
+            request.task_id,
+        )?;
+        ensure_human_review_flow(&flow, request.flow_id)?;
+        let state = read_application_state(&transaction)?;
+        let owner = state
+            .agents
+            .iter()
+            .find(|agent| agent.id == request.task_owner_agent_id)
+            .ok_or_else(|| {
+                PersistenceError::new(
+                    "TASK_OWNER_NOT_FOUND",
+                    "The task owner no longer exists.",
+                    true,
+                )
+            })?;
+        let task = owner
+            .tasks
+            .iter()
+            .find(|task| task.id == request.task_id)
+            .ok_or_else(|| {
+                PersistenceError::new(
+                    "TASK_NOT_FOUND",
+                    "The selected task no longer exists.",
+                    true,
+                )
+            })?;
+        let executor = state
+            .agents
+            .iter()
+            .find(|agent| agent.id == flow.executor_agent_id)
+            .ok_or_else(|| {
+                PersistenceError::new(
+                    "REVIEW_EXECUTOR_NOT_FOUND",
+                    "The task executor no longer exists.",
+                    true,
+                )
+            })?;
+        let execution_attempt_id = flow.latest_execution_attempt_id.ok_or_else(|| {
+            PersistenceError::new(
+                "REVIEW_EVIDENCE_MISSING",
+                "The review flow has no successful execution evidence.",
+                false,
+            )
+        })?;
+        let execution = read_run_attempt(&transaction, execution_attempt_id)?;
+        if execution.run_mode != RunAttemptMode::Execute
+            || !matches!(
+                execution.status,
+                RunAttemptStatus::Succeeded | RunAttemptStatus::Interrupted
+            )
+        {
+            return Err(PersistenceError::new(
+                "REVIEW_EVIDENCE_INVALID",
+                "Trusted human review requires bound execution or explicit legacy-recovery evidence.",
+                false,
+            ));
+        }
+        let level = flow.current_level.unwrap_or(ReviewLevel::Supervisor);
+        let prior_attempts: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM review_stage_attempts
+                 WHERE flow_id = ?1 AND revision_round = ?2 AND level = ?3",
+                params![flow.id, flow.revision_round, level.as_storage()],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        if prior_attempts > MAX_STAGE_ATTEMPTS {
+            return Err(PersistenceError::new(
+                "HUMAN_REVIEW_ALREADY_RECORDED",
+                "A human decision has already been recorded for this review stage.",
+                true,
+            ));
+        }
+        let stage_attempt_id = allocate_review_stage_id(&transaction)?;
+        let review_request = build_review_request(
+            flow.id,
+            stage_attempt_id,
+            flow.revision_round,
+            level,
+            task,
+            executor,
+            &execution,
+        )
+        .map_err(review_protocol_error)?;
+        let result = human_review_result(&review_request, request.verdict, &request.feedback)
+            .map_err(review_protocol_error)?;
+        let request_json = serde_json::to_string(&review_request).map_err(|_| {
+            PersistenceError::new(
+                "REVIEW_REQUEST_INVALID",
+                "The human review request could not be stored.",
+                false,
+            )
+        })?;
+        let result_json = serde_json::to_string(&result).map_err(|_| {
+            PersistenceError::new(
+                "REVIEW_RESULT_INVALID",
+                "The human review result could not be stored.",
+                false,
+            )
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO review_stage_attempts
+                 (id, flow_id, revision_round, level, attempt_number, actor,
+                  reviewer_agent_id, state, request_json, request_fingerprint,
+                  result_json, verdict, feedback, created_at_unix_ms,
+                  started_at_unix_ms, completed_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'human', NULL, ?6, ?7, ?8,
+                         ?9, ?10, ?11, ?12, ?12, ?12)",
+                params![
+                    stage_attempt_id,
+                    flow.id,
+                    flow.revision_round,
+                    level.as_storage(),
+                    prior_attempts + 1,
+                    result.verdict.as_storage(),
+                    request_json,
+                    review_request.request_fingerprint,
+                    result_json,
+                    result.verdict.as_storage(),
+                    result.feedback,
+                    timestamp
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        apply_review_verdict(
+            &transaction,
+            &flow,
+            level,
+            &result,
+            ReviewActor::Human,
+            None,
+            None,
+            None,
+            timestamp,
+        )?;
+        let snapshot = read_review_orchestration_snapshot(&transaction)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(snapshot)
+    }
+
     pub fn initialize_fresh(&mut self) -> PersistenceResult<StateEnvelope> {
         let state = default_application_state().map_err(PersistenceError::validation)?;
         let timestamp = now_unix_ms()?;
@@ -1395,6 +1904,7 @@ impl StateRepository {
         let current = read_application_state(&transaction)?;
         let state = application_state_from_legacy_backup(backup_json, &current)
             .map_err(PersistenceError::validation)?;
+        clear_review_orchestration(&transaction)?;
         let approval_origins = state
             .approval_requests
             .iter()
@@ -1558,6 +2068,7 @@ impl StateRepository {
         ensure_state_initialized(&transaction)?;
         expire_authoritative_approvals(&transaction, timestamp)?;
         let state = read_application_state(&transaction)?;
+        ensure_review_intent_binding(&transaction, intent)?;
         let evaluation = evaluate_policy(&state, intent).map_err(policy_denial)?;
         if evaluation.disposition == PolicyDisposition::Allow {
             transaction.commit().map_err(PersistenceError::database)?;
@@ -1616,6 +2127,7 @@ impl StateRepository {
                 )
             })?;
             let state = read_application_state(&transaction)?;
+            ensure_review_intent_binding(&transaction, &intent)?;
             let evaluation = evaluate_policy(&state, &intent).map_err(policy_denial)?;
             ensure_evaluation_matches(&stored, &evaluation)?;
         }
@@ -1673,6 +2185,7 @@ impl StateRepository {
             )
         })?;
         let state = read_application_state(&transaction)?;
+        ensure_review_intent_binding(&transaction, &intent)?;
         let evaluation = evaluate_policy(&state, &intent).map_err(policy_denial)?;
         ensure_evaluation_matches(&stored, &evaluation)?;
         let approval = read_approval_request(&transaction, approval_id)?;
@@ -1700,6 +2213,7 @@ impl StateRepository {
         ensure_state_initialized(&transaction)?;
         expire_authoritative_approvals(&transaction, timestamp)?;
         let state = read_application_state(&transaction)?;
+        ensure_review_intent_binding(&transaction, intent)?;
         let evaluation = evaluate_policy(&state, intent).map_err(policy_denial)?;
         if evaluation.disposition == PolicyDisposition::Allow {
             transaction.commit().map_err(PersistenceError::database)?;
@@ -1811,7 +2325,8 @@ impl StateRepository {
     ) -> PersistenceResult<RunAdmission> {
         validate_request_id(request_id)
             .map_err(|message| PersistenceError::new("INVALID_RUN_REQUEST_ID", message, true))?;
-        let (agent_id, task_owner_agent_id, task_id, run_mode) = run_intent_parts(intent)?;
+        let (agent_id, task_owner_agent_id, task_id, run_mode, review_context) =
+            run_intent_parts(intent)?;
         let timestamp = now_unix_ms()?;
         let transaction = self
             .connection
@@ -1852,14 +2367,21 @@ impl StateRepository {
                 .map(|approval| AuthorizationGrant {
                     approval: Some(approval),
                 });
+            let review_request_json = attempt
+                .review_stage_attempt_id
+                .map(|stage_id| read_review_request_json(&transaction, stage_id))
+                .transpose()?;
             transaction.commit().map_err(PersistenceError::database)?;
             return Ok(RunAdmission {
                 attempt,
                 authorization,
                 application_state: state,
+                review_request_json,
                 duplicate: true,
             });
         }
+
+        ensure_review_intent_binding(&transaction, intent)?;
 
         let active_attempt_id: Option<i64> = transaction
             .query_row(
@@ -1921,11 +2443,12 @@ impl StateRepository {
             .execute(
                 "INSERT INTO run_attempts
                  (request_id, intent_json, intent_fingerprint, policy_fingerprint,
-                  workspace_fingerprint, agent_id, task_owner_agent_id, task_id, task_title,
-                  run_mode, status, workspace_id, approval_id, task_status_before,
+                 workspace_fingerprint, agent_id, task_owner_agent_id, task_id, task_title,
+                  run_mode, review_flow_id, review_stage_attempt_id, review_revision_round,
+                  status, workspace_id, approval_id, task_status_before,
                   task_phase_before, review_status_before, admitted_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'admitted',
-                         ?11, ?12, ?13, ?14, ?15, ?16)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13, 'admitted', ?14, ?15, ?16, ?17, ?18, ?19)",
                 params![
                     request_id,
                     intent_json,
@@ -1937,6 +2460,13 @@ impl StateRepository {
                     task_id,
                     task.title,
                     run_mode.as_str(),
+                    review_context.as_ref().map(|context| context.flow_id),
+                    review_context
+                        .as_ref()
+                        .map(|context| context.stage_attempt_id),
+                    review_context
+                        .as_ref()
+                        .map(|context| context.revision_round),
                     evaluation.workspace_id,
                     approval_id,
                     task.status,
@@ -1947,6 +2477,34 @@ impl StateRepository {
             )
             .map_err(PersistenceError::database)?;
         let attempt_id = transaction.last_insert_rowid();
+        if let Some(context) = &review_context {
+            let changed = transaction
+                .execute(
+                    "UPDATE review_stage_attempts
+                     SET state = 'admitted', run_attempt_id = ?1
+                     WHERE id = ?2 AND flow_id = ?3 AND revision_round = ?4
+                       AND level = ?5 AND reviewer_agent_id = ?6
+                       AND request_fingerprint = ?7 AND state = 'pending'",
+                    params![
+                        attempt_id,
+                        context.stage_attempt_id,
+                        context.flow_id,
+                        context.revision_round,
+                        context.level.as_storage(),
+                        agent_id,
+                        context.request_fingerprint
+                    ],
+                )
+                .map_err(PersistenceError::database)?;
+            if changed != 1 {
+                return Err(PersistenceError::new(
+                    "REVIEW_STAGE_STATE_CONFLICT",
+                    "The bound review stage changed before run admission completed.",
+                    true,
+                ));
+            }
+            advance_review_revision(&transaction)?;
+        }
         if let Some(approval_id) = approval_id {
             transaction
                 .execute(
@@ -1990,11 +2548,16 @@ impl StateRepository {
                 approval: Some(approval),
             });
         let application_state = read_application_state(&transaction)?;
+        let review_request_json = review_context
+            .as_ref()
+            .map(|context| read_review_request_json(&transaction, context.stage_attempt_id))
+            .transpose()?;
         transaction.commit().map_err(PersistenceError::database)?;
         Ok(RunAdmission {
             attempt,
             authorization,
             application_state,
+            review_request_json,
             duplicate: false,
         })
     }
@@ -2104,7 +2667,7 @@ impl StateRepository {
                 params![next_status.as_str(), timestamp, attempt_id],
             )
             .map_err(PersistenceError::database)?;
-        project_run_started_to_task(&transaction, &current)?;
+        project_run_started_to_task(&transaction, &current, timestamp)?;
         if current.run_mode == RunAttemptMode::Execute {
             advance_task_orchestration_revision(&transaction)?;
         }
@@ -2434,9 +2997,10 @@ impl StateRepository {
                 ],
             )
             .map_err(PersistenceError::database)?;
+        let completed_attempt = read_run_attempt(&transaction, attempt_id)?;
         project_run_completion_to_task(
             &transaction,
-            &current,
+            &completed_attempt,
             terminal_status,
             summary_text,
             completion.response_id.as_deref(),
@@ -2453,10 +3017,21 @@ impl StateRepository {
         )?;
         project_run_completion_to_queue(
             &transaction,
-            &current,
+            &completed_attempt,
             terminal_status,
             recovery_disposition,
         )?;
+        if completed_attempt.run_mode == RunAttemptMode::Execute
+            && terminal_status != RunAttemptStatus::Succeeded
+        {
+            project_execution_failure_to_review_flow(
+                &transaction,
+                &completed_attempt,
+                terminal_status,
+                recovery_disposition,
+                timestamp,
+            )?;
+        }
         transaction
             .execute(
                 "DELETE FROM run_approval_reservations WHERE attempt_id = ?1",
@@ -2574,6 +3149,11 @@ impl StateRepository {
                     5,
                     "authoritative_task_orchestration",
                     TASK_ORCHESTRATION_MIGRATION,
+                )?,
+                5 => self.apply_migration(
+                    6,
+                    "structured_review_orchestration",
+                    REVIEW_ORCHESTRATION_MIGRATION,
                 )?,
                 version => {
                     return Err(PersistenceError::new(
@@ -2782,7 +3362,32 @@ impl StateRepository {
                     ],
                 )
                 .map_err(PersistenceError::database)?;
-            project_recovered_attempt_to_task(&transaction, &attempt, safe_to_retry)?;
+            let recovered = read_run_attempt(&transaction, attempt_id)?;
+            if recovered.run_mode == RunAttemptMode::Review
+                && recovered.review_stage_attempt_id.is_some()
+            {
+                project_review_run_completion(
+                    &transaction,
+                    &recovered,
+                    RunAttemptStatus::Interrupted,
+                    recovered.output_summary.as_deref(),
+                    recovered.model.as_deref(),
+                    recovered.duration_seconds.unwrap_or_default(),
+                    timestamp,
+                    Some(recovery_disposition),
+                )?;
+            } else {
+                project_recovered_attempt_to_task(&transaction, &recovered, safe_to_retry)?;
+                if recovered.run_mode == RunAttemptMode::Execute {
+                    project_execution_failure_to_review_flow(
+                        &transaction,
+                        &recovered,
+                        RunAttemptStatus::Interrupted,
+                        Some(recovery_disposition),
+                        timestamp,
+                    )?;
+                }
+            }
             transaction
                 .execute(
                     "DELETE FROM run_approval_reservations WHERE attempt_id = ?1",
@@ -2797,8 +3402,15 @@ impl StateRepository {
                 .prepare(
                     "SELECT owner_agent_id, id, title, assigned_agent_id, status, phase,
                             review_agent_id, review_status
-                     FROM agent_tasks
-                     WHERE status = 'Running' OR review_status = 'Running'",
+                     FROM agent_tasks AS task
+                     WHERE status = 'Running' OR review_status = 'Running'
+                        OR EXISTS (
+                            SELECT 1 FROM review_flows AS flow
+                            WHERE flow.task_owner_agent_id = task.owner_agent_id
+                              AND flow.task_id = task.id
+                              AND flow.state = 'awaiting_human'
+                              AND flow.latest_execution_attempt_id IS NULL
+                        )",
                 )
                 .map_err(PersistenceError::database)?;
             collect_rows(statement.query_map([], |row| {
@@ -2825,7 +3437,20 @@ impl StateRepository {
             review_status,
         ) in legacy_running_tasks
         {
-            let mode = if review_status == "Running" {
+            let legacy_review_flow = transaction
+                .query_row(
+                    "SELECT id, executor_agent_id FROM review_flows
+                     WHERE task_owner_agent_id = ?1 AND task_id = ?2
+                       AND state = 'awaiting_human'
+                       AND latest_execution_attempt_id IS NULL",
+                    params![owner_id, task_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(PersistenceError::database)?;
+            let mode = if legacy_review_flow.is_some() {
+                RunAttemptMode::Execute
+            } else if review_status == "Running" {
                 RunAttemptMode::Review
             } else {
                 RunAttemptMode::Execute
@@ -2837,12 +3462,18 @@ impl StateRepository {
                 "recovery:{owner_id}:{task_id}:{}:{timestamp}",
                 mode.as_str()
             );
-            let agent_id = if mode == RunAttemptMode::Review {
+            let agent_id = if let Some((_, executor_agent_id)) = legacy_review_flow {
+                executor_agent_id
+            } else if mode == RunAttemptMode::Review {
                 review_agent_id.unwrap_or(assigned_id)
             } else {
                 assigned_id
             };
-            let message = "A legacy in-progress task had no durable attempt record. Inspect the workspace before retrying.";
+            let message = if legacy_review_flow.is_some() {
+                "A legacy in-progress review had no durable execution evidence. Trusted human adjudication is required."
+            } else {
+                "A legacy in-progress task had no durable attempt record. Inspect the workspace before retrying."
+            };
             transaction
                 .execute(
                     "INSERT INTO run_attempts
@@ -2850,10 +3481,13 @@ impl StateRepository {
                       workspace_fingerprint, agent_id, task_owner_agent_id, task_id,
                       task_title, run_mode, status, task_status_before, task_phase_before,
                       review_status_before, admitted_at_unix_ms, completed_at_unix_ms,
-                      error_code, error_message, payload_bytes, recovery_disposition)
+                      output_summary, error_code, error_message, payload_bytes,
+                      summary_truncated, before_snapshot_truncated,
+                      after_snapshot_truncated, recovery_disposition)
                      VALUES (?1, '{}', 'legacy-reconciliation', 'legacy-reconciliation',
                              'legacy-reconciliation', ?2, ?3, ?4, ?5, ?6, 'interrupted',
-                             ?7, ?8, ?9, ?10, ?10, 'RUN_INTERRUPTED', ?11, ?12,
+                             ?7, ?8, ?9, ?10, ?10, ?11, 'RUN_INTERRUPTED', ?11, ?12,
+                             ?13, ?13, ?13,
                              'manual_review_required')",
                     params![
                         request_id,
@@ -2867,12 +3501,38 @@ impl StateRepository {
                         review_status,
                         timestamp,
                         message,
-                        message.len() as i64
+                        message.len() as i64,
+                        legacy_review_flow.is_some() as i64
                     ],
                 )
                 .map_err(PersistenceError::database)?;
             let synthetic = read_run_attempt(&transaction, transaction.last_insert_rowid())?;
-            project_recovered_attempt_to_task(&transaction, &synthetic, false)?;
+            if let Some((flow_id, _)) = legacy_review_flow {
+                transaction
+                    .execute(
+                        "UPDATE review_flows
+                         SET latest_execution_attempt_id = ?1,
+                             updated_at_unix_ms = ?2
+                         WHERE id = ?3 AND state = 'awaiting_human'
+                           AND latest_execution_attempt_id IS NULL",
+                        params![synthetic.id, timestamp, flow_id],
+                    )
+                    .map_err(PersistenceError::database)?;
+                transaction
+                    .execute(
+                        "UPDATE agent_tasks
+                         SET status = 'Under Review', phase = 'Supervisor Approval',
+                             completed_at = NULL, queue_state = 'notQueued',
+                             enqueue_sequence = NULL, review_status = 'Failed',
+                             review_result = ?1
+                         WHERE owner_agent_id = ?2 AND id = ?3",
+                        params![message, owner_id, task_id],
+                    )
+                    .map_err(PersistenceError::database)?;
+                advance_review_revision(&transaction)?;
+            } else {
+                project_recovered_attempt_to_task(&transaction, &synthetic, false)?;
+            }
             changed = true;
         }
 
@@ -2904,6 +3564,643 @@ impl StateRepository {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ActiveReviewFlowBinding {
+    id: i64,
+    task_owner_agent_id: i64,
+    task_id: i64,
+    executor_agent_id: i64,
+    state: String,
+    revision_round: i64,
+    current_level: Option<ReviewLevel>,
+    required_levels: Vec<ReviewLevel>,
+    latest_execution_attempt_id: Option<i64>,
+    last_error_code: Option<String>,
+    last_error_message: Option<String>,
+}
+
+fn review_protocol_error(
+    error: crate::review_orchestration::ReviewProtocolError,
+) -> PersistenceError {
+    PersistenceError::new(&error.code, error.message, false)
+}
+
+fn parse_review_level(value: Option<String>) -> PersistenceResult<Option<ReviewLevel>> {
+    value
+        .map(|value| ReviewLevel::from_storage(&value).map_err(review_protocol_error))
+        .transpose()
+}
+
+fn parse_required_review_levels(value: &str) -> PersistenceResult<Vec<ReviewLevel>> {
+    serde_json::from_str::<Vec<String>>(value)
+        .map_err(|_| {
+            PersistenceError::new(
+                "REVIEW_LEDGER_INVALID",
+                "Stored required review levels are invalid.",
+                false,
+            )
+        })?
+        .into_iter()
+        .map(|level| ReviewLevel::from_storage(&level).map_err(review_protocol_error))
+        .collect()
+}
+
+fn read_active_review_flow_binding(
+    connection: &Connection,
+    task_owner_agent_id: i64,
+    task_id: i64,
+) -> PersistenceResult<ActiveReviewFlowBinding> {
+    let stored = connection
+        .query_row(
+            "SELECT id, task_owner_agent_id, task_id, executor_agent_id, state,
+                    revision_round, current_level, required_levels_json,
+                    latest_execution_attempt_id, last_error_code, last_error_message
+             FROM review_flows
+             WHERE task_owner_agent_id = ?1 AND task_id = ?2
+               AND state NOT IN ('completed', 'failed', 'cancelled')",
+            params![task_owner_agent_id, task_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            },
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => PersistenceError::new(
+                "REVIEW_FLOW_NOT_FOUND",
+                "The selected task has no active review flow.",
+                true,
+            ),
+            other => PersistenceError::database(other),
+        })?;
+    Ok(ActiveReviewFlowBinding {
+        id: stored.0,
+        task_owner_agent_id: stored.1,
+        task_id: stored.2,
+        executor_agent_id: stored.3,
+        state: stored.4,
+        revision_round: stored.5,
+        current_level: parse_review_level(stored.6)?,
+        required_levels: parse_required_review_levels(&stored.7)?,
+        latest_execution_attempt_id: stored.8,
+        last_error_code: stored.9,
+        last_error_message: stored.10,
+    })
+}
+
+fn read_review_orchestration_snapshot(
+    connection: &Connection,
+) -> PersistenceResult<ReviewOrchestrationSnapshot> {
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM review_orchestration_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let flow_rows = {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, task_owner_agent_id, task_id, executor_agent_id, state,
+                        revision_round, max_revisions, current_level, required_levels_json,
+                        latest_execution_attempt_id, review_mode, last_error_code,
+                        last_error_message, created_at_unix_ms, updated_at_unix_ms,
+                        completed_at_unix_ms
+                 FROM review_flows ORDER BY id DESC",
+            )
+            .map_err(PersistenceError::database)?;
+        collect_rows(statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, i64>(14)?,
+                row.get::<_, Option<i64>>(15)?,
+            ))
+        }))?
+    };
+    let mut flows = Vec::with_capacity(flow_rows.len());
+    for row in flow_rows {
+        let stage_rows = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, revision_round, level, attempt_number, actor,
+                            reviewer_agent_id, state, request_fingerprint, verdict,
+                            feedback, run_attempt_id, error_code, error_message,
+                            created_at_unix_ms, started_at_unix_ms, completed_at_unix_ms
+                     FROM review_stage_attempts WHERE flow_id = ?1 ORDER BY id",
+                )
+                .map_err(PersistenceError::database)?;
+            collect_rows(statement.query_map([row.0], |stage| {
+                Ok((
+                    stage.get::<_, i64>(0)?,
+                    stage.get::<_, i64>(1)?,
+                    stage.get::<_, String>(2)?,
+                    stage.get::<_, i64>(3)?,
+                    stage.get::<_, String>(4)?,
+                    stage.get::<_, Option<i64>>(5)?,
+                    stage.get::<_, String>(6)?,
+                    stage.get::<_, String>(7)?,
+                    stage.get::<_, Option<String>>(8)?,
+                    stage.get::<_, Option<String>>(9)?,
+                    stage.get::<_, Option<i64>>(10)?,
+                    stage.get::<_, Option<String>>(11)?,
+                    stage.get::<_, Option<String>>(12)?,
+                    stage.get::<_, i64>(13)?,
+                    stage.get::<_, Option<i64>>(14)?,
+                    stage.get::<_, Option<i64>>(15)?,
+                ))
+            }))?
+        };
+        let stages = stage_rows
+            .into_iter()
+            .map(|stage| {
+                let actor = match stage.4.as_str() {
+                    "agent" => ReviewActor::Agent,
+                    "human" => ReviewActor::Human,
+                    _ => {
+                        return Err(PersistenceError::new(
+                            "REVIEW_LEDGER_INVALID",
+                            "Stored review actor is invalid.",
+                            false,
+                        ))
+                    }
+                };
+                let verdict = match stage.8.as_deref() {
+                    Some("approved") => Some(ReviewVerdict::Approved),
+                    Some("changes_requested") => Some(ReviewVerdict::ChangesRequested),
+                    None => None,
+                    _ => {
+                        return Err(PersistenceError::new(
+                            "REVIEW_LEDGER_INVALID",
+                            "Stored review verdict is invalid.",
+                            false,
+                        ))
+                    }
+                };
+                Ok(ReviewStageAttemptProjection {
+                    id: stage.0,
+                    flow_id: row.0,
+                    revision_round: stage.1,
+                    level: ReviewLevel::from_storage(&stage.2).map_err(review_protocol_error)?,
+                    attempt_number: stage.3,
+                    actor,
+                    reviewer_agent_id: stage.5,
+                    state: stage.6,
+                    request_fingerprint: stage.7,
+                    verdict,
+                    feedback: stage.9,
+                    run_attempt_id: stage.10,
+                    error_code: stage.11,
+                    error_message: stage.12,
+                    created_at_unix_ms: stage.13,
+                    started_at_unix_ms: stage.14,
+                    completed_at_unix_ms: stage.15,
+                })
+            })
+            .collect::<PersistenceResult<Vec<_>>>()?;
+        flows.push(ReviewFlowProjection {
+            id: row.0,
+            task_owner_agent_id: row.1,
+            task_id: row.2,
+            executor_agent_id: row.3,
+            state: row.4,
+            revision_round: row.5,
+            max_revisions: row.6,
+            current_level: parse_review_level(row.7)?,
+            required_levels: parse_required_review_levels(&row.8)?,
+            latest_execution_attempt_id: row.9,
+            review_mode: row.10,
+            last_error_code: row.11,
+            last_error_message: row.12,
+            created_at_unix_ms: row.13,
+            updated_at_unix_ms: row.14,
+            completed_at_unix_ms: row.15,
+            stages,
+        });
+    }
+    Ok(ReviewOrchestrationSnapshot { revision, flows })
+}
+
+fn ensure_expected_review_revision(
+    connection: &Connection,
+    expected_revision: i64,
+) -> PersistenceResult<()> {
+    let current: i64 = connection
+        .query_row(
+            "SELECT revision FROM review_orchestration_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    if expected_revision != current {
+        return Err(PersistenceError::new(
+            "STALE_REVIEW_REVISION",
+            format!(
+                "The review flow changed before this action (expected {expected_revision}, current {current})."
+            ),
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn advance_review_revision(connection: &Connection) -> PersistenceResult<i64> {
+    let current: i64 = connection
+        .query_row(
+            "SELECT revision FROM review_orchestration_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let next = next_revision(current)?;
+    connection
+        .execute(
+            "UPDATE review_orchestration_meta SET revision = ?1 WHERE singleton = 1",
+            [next],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(next)
+}
+
+fn allocate_review_stage_id(connection: &Connection) -> PersistenceResult<i64> {
+    let current: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM review_stage_attempts",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    if current >= MAX_SAFE_INTEGER {
+        return Err(PersistenceError::new(
+            "REVIEW_STAGE_ID_EXHAUSTED",
+            "No additional JavaScript-safe review-stage identifiers are available.",
+            false,
+        ));
+    }
+    Ok(current + 1)
+}
+
+fn read_prior_reviewer_ids(
+    connection: &Connection,
+    flow_id: i64,
+    current_level: ReviewLevel,
+) -> PersistenceResult<HashSet<i64>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT reviewer_agent_id FROM review_stage_attempts
+             WHERE flow_id = ?1 AND reviewer_agent_id IS NOT NULL AND level <> ?2",
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(collect_rows(
+        statement.query_map(params![flow_id, current_level.as_storage()], |row| {
+            row.get(0)
+        }),
+    )?
+    .into_iter()
+    .collect())
+}
+
+fn mark_review_awaiting_human(
+    connection: &Connection,
+    flow: &ActiveReviewFlowBinding,
+    code: &str,
+    message: &str,
+    timestamp: i64,
+) -> PersistenceResult<()> {
+    connection
+        .execute(
+            "UPDATE review_flows
+             SET state = 'awaiting_human', last_error_code = ?1,
+                 last_error_message = ?2, updated_at_unix_ms = ?3
+             WHERE id = ?4 AND state NOT IN ('completed', 'failed', 'cancelled')",
+            params![code, message, timestamp, flow.id],
+        )
+        .map_err(PersistenceError::database)?;
+    connection
+        .execute(
+            "UPDATE agent_tasks
+             SET status = 'Under Review', phase = 'Supervisor Approval',
+                 review_status = 'Failed', review_result = ?1
+             WHERE owner_agent_id = ?2 AND id = ?3",
+            params![message, flow.task_owner_agent_id, flow.task_id],
+        )
+        .map_err(PersistenceError::database)?;
+    advance_review_revision(connection)?;
+    advance_task_orchestration_revision(connection)?;
+    Ok(())
+}
+
+fn validate_human_review_request(request: &HumanReviewDecisionRequest) -> PersistenceResult<()> {
+    if !(0..=MAX_SAFE_INTEGER).contains(&request.expected_revision)
+        || !(1..=MAX_SAFE_INTEGER).contains(&request.task_owner_agent_id)
+        || !(1..=MAX_SAFE_INTEGER).contains(&request.task_id)
+        || !(1..=MAX_SAFE_INTEGER).contains(&request.flow_id)
+        || request.feedback.len() > 32 * 1024
+        || request
+            .feedback
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+        || (request.verdict == ReviewVerdict::Approved && !request.feedback.trim().is_empty())
+        || (request.verdict == ReviewVerdict::ChangesRequested
+            && request.feedback.trim().is_empty())
+    {
+        return Err(PersistenceError::new(
+            "INVALID_HUMAN_REVIEW_DECISION",
+            "Human approval requires empty feedback; requesting changes requires bounded non-empty feedback.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_human_review_flow(
+    flow: &ActiveReviewFlowBinding,
+    expected_flow_id: i64,
+) -> PersistenceResult<()> {
+    if flow.id != expected_flow_id || flow.state != "awaiting_human" {
+        return Err(PersistenceError::new(
+            "HUMAN_REVIEW_STATE_CONFLICT",
+            "The selected review flow is not awaiting a trusted human decision.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_review_intent_binding(
+    connection: &Connection,
+    intent: &ActionIntent,
+) -> PersistenceResult<()> {
+    let ActionIntent::RunTask {
+        agent_id,
+        task_owner_agent_id,
+        task_id,
+        run_mode,
+        review_context,
+    } = intent
+    else {
+        return Ok(());
+    };
+    match (run_mode, review_context) {
+        (crate::policy::RunMode::Execute, None) => Ok(()),
+        (crate::policy::RunMode::Review, Some(context)) => {
+            let matches_binding: bool = connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1
+                         FROM review_flows AS flow
+                         JOIN review_stage_attempts AS stage ON stage.flow_id = flow.id
+                         WHERE flow.id = ?1 AND stage.id = ?2
+                           AND flow.task_owner_agent_id = ?3 AND flow.task_id = ?4
+                           AND flow.state = 'review_pending'
+                           AND flow.revision_round = ?5 AND flow.current_level = ?6
+                           AND stage.revision_round = ?5 AND stage.level = ?6
+                           AND stage.reviewer_agent_id = ?7 AND stage.actor = 'agent'
+                           AND stage.state = 'pending'
+                           AND stage.request_fingerprint = ?8
+                     )",
+                    params![
+                        context.flow_id,
+                        context.stage_attempt_id,
+                        task_owner_agent_id,
+                        task_id,
+                        context.revision_round,
+                        context.level.as_storage(),
+                        agent_id,
+                        context.request_fingerprint
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(PersistenceError::database)?;
+            if !matches_binding {
+                return Err(PersistenceError::new(
+                    "REVIEW_INTENT_STALE",
+                    "The review intent does not match the exact pending backend review stage.",
+                    true,
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(PersistenceError::new(
+            "INVALID_REVIEW_CONTEXT",
+            "Execution must not carry review context and review must carry a bound context.",
+            true,
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_review_verdict(
+    connection: &Connection,
+    flow: &ActiveReviewFlowBinding,
+    level: ReviewLevel,
+    result: &ReviewResultV1,
+    actor: ReviewActor,
+    reviewer_agent_id: Option<i64>,
+    runtime_model: Option<&str>,
+    duration_seconds: Option<u64>,
+    timestamp: i64,
+) -> PersistenceResult<()> {
+    let result_json = serde_json::to_string(result).map_err(|_| {
+        PersistenceError::new(
+            "REVIEW_RESULT_INVALID",
+            "The structured review result could not be projected.",
+            false,
+        )
+    })?;
+    let reviewed_at = format_unix_ms(timestamp);
+    match result.verdict {
+        ReviewVerdict::Approved => {
+            if let Some(next_level) = next_required_level(&flow.required_levels, level) {
+                connection
+                    .execute(
+                        "UPDATE review_flows
+                         SET state = 'awaiting_review', current_level = ?1,
+                             last_error_code = NULL, last_error_message = NULL,
+                             updated_at_unix_ms = ?2
+                         WHERE id = ?3",
+                        params![next_level.as_storage(), timestamp, flow.id],
+                    )
+                    .map_err(PersistenceError::database)?;
+                connection
+                    .execute(
+                        "UPDATE agent_tasks
+                         SET status = 'Under Review', phase = ?1, completed_at = NULL,
+                             review_agent_id = ?2, review_status = 'Pending',
+                             review_result = ?3, review_model = ?4,
+                             review_duration_seconds = ?5, reviewed_at = ?6
+                         WHERE owner_agent_id = ?7 AND id = ?8",
+                        params![
+                            next_level.task_phase(),
+                            reviewer_agent_id,
+                            result_json,
+                            runtime_model,
+                            duration_seconds.map(|value| value as f64),
+                            reviewed_at,
+                            flow.task_owner_agent_id,
+                            flow.task_id
+                        ],
+                    )
+                    .map_err(PersistenceError::database)?;
+            } else {
+                connection
+                    .execute(
+                        "UPDATE review_flows
+                         SET state = 'completed', current_level = NULL,
+                             last_error_code = NULL, last_error_message = NULL,
+                             updated_at_unix_ms = ?1, completed_at_unix_ms = ?1
+                         WHERE id = ?2",
+                        params![timestamp, flow.id],
+                    )
+                    .map_err(PersistenceError::database)?;
+                connection
+                    .execute(
+                        "UPDATE agent_tasks
+                         SET status = 'Completed', phase = 'Finished', completed_at = ?1,
+                             queue_state = 'notQueued', enqueue_sequence = NULL,
+                             review_agent_id = ?2, review_status = 'Approved',
+                             review_result = ?3, review_model = ?4,
+                             review_duration_seconds = ?5, reviewed_at = ?1
+                         WHERE owner_agent_id = ?6 AND id = ?7",
+                        params![
+                            reviewed_at,
+                            reviewer_agent_id,
+                            result_json,
+                            runtime_model,
+                            duration_seconds.map(|value| value as f64),
+                            flow.task_owner_agent_id,
+                            flow.task_id
+                        ],
+                    )
+                    .map_err(PersistenceError::database)?;
+            }
+        }
+        ReviewVerdict::ChangesRequested if flow.revision_round < MAX_REVISION_ROUNDS => {
+            let enqueue_sequence = allocate_enqueue_sequence(connection)?;
+            let next_level = flow.required_levels.first().copied();
+            connection
+                .execute(
+                    "UPDATE review_flows
+                     SET state = 'revision_queued', revision_round = revision_round + 1,
+                         current_level = ?1, last_error_code = NULL,
+                         last_error_message = NULL, updated_at_unix_ms = ?2
+                     WHERE id = ?3",
+                    params![next_level.map(ReviewLevel::as_storage), timestamp, flow.id],
+                )
+                .map_err(PersistenceError::database)?;
+            connection
+                .execute(
+                    "UPDATE agent_tasks
+                     SET status = 'Pending', phase = 'Assigned', completed_at = NULL,
+                         queue_state = 'queued', enqueue_sequence = ?1,
+                         review_agent_id = ?2, review_status = 'Changes Requested',
+                         review_result = ?3, review_model = ?4,
+                         review_duration_seconds = ?5, reviewed_at = ?6
+                     WHERE owner_agent_id = ?7 AND id = ?8",
+                    params![
+                        enqueue_sequence,
+                        reviewer_agent_id,
+                        result.feedback,
+                        runtime_model,
+                        duration_seconds.map(|value| value as f64),
+                        reviewed_at,
+                        flow.task_owner_agent_id,
+                        flow.task_id
+                    ],
+                )
+                .map_err(PersistenceError::database)?;
+            expire_task_approvals(connection, flow.task_owner_agent_id, flow.task_id)?;
+        }
+        ReviewVerdict::ChangesRequested if actor == ReviewActor::Agent => {
+            connection
+                .execute(
+                    "UPDATE review_flows
+                     SET state = 'awaiting_human',
+                         last_error_code = 'REVIEW_REVISION_LIMIT_REACHED',
+                         last_error_message = 'Three revision executions were reviewed without approval.',
+                         updated_at_unix_ms = ?1
+                     WHERE id = ?2",
+                    params![timestamp, flow.id],
+                )
+                .map_err(PersistenceError::database)?;
+            connection
+                .execute(
+                    "UPDATE agent_tasks
+                     SET status = 'Under Review', phase = 'Supervisor Approval',
+                         completed_at = NULL, review_agent_id = ?1,
+                         review_status = 'Changes Requested', review_result = ?2,
+                         review_model = ?3, review_duration_seconds = ?4, reviewed_at = ?5
+                     WHERE owner_agent_id = ?6 AND id = ?7",
+                    params![
+                        reviewer_agent_id,
+                        result.feedback,
+                        runtime_model,
+                        duration_seconds.map(|value| value as f64),
+                        reviewed_at,
+                        flow.task_owner_agent_id,
+                        flow.task_id
+                    ],
+                )
+                .map_err(PersistenceError::database)?;
+        }
+        ReviewVerdict::ChangesRequested => {
+            connection
+                .execute(
+                    "UPDATE review_flows
+                     SET state = 'failed', current_level = NULL,
+                         last_error_code = 'REVIEW_REJECTED_AT_REVISION_LIMIT',
+                         last_error_message = ?1, updated_at_unix_ms = ?2,
+                         completed_at_unix_ms = ?2
+                     WHERE id = ?3",
+                    params![result.feedback, timestamp, flow.id],
+                )
+                .map_err(PersistenceError::database)?;
+            connection
+                .execute(
+                    "UPDATE agent_tasks
+                     SET status = 'Failed', phase = 'Failed', completed_at = ?1,
+                         queue_state = 'notQueued', enqueue_sequence = NULL,
+                         review_agent_id = NULL, review_status = 'Changes Requested',
+                         review_result = ?2, review_model = NULL,
+                         review_duration_seconds = NULL, reviewed_at = ?1
+                     WHERE owner_agent_id = ?3 AND id = ?4",
+                    params![
+                        reviewed_at,
+                        result.feedback,
+                        flow.task_owner_agent_id,
+                        flow.task_id
+                    ],
+                )
+                .map_err(PersistenceError::database)?;
+        }
+    }
+    advance_review_revision(connection)?;
+    advance_task_orchestration_revision(connection)?;
+    Ok(())
+}
+
 #[derive(Debug)]
 struct StoredRunAttempt {
     id: i64,
@@ -2918,6 +4215,9 @@ struct StoredRunAttempt {
     model: Option<String>,
     workspace_id: Option<String>,
     approval_id: Option<i64>,
+    review_flow_id: Option<i64>,
+    review_stage_attempt_id: Option<i64>,
+    review_revision_round: Option<i64>,
     admitted_at_unix_ms: i64,
     started_at_unix_ms: Option<i64>,
     cancel_requested_at_unix_ms: Option<i64>,
@@ -2965,43 +4265,47 @@ fn map_stored_run_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRun
         model: row.get(9)?,
         workspace_id: row.get(10)?,
         approval_id: row.get(11)?,
-        admitted_at_unix_ms: row.get(12)?,
-        started_at_unix_ms: row.get(13)?,
-        cancel_requested_at_unix_ms: row.get(14)?,
-        completed_at_unix_ms: row.get(15)?,
-        duration_seconds: row.get(16)?,
-        output_summary: row.get(17)?,
-        stderr_excerpt: row.get(18)?,
-        response_id: row.get(19)?,
-        input_tokens: row.get(20)?,
-        output_tokens: row.get(21)?,
-        total_tokens: row.get(22)?,
-        changed_files_json: row.get(23)?,
-        diff: row.get(24)?,
-        error_code: row.get(25)?,
-        error_message: row.get(26)?,
-        progress_event_count: row.get(27)?,
-        recovery_disposition: row.get(28)?,
-        stdout_truncated: row.get::<_, i64>(29)? != 0,
-        stderr_truncated: row.get::<_, i64>(30)? != 0,
-        summary_truncated: row.get::<_, i64>(31)? != 0,
-        diff_truncated: row.get::<_, i64>(32)? != 0,
-        changed_files_truncated: row.get::<_, i64>(33)? != 0,
-        progress_truncated: row.get::<_, i64>(34)? != 0,
-        before_snapshot_truncated: row.get::<_, i64>(35)? != 0,
-        after_snapshot_truncated: row.get::<_, i64>(36)? != 0,
-        original_stdout_bytes: row.get(37)?,
-        original_stderr_bytes: row.get(38)?,
-        original_summary_bytes: row.get(39)?,
-        original_diff_bytes: row.get(40)?,
-        original_changed_file_count: row.get(41)?,
-        omitted_progress_event_count: row.get(42)?,
+        review_flow_id: row.get(12)?,
+        review_stage_attempt_id: row.get(13)?,
+        review_revision_round: row.get(14)?,
+        admitted_at_unix_ms: row.get(15)?,
+        started_at_unix_ms: row.get(16)?,
+        cancel_requested_at_unix_ms: row.get(17)?,
+        completed_at_unix_ms: row.get(18)?,
+        duration_seconds: row.get(19)?,
+        output_summary: row.get(20)?,
+        stderr_excerpt: row.get(21)?,
+        response_id: row.get(22)?,
+        input_tokens: row.get(23)?,
+        output_tokens: row.get(24)?,
+        total_tokens: row.get(25)?,
+        changed_files_json: row.get(26)?,
+        diff: row.get(27)?,
+        error_code: row.get(28)?,
+        error_message: row.get(29)?,
+        progress_event_count: row.get(30)?,
+        recovery_disposition: row.get(31)?,
+        stdout_truncated: row.get::<_, i64>(32)? != 0,
+        stderr_truncated: row.get::<_, i64>(33)? != 0,
+        summary_truncated: row.get::<_, i64>(34)? != 0,
+        diff_truncated: row.get::<_, i64>(35)? != 0,
+        changed_files_truncated: row.get::<_, i64>(36)? != 0,
+        progress_truncated: row.get::<_, i64>(37)? != 0,
+        before_snapshot_truncated: row.get::<_, i64>(38)? != 0,
+        after_snapshot_truncated: row.get::<_, i64>(39)? != 0,
+        original_stdout_bytes: row.get(40)?,
+        original_stderr_bytes: row.get(41)?,
+        original_summary_bytes: row.get(42)?,
+        original_diff_bytes: row.get(43)?,
+        original_changed_file_count: row.get(44)?,
+        omitted_progress_event_count: row.get(45)?,
     })
 }
 
 const RUN_ATTEMPT_PROJECTION_QUERY: &str =
     "SELECT id, request_id, agent_id, task_owner_agent_id, task_id, task_title,
             run_mode, status, provider, model, workspace_id, approval_id,
+            review_flow_id, review_stage_attempt_id, review_revision_round,
             admitted_at_unix_ms, started_at_unix_ms, cancel_requested_at_unix_ms,
             completed_at_unix_ms, duration_seconds, output_summary, stderr_excerpt,
             response_id, input_tokens, output_tokens, total_tokens, changed_files_json,
@@ -3056,6 +4360,9 @@ fn read_run_attempt(
         model: stored.model,
         workspace_id: stored.workspace_id,
         approval_id: stored.approval_id,
+        review_flow_id: stored.review_flow_id,
+        review_stage_attempt_id: stored.review_stage_attempt_id,
+        review_revision_round: stored.review_revision_round,
         admitted_at_unix_ms: stored.admitted_at_unix_ms,
         started_at_unix_ms: stored.started_at_unix_ms,
         cancel_requested_at_unix_ms: stored.cancel_requested_at_unix_ms,
@@ -3094,6 +4401,26 @@ fn read_run_attempt(
     })
 }
 
+fn read_review_request_json(
+    connection: &Connection,
+    stage_attempt_id: i64,
+) -> PersistenceResult<String> {
+    connection
+        .query_row(
+            "SELECT request_json FROM review_stage_attempts WHERE id = ?1",
+            [stage_attempt_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => PersistenceError::new(
+                "REVIEW_STAGE_NOT_FOUND",
+                "The bound review stage no longer exists.",
+                true,
+            ),
+            other => PersistenceError::database(other),
+        })
+}
+
 fn nonnegative_u64(value: i64) -> PersistenceResult<u64> {
     u64::try_from(value).map_err(|_| {
         PersistenceError::new(
@@ -3112,13 +4439,16 @@ fn optional_bounded_i64(value: Option<u64>) -> Option<i64> {
     value.map(bounded_i64)
 }
 
-fn run_intent_parts(intent: &ActionIntent) -> PersistenceResult<(i64, i64, i64, RunAttemptMode)> {
+fn run_intent_parts(
+    intent: &ActionIntent,
+) -> PersistenceResult<(i64, i64, i64, RunAttemptMode, Option<ReviewIntentContext>)> {
     match intent {
         ActionIntent::RunTask {
             agent_id,
             task_owner_agent_id,
             task_id,
             run_mode,
+            review_context,
         } => Ok((
             *agent_id,
             *task_owner_agent_id,
@@ -3127,6 +4457,7 @@ fn run_intent_parts(intent: &ActionIntent) -> PersistenceResult<(i64, i64, i64, 
                 crate::policy::RunMode::Execute => RunAttemptMode::Execute,
                 crate::policy::RunMode::Review => RunAttemptMode::Review,
             },
+            review_context.clone(),
         )),
         _ => Err(PersistenceError::new(
             "INVALID_RUN_INTENT",
@@ -3188,7 +4519,7 @@ fn ensure_execute_queue_head(
     Ok(())
 }
 
-fn advance_task_orchestration_revision(transaction: &Transaction<'_>) -> PersistenceResult<i64> {
+fn advance_task_orchestration_revision(transaction: &Connection) -> PersistenceResult<i64> {
     let revision: i64 = transaction
         .query_row(
             "SELECT revision FROM task_orchestration_meta WHERE singleton = 1",
@@ -3344,28 +4675,105 @@ fn invalidate_reserved_run_approval(
 fn project_run_started_to_task(
     transaction: &Transaction<'_>,
     attempt: &RunAttemptProjection,
+    timestamp: i64,
 ) -> PersistenceResult<()> {
     let changed = match attempt.run_mode {
-        RunAttemptMode::Execute => transaction.execute(
-            "UPDATE agent_tasks
-             SET status = 'Running', phase = 'Specialist Work', completed_at = NULL,
-                 queue_state = 'running'
-             WHERE owner_agent_id = ?1 AND id = ?2 AND queue_state = 'admitted'",
-            params![attempt.task_owner_agent_id, attempt.task_id],
-        ),
-        RunAttemptMode::Review => transaction.execute(
-            "UPDATE agent_tasks
-             SET status = 'Under Review', phase = 'Senior Review',
-                 review_agent_id = ?1, review_status = 'Running'
-             WHERE owner_agent_id = ?2 AND id = ?3",
-            params![
-                attempt.agent_id,
-                attempt.task_owner_agent_id,
-                attempt.task_id
-            ],
-        ),
-    }
-    .map_err(PersistenceError::database)?;
+        RunAttemptMode::Execute => {
+            let changed = transaction
+                .execute(
+                    "UPDATE agent_tasks
+                     SET status = 'Running', phase = 'Specialist Work', completed_at = NULL,
+                         queue_state = 'running'
+                     WHERE owner_agent_id = ?1 AND id = ?2 AND queue_state = 'admitted'",
+                    params![attempt.task_owner_agent_id, attempt.task_id],
+                )
+                .map_err(PersistenceError::database)?;
+            let flow_changed = transaction
+                .execute(
+                    "UPDATE review_flows
+                     SET state = 'awaiting_execution', updated_at_unix_ms = ?1
+                     WHERE task_owner_agent_id = ?2 AND task_id = ?3
+                       AND state = 'revision_queued'",
+                    params![timestamp, attempt.task_owner_agent_id, attempt.task_id],
+                )
+                .map_err(PersistenceError::database)?;
+            if flow_changed == 1 {
+                advance_review_revision(transaction)?;
+            }
+            changed
+        }
+        RunAttemptMode::Review => {
+            let flow_id = attempt.review_flow_id.ok_or_else(|| {
+                PersistenceError::new(
+                    "REVIEW_BINDING_MISSING",
+                    "The review run has no bound flow.",
+                    false,
+                )
+            })?;
+            let stage_id = attempt.review_stage_attempt_id.ok_or_else(|| {
+                PersistenceError::new(
+                    "REVIEW_BINDING_MISSING",
+                    "The review run has no bound stage.",
+                    false,
+                )
+            })?;
+            let level: String = transaction
+                .query_row(
+                    "SELECT level FROM review_stage_attempts
+                     WHERE id = ?1 AND flow_id = ?2 AND run_attempt_id = ?3
+                       AND state = 'admitted'",
+                    params![stage_id, flow_id, attempt.id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => PersistenceError::new(
+                        "REVIEW_STAGE_STATE_CONFLICT",
+                        "The admitted review stage no longer matches this run.",
+                        true,
+                    ),
+                    other => PersistenceError::database(other),
+                })?;
+            let level = ReviewLevel::from_storage(&level).map_err(review_protocol_error)?;
+            let stage_changed = transaction
+                .execute(
+                    "UPDATE review_stage_attempts
+                     SET state = 'running', started_at_unix_ms = ?1
+                     WHERE id = ?2 AND state = 'admitted'",
+                    params![timestamp, stage_id],
+                )
+                .map_err(PersistenceError::database)?;
+            let flow_changed = transaction
+                .execute(
+                    "UPDATE review_flows
+                     SET state = 'reviewing', updated_at_unix_ms = ?1
+                     WHERE id = ?2 AND state = 'review_pending'",
+                    params![timestamp, flow_id],
+                )
+                .map_err(PersistenceError::database)?;
+            if stage_changed != 1 || flow_changed != 1 {
+                return Err(PersistenceError::new(
+                    "REVIEW_STAGE_STATE_CONFLICT",
+                    "The admitted review flow changed before startup could be recorded.",
+                    true,
+                ));
+            }
+            advance_review_revision(transaction)?;
+            transaction
+                .execute(
+                    "UPDATE agent_tasks
+                     SET status = 'Under Review', phase = ?1,
+                         review_agent_id = ?2, review_status = 'Running'
+                     WHERE owner_agent_id = ?3 AND id = ?4",
+                    params![
+                        level.task_phase(),
+                        attempt.agent_id,
+                        attempt.task_owner_agent_id,
+                        attempt.task_id
+                    ],
+                )
+                .map_err(PersistenceError::database)?
+        }
+    };
     if changed != 1 {
         return Err(PersistenceError::new(
             "TASK_STATE_CONFLICT",
@@ -3373,6 +4781,239 @@ fn project_run_started_to_task(
             true,
         ));
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReviewAfterExecution {
+    required: bool,
+    next_level: Option<ReviewLevel>,
+}
+
+fn project_execution_success_to_review_flow(
+    connection: &Connection,
+    attempt: &RunAttemptProjection,
+    configured_review_mode: &str,
+    timestamp: i64,
+) -> PersistenceResult<ReviewAfterExecution> {
+    let active_flow_id: Option<i64> = connection
+        .query_row(
+            "SELECT id FROM review_flows
+             WHERE task_owner_agent_id = ?1 AND task_id = ?2
+               AND state NOT IN ('completed', 'failed', 'cancelled')",
+            params![attempt.task_owner_agent_id, attempt.task_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(PersistenceError::database)?;
+    if active_flow_id.is_none() && configured_review_mode == "off" {
+        return Ok(ReviewAfterExecution {
+            required: false,
+            next_level: None,
+        });
+    }
+    let (flow_id, required_levels) = if let Some(flow_id) = active_flow_id {
+        let flow = read_active_review_flow_binding(
+            connection,
+            attempt.task_owner_agent_id,
+            attempt.task_id,
+        )?;
+        if flow.id != flow_id
+            || flow.executor_agent_id != attempt.agent_id
+            || !matches!(
+                flow.state.as_str(),
+                "awaiting_execution" | "revision_queued"
+            )
+        {
+            return Err(PersistenceError::new(
+                "REVIEW_FLOW_STATE_CONFLICT",
+                "The revision execution does not match the active review flow.",
+                true,
+            ));
+        }
+        (flow.id, flow.required_levels)
+    } else {
+        if !matches!(configured_review_mode, "manual" | "automatic") {
+            return Err(PersistenceError::new(
+                "REVIEW_MODE_INVALID",
+                "The configured review mode is invalid.",
+                false,
+            ));
+        }
+        let state = read_application_state(connection)?;
+        let executor = state
+            .agents
+            .iter()
+            .find(|agent| agent.id == attempt.agent_id)
+            .ok_or_else(|| {
+                PersistenceError::new(
+                    "REVIEW_EXECUTOR_NOT_FOUND",
+                    "The task executor no longer exists.",
+                    true,
+                )
+            })?;
+        let required_levels =
+            required_levels_for_role(&executor.role).map_err(review_protocol_error)?;
+        let required_levels_json = serde_json::to_string(
+            &required_levels
+                .iter()
+                .map(|level| level.as_storage())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|_| {
+            PersistenceError::new(
+                "REVIEW_REQUEST_INVALID",
+                "The required review levels could not be stored.",
+                false,
+            )
+        })?;
+        connection
+            .execute(
+                "INSERT INTO review_flows
+                 (task_owner_agent_id, task_id, executor_agent_id, pipeline_version,
+                  state, revision_round, max_revisions, required_levels_json,
+                  current_level, latest_execution_attempt_id, review_mode,
+                  last_error_code, last_error_message, created_at_unix_ms,
+                  updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, 'awaiting_execution', 0, ?5, ?6, NULL,
+                         ?7, ?8, NULL, NULL, ?9, ?9)",
+                params![
+                    attempt.task_owner_agent_id,
+                    attempt.task_id,
+                    attempt.agent_id,
+                    REVIEW_PIPELINE_VERSION,
+                    MAX_REVISION_ROUNDS,
+                    required_levels_json,
+                    attempt.id,
+                    configured_review_mode,
+                    timestamp
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        (connection.last_insert_rowid(), required_levels)
+    };
+    let next_level = required_levels.first().copied();
+    let awaiting_human = next_level.is_none();
+    connection
+        .execute(
+            "UPDATE review_flows
+             SET state = ?1, current_level = ?2, latest_execution_attempt_id = ?3,
+                 last_error_code = ?4, last_error_message = ?5,
+                 updated_at_unix_ms = ?6
+             WHERE id = ?7",
+            params![
+                if awaiting_human {
+                    "awaiting_human"
+                } else {
+                    "awaiting_review"
+                },
+                next_level.map(ReviewLevel::as_storage),
+                attempt.id,
+                if awaiting_human {
+                    Some("HUMAN_REVIEW_REQUIRED")
+                } else {
+                    None
+                },
+                if awaiting_human {
+                    Some("The executor is the Supervisor, so a trusted human decision is required.")
+                } else {
+                    None
+                },
+                timestamp,
+                flow_id
+            ],
+        )
+        .map_err(PersistenceError::database)?;
+    advance_review_revision(connection)?;
+    Ok(ReviewAfterExecution {
+        required: true,
+        next_level,
+    })
+}
+
+fn project_execution_failure_to_review_flow(
+    connection: &Connection,
+    attempt: &RunAttemptProjection,
+    status: RunAttemptStatus,
+    recovery_disposition: Option<&str>,
+    timestamp: i64,
+) -> PersistenceResult<()> {
+    let flow_id: Option<i64> = connection
+        .query_row(
+            "SELECT id FROM review_flows
+             WHERE task_owner_agent_id = ?1 AND task_id = ?2
+               AND state IN ('revision_queued', 'awaiting_execution')",
+            params![attempt.task_owner_agent_id, attempt.task_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(PersistenceError::database)?;
+    let Some(flow_id) = flow_id else {
+        return Ok(());
+    };
+    let safe_to_retry = status == RunAttemptStatus::StartupFailed
+        || (matches!(
+            status,
+            RunAttemptStatus::Cancelled | RunAttemptStatus::Interrupted
+        ) && recovery_disposition == Some("safe_to_retry"));
+    if safe_to_retry {
+        connection
+            .execute(
+                "UPDATE review_flows
+                 SET state = 'revision_queued',
+                     last_error_code = 'REVISION_EXECUTION_RETRYABLE',
+                     last_error_message = 'The revision execution stopped before dispatch and is safe to retry.',
+                     updated_at_unix_ms = ?1
+                 WHERE id = ?2",
+                params![timestamp, flow_id],
+            )
+            .map_err(PersistenceError::database)?;
+        connection
+            .execute(
+                "UPDATE agent_tasks
+                 SET status = 'Pending', phase = 'Assigned', completed_at = NULL,
+                     queue_state = 'queued'
+                 WHERE owner_agent_id = ?1 AND id = ?2",
+                params![attempt.task_owner_agent_id, attempt.task_id],
+            )
+            .map_err(PersistenceError::database)?;
+    } else {
+        let enqueue_sequence: Option<i64> = connection
+            .query_row(
+                "SELECT enqueue_sequence FROM agent_tasks
+                 WHERE owner_agent_id = ?1 AND id = ?2",
+                params![attempt.task_owner_agent_id, attempt.task_id],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        let enqueue_sequence = match enqueue_sequence {
+            Some(sequence) => sequence,
+            None => allocate_enqueue_sequence(connection)?,
+        };
+        connection
+            .execute(
+                "UPDATE review_flows
+                 SET state = 'awaiting_human',
+                     last_error_code = 'REVISION_EXECUTION_UNCERTAIN',
+                     last_error_message = 'The revision execution may have changed the workspace and requires human inspection.',
+                     updated_at_unix_ms = ?1
+                 WHERE id = ?2",
+                params![timestamp, flow_id],
+            )
+            .map_err(PersistenceError::database)?;
+        connection
+            .execute(
+                "UPDATE agent_tasks
+                 SET status = 'Blocked', phase = 'Supervisor Approval', completed_at = NULL,
+                     queue_state = 'held', enqueue_sequence = ?1,
+                     review_status = 'Failed',
+                     review_result = 'Revision execution outcome is uncertain; inspect the workspace before continuing.'
+                 WHERE owner_agent_id = ?2 AND id = ?3",
+                params![enqueue_sequence, attempt.task_owner_agent_id, attempt.task_id],
+            )
+            .map_err(PersistenceError::database)?;
+    }
+    advance_review_revision(connection)?;
     Ok(())
 }
 
@@ -3392,38 +5033,58 @@ fn project_run_completion_to_task(
     recovery_disposition: Option<&str>,
 ) -> PersistenceResult<()> {
     let completed_at = format_unix_ms(timestamp);
-    match attempt.run_mode {
-        RunAttemptMode::Execute => match status {
-            RunAttemptStatus::Succeeded => {
-                let review_mode: String = transaction
-                    .query_row(
-                        "SELECT review_mode FROM preferences WHERE singleton = 1",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(PersistenceError::database)?;
-                let review_required = review_mode != "off";
-                transaction
+    if attempt.run_mode == RunAttemptMode::Review {
+        return project_review_run_completion(
+            transaction,
+            attempt,
+            status,
+            summary,
+            runtime_model,
+            duration_seconds,
+            timestamp,
+            recovery_disposition,
+        );
+    }
+    match status {
+        RunAttemptStatus::Succeeded => {
+            let review_mode: String = transaction
+                .query_row(
+                    "SELECT review_mode FROM preferences WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(PersistenceError::database)?;
+            let review = project_execution_success_to_review_flow(
+                transaction,
+                attempt,
+                &review_mode,
+                timestamp,
+            )?;
+            let awaiting_human = review.required && review.next_level.is_none();
+            transaction
                     .execute(
                         "UPDATE agent_tasks
                          SET status = ?1, phase = ?2, completed_at = ?3, result = ?4,
                              response_id = ?5, runtime_model = ?6, total_tokens = ?7,
                              diff = ?8, duration_seconds = ?9, review_agent_id = NULL,
-                             review_status = ?10, review_model = NULL,
-                             review_duration_seconds = NULL, reviewed_at = NULL
-                         WHERE owner_agent_id = ?11 AND id = ?12",
+                             review_status = ?10, review_result = ?11,
+                             review_model = NULL, review_duration_seconds = NULL,
+                             reviewed_at = NULL
+                         WHERE owner_agent_id = ?12 AND id = ?13",
                         params![
-                            if review_required {
+                            if review.required {
                                 "Under Review"
                             } else {
                                 "Completed"
                             },
-                            if review_required {
-                                "Senior Review"
+                            if let Some(level) = review.next_level {
+                                level.task_phase()
+                            } else if awaiting_human {
+                                "Supervisor Approval"
                             } else {
                                 "Finished"
                             },
-                            if review_required {
+                            if review.required {
                                 None::<String>
                             } else {
                                 Some(completed_at.clone())
@@ -3434,133 +5095,371 @@ fn project_run_completion_to_task(
                             optional_bounded_i64(total_tokens),
                             diff,
                             duration_seconds as f64,
-                            if review_required {
+                            if review.required {
                                 "Pending"
                             } else {
                                 "Not Requested"
                             },
-                            attempt.task_owner_agent_id,
-                            attempt.task_id
-                        ],
-                    )
-                    .map_err(PersistenceError::database)?;
-                transaction
-                    .execute(
-                        "DELETE FROM task_changed_files
-                         WHERE owner_agent_id = ?1 AND task_id = ?2",
-                        params![attempt.task_owner_agent_id, attempt.task_id],
-                    )
-                    .map_err(PersistenceError::database)?;
-                for (position, path) in changed_files.iter().enumerate() {
-                    transaction
-                        .execute(
-                            "INSERT INTO task_changed_files
-                             (owner_agent_id, task_id, position, path)
-                             VALUES (?1, ?2, ?3, ?4)",
-                            params![
-                                attempt.task_owner_agent_id,
-                                attempt.task_id,
-                                position as i64,
-                                path
-                            ],
-                        )
-                        .map_err(PersistenceError::database)?;
-                }
-            }
-            RunAttemptStatus::Cancelled | RunAttemptStatus::StartupFailed => {
-                transaction
-                    .execute(
-                        "UPDATE agent_tasks
-                         SET status = 'Pending', phase = 'Assigned', completed_at = NULL
-                         WHERE owner_agent_id = ?1 AND id = ?2",
-                        params![attempt.task_owner_agent_id, attempt.task_id],
-                    )
-                    .map_err(PersistenceError::database)?;
-            }
-            RunAttemptStatus::Interrupted => {
-                let safe = recovery_disposition == Some("safe_to_retry");
-                transaction
-                    .execute(
-                        "UPDATE agent_tasks SET status = ?1, phase = ?2, completed_at = NULL
-                         WHERE owner_agent_id = ?3 AND id = ?4",
-                        params![
-                            if safe { "Pending" } else { "Blocked" },
-                            if safe {
-                                "Assigned"
+                            if awaiting_human {
+                                Some("A trusted human decision is required for Supervisor-executed work.")
                             } else {
-                                "Supervisor Approval"
+                                None
                             },
                             attempt.task_owner_agent_id,
                             attempt.task_id
                         ],
                     )
                     .map_err(PersistenceError::database)?;
-            }
-            RunAttemptStatus::TimedOut | RunAttemptStatus::Failed => {
+            transaction
+                .execute(
+                    "DELETE FROM task_changed_files
+                         WHERE owner_agent_id = ?1 AND task_id = ?2",
+                    params![attempt.task_owner_agent_id, attempt.task_id],
+                )
+                .map_err(PersistenceError::database)?;
+            for (position, path) in changed_files.iter().enumerate() {
                 transaction
                     .execute(
-                        "UPDATE agent_tasks
-                         SET status = 'Failed', phase = 'Failed', completed_at = ?1
-                         WHERE owner_agent_id = ?2 AND id = ?3",
-                        params![completed_at, attempt.task_owner_agent_id, attempt.task_id],
+                        "INSERT INTO task_changed_files
+                             (owner_agent_id, task_id, position, path)
+                             VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            attempt.task_owner_agent_id,
+                            attempt.task_id,
+                            position as i64,
+                            path
+                        ],
                     )
                     .map_err(PersistenceError::database)?;
             }
-            _ => {
-                return Err(PersistenceError::new(
-                    "INVALID_RUN_COMPLETION",
-                    "The execution completion status is not terminal.",
-                    false,
-                ));
-            }
-        },
-        RunAttemptMode::Review => {
-            let normalized = summary.unwrap_or_default().to_ascii_lowercase();
-            let (task_status, task_phase, review_status, completed) = match status {
-                RunAttemptStatus::Succeeded if normalized.contains("verdict: approved") => {
-                    ("Completed", "Finished", "Approved", true)
-                }
-                RunAttemptStatus::Succeeded
-                    if normalized.contains("verdict: changes requested") =>
-                {
-                    ("Pending", "Assigned", "Changes Requested", false)
-                }
-                RunAttemptStatus::Cancelled | RunAttemptStatus::StartupFailed => {
-                    ("Under Review", "Senior Review", "Pending", false)
-                }
-                RunAttemptStatus::Interrupted if recovery_disposition == Some("safe_to_retry") => {
-                    ("Under Review", "Senior Review", "Pending", false)
-                }
-                _ => ("Under Review", "Senior Review", "Failed", false),
-            };
+        }
+        RunAttemptStatus::Cancelled | RunAttemptStatus::StartupFailed => {
             transaction
                 .execute(
                     "UPDATE agent_tasks
-                     SET status = ?1, phase = ?2, completed_at = ?3,
-                         review_agent_id = ?4, review_status = ?5, review_result = ?6,
-                         review_model = ?7, review_duration_seconds = ?8, reviewed_at = ?9
-                     WHERE owner_agent_id = ?10 AND id = ?11",
+                         SET status = 'Pending', phase = 'Assigned', completed_at = NULL
+                         WHERE owner_agent_id = ?1 AND id = ?2",
+                    params![attempt.task_owner_agent_id, attempt.task_id],
+                )
+                .map_err(PersistenceError::database)?;
+        }
+        RunAttemptStatus::Interrupted => {
+            let safe = recovery_disposition == Some("safe_to_retry");
+            transaction
+                .execute(
+                    "UPDATE agent_tasks SET status = ?1, phase = ?2, completed_at = NULL
+                         WHERE owner_agent_id = ?3 AND id = ?4",
                     params![
-                        task_status,
-                        task_phase,
-                        if completed {
-                            Some(completed_at.clone())
+                        if safe { "Pending" } else { "Blocked" },
+                        if safe {
+                            "Assigned"
                         } else {
-                            None::<String>
+                            "Supervisor Approval"
                         },
-                        attempt.agent_id,
-                        review_status,
-                        summary,
-                        runtime_model,
-                        duration_seconds as f64,
-                        completed_at,
                         attempt.task_owner_agent_id,
                         attempt.task_id
                     ],
                 )
                 .map_err(PersistenceError::database)?;
         }
+        RunAttemptStatus::TimedOut | RunAttemptStatus::Failed => {
+            transaction
+                .execute(
+                    "UPDATE agent_tasks
+                         SET status = 'Failed', phase = 'Failed', completed_at = ?1
+                         WHERE owner_agent_id = ?2 AND id = ?3",
+                    params![completed_at, attempt.task_owner_agent_id, attempt.task_id],
+                )
+                .map_err(PersistenceError::database)?;
+        }
+        _ => {
+            return Err(PersistenceError::new(
+                "INVALID_RUN_COMPLETION",
+                "The execution completion status is not terminal.",
+                false,
+            ));
+        }
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_review_run_completion(
+    connection: &Connection,
+    attempt: &RunAttemptProjection,
+    status: RunAttemptStatus,
+    summary: Option<&str>,
+    runtime_model: Option<&str>,
+    duration_seconds: u64,
+    timestamp: i64,
+    recovery_disposition: Option<&str>,
+) -> PersistenceResult<()> {
+    let flow_id = attempt.review_flow_id.ok_or_else(|| {
+        PersistenceError::new(
+            "REVIEW_BINDING_MISSING",
+            "The completed review run has no bound flow.",
+            false,
+        )
+    })?;
+    let stage_id = attempt.review_stage_attempt_id.ok_or_else(|| {
+        PersistenceError::new(
+            "REVIEW_BINDING_MISSING",
+            "The completed review run has no bound stage.",
+            false,
+        )
+    })?;
+    let flow =
+        read_active_review_flow_binding(connection, attempt.task_owner_agent_id, attempt.task_id)?;
+    if flow.id != flow_id
+        || attempt.review_revision_round != Some(flow.revision_round)
+        || !matches!(flow.state.as_str(), "review_pending" | "reviewing")
+    {
+        return Err(PersistenceError::new(
+            "REVIEW_FLOW_STATE_CONFLICT",
+            "The completed review run no longer matches the active review flow.",
+            false,
+        ));
+    }
+    let (request_json, stage_level, stage_state, attempt_number): (String, String, String, i64) =
+        connection
+            .query_row(
+                "SELECT request_json, level, state, attempt_number
+                 FROM review_stage_attempts
+                 WHERE id = ?1 AND flow_id = ?2 AND run_attempt_id = ?3
+                   AND reviewer_agent_id = ?4",
+                params![stage_id, flow_id, attempt.id, attempt.agent_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => PersistenceError::new(
+                    "REVIEW_STAGE_STATE_CONFLICT",
+                    "The completed review run no longer matches its stage attempt.",
+                    false,
+                ),
+                other => PersistenceError::database(other),
+            })?;
+    if !matches!(stage_state.as_str(), "admitted" | "running") {
+        return Err(PersistenceError::new(
+            "REVIEW_STAGE_STATE_CONFLICT",
+            "The review stage is already terminal or has an invalid state.",
+            false,
+        ));
+    }
+    let level = ReviewLevel::from_storage(&stage_level).map_err(review_protocol_error)?;
+    let review_request: ReviewRequestV1 = serde_json::from_str(&request_json).map_err(|_| {
+        PersistenceError::new(
+            "REVIEW_LEDGER_INVALID",
+            "The stored review request is invalid.",
+            false,
+        )
+    })?;
+    if review_request.flow_id != flow_id
+        || review_request.stage_attempt_id != stage_id
+        || review_request.revision_round != flow.revision_round
+        || review_request.level != level
+        || review_request.request_fingerprint
+            != read_review_request_fingerprint(connection, stage_id)?
+    {
+        return Err(PersistenceError::new(
+            "REVIEW_LEDGER_INVALID",
+            "The stored review request does not match its normalized stage binding.",
+            false,
+        ));
+    }
+
+    if status == RunAttemptStatus::Succeeded
+        && !attempt.truncation.summary_truncated
+        && !attempt.truncation.stdout_truncated
+    {
+        match parse_review_result(summary.unwrap_or_default(), &review_request) {
+            Ok(result) => {
+                let result_json = serde_json::to_string(&result).map_err(|_| {
+                    PersistenceError::new(
+                        "REVIEW_RESULT_INVALID",
+                        "The structured review result could not be stored.",
+                        false,
+                    )
+                })?;
+                let changed = connection
+                    .execute(
+                        "UPDATE review_stage_attempts
+                         SET state = ?1, result_json = ?2, verdict = ?3, feedback = ?4,
+                             completed_at_unix_ms = ?5
+                         WHERE id = ?6 AND state IN ('admitted', 'running')",
+                        params![
+                            result.verdict.as_storage(),
+                            result_json,
+                            result.verdict.as_storage(),
+                            result.feedback,
+                            timestamp,
+                            stage_id
+                        ],
+                    )
+                    .map_err(PersistenceError::database)?;
+                if changed != 1 {
+                    return Err(PersistenceError::new(
+                        "REVIEW_STAGE_STATE_CONFLICT",
+                        "The review stage changed before its verdict was recorded.",
+                        true,
+                    ));
+                }
+                return apply_review_verdict(
+                    connection,
+                    &flow,
+                    level,
+                    &result,
+                    ReviewActor::Agent,
+                    Some(attempt.agent_id),
+                    runtime_model,
+                    Some(duration_seconds),
+                    timestamp,
+                );
+            }
+            Err(error) => {
+                return project_review_stage_failure(
+                    connection,
+                    &flow,
+                    stage_id,
+                    level,
+                    attempt_number,
+                    "invalid",
+                    &error.code,
+                    &error.message,
+                    false,
+                    timestamp,
+                )
+            }
+        }
+    }
+
+    let uncertain = recovery_disposition != Some("safe_to_retry")
+        && matches!(
+            status,
+            RunAttemptStatus::Cancelled | RunAttemptStatus::Interrupted
+        );
+    let (stage_terminal_state, code, message) = if status == RunAttemptStatus::Succeeded {
+        (
+            "invalid",
+            "REVIEW_RESULT_TRUNCATED",
+            "The review response was truncated and cannot support a verdict.",
+        )
+    } else {
+        (
+            match status {
+                RunAttemptStatus::Cancelled => "cancelled",
+                RunAttemptStatus::Interrupted => "interrupted",
+                _ => "failed",
+            },
+            attempt.error_code.as_deref().unwrap_or("REVIEW_RUN_FAILED"),
+            attempt
+                .error_message
+                .as_deref()
+                .unwrap_or("The review run did not produce a valid structured result."),
+        )
+    };
+    project_review_stage_failure(
+        connection,
+        &flow,
+        stage_id,
+        level,
+        attempt_number,
+        stage_terminal_state,
+        code,
+        message,
+        uncertain,
+        timestamp,
+    )
+}
+
+fn read_review_request_fingerprint(
+    connection: &Connection,
+    stage_attempt_id: i64,
+) -> PersistenceResult<String> {
+    connection
+        .query_row(
+            "SELECT request_fingerprint FROM review_stage_attempts WHERE id = ?1",
+            [stage_attempt_id],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_review_stage_failure(
+    connection: &Connection,
+    flow: &ActiveReviewFlowBinding,
+    stage_id: i64,
+    level: ReviewLevel,
+    attempt_number: i64,
+    terminal_state: &str,
+    error_code: &str,
+    error_message: &str,
+    uncertain: bool,
+    timestamp: i64,
+) -> PersistenceResult<()> {
+    let changed = connection
+        .execute(
+            "UPDATE review_stage_attempts
+             SET state = ?1, error_code = ?2, error_message = ?3,
+                 completed_at_unix_ms = ?4
+             WHERE id = ?5 AND state IN ('admitted', 'running')",
+            params![
+                terminal_state,
+                error_code,
+                error_message,
+                timestamp,
+                stage_id
+            ],
+        )
+        .map_err(PersistenceError::database)?;
+    if changed != 1 {
+        return Err(PersistenceError::new(
+            "REVIEW_STAGE_STATE_CONFLICT",
+            "The review stage changed before its failure was recorded.",
+            true,
+        ));
+    }
+    let awaiting_human = uncertain || attempt_number >= MAX_STAGE_ATTEMPTS;
+    connection
+        .execute(
+            "UPDATE review_flows
+             SET state = ?1, last_error_code = ?2, last_error_message = ?3,
+                 updated_at_unix_ms = ?4
+             WHERE id = ?5",
+            params![
+                if awaiting_human {
+                    "awaiting_human"
+                } else {
+                    "awaiting_review"
+                },
+                error_code,
+                error_message,
+                timestamp,
+                flow.id
+            ],
+        )
+        .map_err(PersistenceError::database)?;
+    connection
+        .execute(
+            "UPDATE agent_tasks
+             SET status = ?1, phase = ?2, completed_at = NULL,
+                 review_status = 'Failed', review_result = ?3
+             WHERE owner_agent_id = ?4 AND id = ?5",
+            params![
+                "Under Review",
+                if awaiting_human {
+                    "Supervisor Approval"
+                } else {
+                    level.task_phase()
+                },
+                error_message,
+                flow.task_owner_agent_id,
+                flow.task_id
+            ],
+        )
+        .map_err(PersistenceError::database)?;
+    advance_review_revision(connection)?;
+    advance_task_orchestration_revision(connection)?;
     Ok(())
 }
 
@@ -3744,6 +5643,18 @@ fn prune_run_history(transaction: &Transaction<'_>, timestamp: i64) -> Persisten
                 "SELECT id FROM run_attempts
                  WHERE status IN ('succeeded', 'cancelled', 'timed_out', 'startup_failed',
                                   'failed', 'interrupted')
+                   AND id NOT IN (
+                       SELECT latest_execution_attempt_id FROM review_flows
+                       WHERE state NOT IN ('completed', 'failed', 'cancelled')
+                         AND latest_execution_attempt_id IS NOT NULL
+                   )
+                   AND id NOT IN (
+                       SELECT stage.run_attempt_id
+                       FROM review_stage_attempts AS stage
+                       JOIN review_flows AS flow ON flow.id = stage.flow_id
+                       WHERE flow.state NOT IN ('completed', 'failed', 'cancelled')
+                         AND stage.run_attempt_id IS NOT NULL
+                   )
                  ORDER BY completed_at_unix_ms, id LIMIT 1",
                 [],
                 |row| row.get(0),
@@ -3753,7 +5664,7 @@ fn prune_run_history(transaction: &Transaction<'_>, timestamp: i64) -> Persisten
         let Some(attempt_id) = oldest_terminal else {
             return Err(PersistenceError::new(
                 "RUN_HISTORY_LIMIT",
-                "Active run data alone exceeds the durable ledger bound.",
+                "No unreferenced terminal run history can be pruned within the durable ledger bound.",
                 false,
             ));
         };
@@ -3806,11 +5717,24 @@ fn clear_run_coordination(transaction: &Transaction<'_>) -> PersistenceResult<()
             "DELETE FROM run_approval_reservations;
              DELETE FROM run_events;
              DELETE FROM run_attempts;
+             DELETE FROM review_stage_attempts;
+             DELETE FROM review_flows;
+             UPDATE review_orchestration_meta SET revision = 0 WHERE singleton = 1;
              UPDATE run_coordinator_meta
              SET revision = 0, active_attempt_id = NULL, retained_attempt_count = 0,
                  retained_payload_bytes = 0, pruned_attempt_count = 0,
                  last_pruned_at_unix_ms = NULL
              WHERE singleton = 1;",
+        )
+        .map_err(PersistenceError::database)
+}
+
+fn clear_review_orchestration(transaction: &Transaction<'_>) -> PersistenceResult<()> {
+    transaction
+        .execute_batch(
+            "DELETE FROM review_stage_attempts;
+             DELETE FROM review_flows;
+             UPDATE review_orchestration_meta SET revision = 0 WHERE singleton = 1;",
         )
         .map_err(PersistenceError::database)
 }
@@ -4158,7 +6082,7 @@ fn allocate_task_and_enqueue_sequence(
     Ok((task_id, enqueue_sequence))
 }
 
-fn allocate_enqueue_sequence(transaction: &Transaction<'_>) -> PersistenceResult<i64> {
+fn allocate_enqueue_sequence(transaction: &Connection) -> PersistenceResult<i64> {
     let sequence: i64 = transaction
         .query_row(
             "SELECT next_enqueue_sequence
@@ -4239,8 +6163,62 @@ fn ensure_task_has_no_active_run(
     Ok(())
 }
 
+fn ensure_task_has_no_active_review_flow(
+    connection: &Connection,
+    owner_agent_id: i64,
+    task_id: i64,
+) -> PersistenceResult<()> {
+    let active: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM review_flows
+                 WHERE task_owner_agent_id = ?1 AND task_id = ?2
+                   AND state NOT IN ('completed', 'failed', 'cancelled')
+             )",
+            params![owner_agent_id, task_id],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    if active {
+        return Err(PersistenceError::new(
+            "TASK_REVIEW_LOCKED",
+            "The task executor and routing inputs are locked by an active review flow.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_review_queue_mutation_allowed(
+    connection: &Connection,
+    owner_agent_id: i64,
+    task_id: i64,
+) -> PersistenceResult<()> {
+    let state: Option<String> = connection
+        .query_row(
+            "SELECT state FROM review_flows
+             WHERE task_owner_agent_id = ?1 AND task_id = ?2
+               AND state NOT IN ('completed', 'failed', 'cancelled')",
+            params![owner_agent_id, task_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(PersistenceError::database)?;
+    if state
+        .as_deref()
+        .is_some_and(|state| state != "revision_queued")
+    {
+        return Err(PersistenceError::new(
+            "TASK_REVIEW_LOCKED",
+            "Only a review-requested revision may be held or resumed through queue controls.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
 fn expire_task_approvals(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     task_owner_agent_id: i64,
     task_id: i64,
 ) -> PersistenceResult<()> {
@@ -5896,6 +7874,10 @@ mod tests {
         catalog_provider_bindings, ollama_descriptor, ProviderAvailability, ProviderRuntimeModel,
         ProviderRuntimeStatus,
     };
+    use crate::review_orchestration::{
+        ReviewCheckKind, ReviewCheckResultV1, ReviewCheckStatus, ReviewRequestV1,
+        REQUIRED_REVIEW_CHECKS,
+    };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -6035,7 +8017,8 @@ mod tests {
                     (2, "authoritative_approval_lifecycle".to_string()),
                     (3, "authoritative_run_coordination".to_string()),
                     (4, "dynamic_agent_registry".to_string()),
-                    (5, "authoritative_task_orchestration".to_string())
+                    (5, "authoritative_task_orchestration".to_string()),
+                    (6, "structured_review_orchestration".to_string())
                 ]
             );
             let journal_mode: String = repository
@@ -6062,6 +8045,158 @@ mod tests {
         let reopened = repository.load().unwrap().expect("state should exist");
         assert_eq!(reopened.revision, 1);
         assert_eq!(reopened.state, expected);
+    }
+
+    #[test]
+    fn task_0011_schema_five_inflight_review_migrates_conservatively_to_human() {
+        let directory = TestDirectory::new();
+        let path = directory.database_path();
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        for (version, name, sql) in [
+            (1, "initial_application_state", INITIAL_MIGRATION),
+            (
+                2,
+                "authoritative_approval_lifecycle",
+                AUTHORIZATION_MIGRATION,
+            ),
+            (
+                3,
+                "authoritative_run_coordination",
+                RUN_COORDINATION_MIGRATION,
+            ),
+            (4, "dynamic_agent_registry", AGENT_REGISTRY_MIGRATION),
+            (
+                5,
+                "authoritative_task_orchestration",
+                TASK_ORCHESTRATION_MIGRATION,
+            ),
+        ] {
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations (version, name, applied_at_unix_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![version, name, version],
+                )
+                .unwrap();
+        }
+        connection.pragma_update(None, "user_version", 5).unwrap();
+
+        let mut state = authorization_state();
+        state.preferences.review_mode = "manual".to_string();
+        let task = &mut state.agents[1].tasks[0];
+        task.status = "Under Review".to_string();
+        task.phase = "Senior Review".to_string();
+        task.queue_state = "notQueued".to_string();
+        task.enqueue_sequence = None;
+        task.review_agent_id = Some(3);
+        task.review_status = "Running".to_string();
+        task.review_result = Some("Legacy unbound review output".to_string());
+        let mut pending_review = task.clone();
+        pending_review.id = 42;
+        pending_review.title = "Legacy pending review".to_string();
+        pending_review.review_status = "Pending".to_string();
+        state.agents[1].tasks.push(pending_review);
+        let transaction = connection.transaction().unwrap();
+        write_application_state(
+            &transaction,
+            &state,
+            "renderer_prototype",
+            &HashMap::new(),
+            true,
+        )
+        .unwrap();
+        transaction
+            .execute(
+                "UPDATE application_meta
+                 SET initialized = 1, state_revision = 1,
+                     source_kind = 'fresh', source_version = NULL
+                 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let mut repository = StateRepository::open(&path).unwrap();
+        assert_eq!(repository.schema_version().unwrap(), 6);
+        let snapshot = repository.review_orchestration_snapshot().unwrap();
+        assert_eq!(snapshot.flows.len(), 2);
+        assert!(snapshot
+            .flows
+            .iter()
+            .all(|flow| flow.latest_execution_attempt_id.is_some()));
+        let flow = snapshot
+            .flows
+            .iter()
+            .find(|flow| flow.task_id == 41)
+            .unwrap();
+        assert_eq!(flow.state, "awaiting_human");
+        assert_eq!(flow.revision_round, 0);
+        assert_eq!(
+            flow.required_levels,
+            vec![
+                ReviewLevel::Senior,
+                ReviewLevel::TeamLeader,
+                ReviewLevel::Supervisor
+            ]
+        );
+        assert_eq!(flow.current_level, Some(ReviewLevel::Senior));
+        assert_eq!(
+            flow.last_error_code.as_deref(),
+            Some("LEGACY_REVIEW_UNBOUND")
+        );
+        assert!(flow.latest_execution_attempt_id.is_some());
+        assert!(flow.stages.is_empty());
+
+        let blocked = repository
+            .start_review_stage(
+                StartReviewStageRequest {
+                    expected_revision: snapshot.revision,
+                    task_owner_agent_id: 2,
+                    task_id: 41,
+                },
+                &task_0010_provider_snapshot(),
+            )
+            .unwrap();
+        assert_eq!(
+            blocked.blocked_code.as_deref(),
+            Some("LEGACY_REVIEW_UNBOUND")
+        );
+        assert!(blocked.stage.is_none());
+        assert!(blocked.context.is_none());
+        let recovered = repository
+            .record_human_review_decision(HumanReviewDecisionRequest {
+                expected_revision: blocked.snapshot.revision,
+                task_owner_agent_id: 2,
+                task_id: 41,
+                flow_id: flow.id,
+                verdict: ReviewVerdict::ChangesRequested,
+                feedback: "Run a fresh execution because legacy evidence is incomplete."
+                    .to_string(),
+            })
+            .unwrap();
+        let recovered_flow = recovered
+            .flows
+            .iter()
+            .find(|flow| flow.task_id == 41)
+            .unwrap();
+        assert_eq!(recovered_flow.state, "revision_queued");
+        assert_eq!(recovered_flow.revision_round, 1);
+        let task = &repository.load().unwrap().unwrap().state.agents[1].tasks[0];
+        assert_eq!(task.status, "Pending");
+        assert_eq!(task.queue_state, "queued");
+        assert_eq!(
+            repository
+                .connection
+                .query_row("PRAGMA foreign_key_check", [], |_| Ok(false))
+                .optional()
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -6125,6 +8260,7 @@ mod tests {
             task_owner_agent_id: 1,
             task_id: normal_task.id,
             run_mode: RunMode::Execute,
+            review_context: None,
         };
         assert_eq!(
             repository
@@ -6181,12 +8317,14 @@ mod tests {
             task_owner_agent_id: 1,
             task_id: head_task.id,
             run_mode: RunMode::Execute,
+            review_context: None,
         };
         let later_intent = ActionIntent::RunTask {
             agent_id: later_task.assigned_agent_id,
             task_owner_agent_id: 1,
             task_id: later_task.id,
             run_mode: RunMode::Execute,
+            review_context: None,
         };
         let admitted = repository
             .admit_run("task-0010-head-failure", &head_intent)
@@ -6428,6 +8566,7 @@ mod tests {
             task_owner_agent_id: 1,
             task_id: rerouted_task.id,
             run_mode: RunMode::Execute,
+            review_context: None,
         };
         let attempt = repository.admit_run("task-0010-reset", &intent).unwrap();
         repository
@@ -7070,6 +9209,7 @@ mod tests {
             task_owner_agent_id: 2,
             task_id: 41,
             run_mode: RunMode::Execute,
+            review_context: None,
         }
     }
 
@@ -7143,6 +9283,612 @@ mod tests {
             truncation: RunTruncationEvidence::default(),
             recovery_disposition: None,
         }
+    }
+
+    fn task_0011_repository() -> (StateRepository, i64) {
+        let (mut repository, configured) = task_0010_repository();
+        let mut state = configured.state;
+        state.preferences.review_mode = "manual".to_string();
+        for agent_id in [1, 3, 6] {
+            let reviewer = state
+                .agents
+                .iter_mut()
+                .find(|agent| agent.id == agent_id)
+                .unwrap();
+            reviewer.model = "qwen2.5-coder:7b".to_string();
+            reviewer.approvals.files = "allow".to_string();
+        }
+        let saved = repository.save(configured.revision, &state, true).unwrap();
+        let created = repository
+            .create_routed_task(
+                CreateRoutedTaskRequest {
+                    expected_revision: saved.revision,
+                    task_owner_agent_id: 2,
+                    title: "Implement parser boundary".to_string(),
+                    category: "Development".to_string(),
+                    priority: "Normal".to_string(),
+                    workspace_id: "workspace-1".to_string(),
+                    routing_mode: "selected".to_string(),
+                    preferred_agent_id: Some(2),
+                    selected_agent_id: Some(2),
+                },
+                &task_0010_provider_snapshot(),
+            )
+            .unwrap();
+        let task_id = created.state.agents[1].tasks[0].id;
+        (repository, task_id)
+    }
+
+    fn task_0011_execute(
+        repository: &mut StateRepository,
+        task_id: i64,
+        request_id: &str,
+    ) -> RunAttemptProjection {
+        let intent = ActionIntent::RunTask {
+            agent_id: 2,
+            task_owner_agent_id: 2,
+            task_id,
+            run_mode: RunMode::Execute,
+            review_context: None,
+        };
+        assert_eq!(
+            repository.request_authorization(&intent).unwrap().decision,
+            crate::authorization::AuthorizationDecision::Allowed
+        );
+        let admitted = repository.admit_run(request_id, &intent).unwrap();
+        repository
+            .prepare_run_attempt(
+                admitted.attempt.id,
+                "Ollama",
+                "qwen2.5-coder:7b",
+                Some("workspace-1"),
+            )
+            .unwrap();
+        repository
+            .mark_run_dispatching(admitted.attempt.id)
+            .unwrap();
+        repository.mark_run_started(admitted.attempt.id).unwrap();
+        repository
+            .complete_run(
+                admitted.attempt.id,
+                &successful_completion("Implemented and verified the parser boundary."),
+            )
+            .unwrap()
+    }
+
+    fn task_0011_result_json(request_json: &str, verdict: ReviewVerdict) -> String {
+        let request: ReviewRequestV1 = serde_json::from_str(request_json).unwrap();
+        serde_json::to_string(&ReviewResultV1 {
+            schema_version: 1,
+            flow_id: request.flow_id,
+            task_id: request.subject.task_id,
+            revision_round: request.revision_round,
+            level: request.level,
+            stage_attempt_id: request.stage_attempt_id,
+            request_fingerprint: request.request_fingerprint,
+            verdict,
+            checks: REQUIRED_REVIEW_CHECKS
+                .iter()
+                .copied()
+                .map(|check| ReviewCheckResultV1 {
+                    check,
+                    status: if verdict == ReviewVerdict::Approved {
+                        ReviewCheckStatus::Pass
+                    } else if check == ReviewCheckKind::Correctness {
+                        ReviewCheckStatus::Fail
+                    } else {
+                        ReviewCheckStatus::Pass
+                    },
+                    evidence_ids: vec!["execution.summary".to_string()],
+                    finding: "Bound evidence inspected.".to_string(),
+                })
+                .collect(),
+            blocking_issues: if verdict == ReviewVerdict::Approved {
+                Vec::new()
+            } else {
+                vec!["The boundary behavior needs another revision.".to_string()]
+            },
+            feedback: if verdict == ReviewVerdict::Approved {
+                String::new()
+            } else {
+                "Correct the boundary behavior and rerun verification.".to_string()
+            },
+        })
+        .unwrap()
+    }
+
+    fn task_0011_review_stage(
+        repository: &mut StateRepository,
+        task_id: i64,
+        request_id: &str,
+        verdict: ReviewVerdict,
+    ) -> (ReviewStageStart, RunAttemptProjection) {
+        let snapshot = repository.review_orchestration_snapshot().unwrap();
+        let start = repository
+            .start_review_stage(
+                StartReviewStageRequest {
+                    expected_revision: snapshot.revision,
+                    task_owner_agent_id: 2,
+                    task_id,
+                },
+                &task_0010_provider_snapshot(),
+            )
+            .unwrap();
+        let context = start.context.clone().unwrap();
+        let reviewer_agent_id = start.stage.as_ref().unwrap().reviewer_agent_id.unwrap();
+        let intent = ActionIntent::RunTask {
+            agent_id: reviewer_agent_id,
+            task_owner_agent_id: 2,
+            task_id,
+            run_mode: RunMode::Review,
+            review_context: Some(context),
+        };
+        assert_eq!(
+            repository.request_authorization(&intent).unwrap().decision,
+            crate::authorization::AuthorizationDecision::Allowed
+        );
+        let admitted = repository.admit_run(request_id, &intent).unwrap();
+        let output =
+            task_0011_result_json(admitted.review_request_json.as_deref().unwrap(), verdict);
+        repository
+            .prepare_run_attempt(
+                admitted.attempt.id,
+                "Ollama",
+                "qwen2.5-coder:7b",
+                Some("workspace-1"),
+            )
+            .unwrap();
+        repository
+            .mark_run_dispatching(admitted.attempt.id)
+            .unwrap();
+        repository.mark_run_started(admitted.attempt.id).unwrap();
+        let completion = RunCompletion {
+            changed_files: Vec::new(),
+            diff: None,
+            ..successful_completion(&output)
+        };
+        let completed = repository
+            .complete_run(admitted.attempt.id, &completion)
+            .unwrap();
+        (start, completed)
+    }
+
+    #[test]
+    fn task_0011_backend_runs_exact_reporting_chain_and_structured_completion() {
+        let (mut repository, task_id) = task_0011_repository();
+        task_0011_execute(&mut repository, task_id, "task-0011-execute-0");
+        for (index, (level, reviewer)) in [
+            (ReviewLevel::Senior, 3),
+            (ReviewLevel::TeamLeader, 6),
+            (ReviewLevel::Supervisor, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let snapshot = repository.review_orchestration_snapshot().unwrap();
+            let flow = &snapshot.flows[0];
+            assert_eq!(flow.state, "awaiting_review");
+            assert_eq!(flow.current_level, Some(level));
+            let (start, _) = task_0011_review_stage(
+                &mut repository,
+                task_id,
+                &format!("task-0011-review-{index}"),
+                ReviewVerdict::Approved,
+            );
+            assert_eq!(start.stage.unwrap().reviewer_agent_id, Some(reviewer));
+        }
+        let snapshot = repository.review_orchestration_snapshot().unwrap();
+        assert_eq!(snapshot.flows[0].state, "completed");
+        let task = &repository.load().unwrap().unwrap().state.agents[1].tasks[0];
+        assert_eq!(task.status, "Completed");
+        assert_eq!(task.phase, "Finished");
+        assert_eq!(task.review_status, "Approved");
+    }
+
+    #[test]
+    fn task_0011_changes_requeue_fresh_execution_and_stale_stage_cannot_replay() {
+        let (mut repository, task_id) = task_0011_repository();
+        task_0011_execute(&mut repository, task_id, "task-0011-revision-execute-0");
+        let (start, _) = task_0011_review_stage(
+            &mut repository,
+            task_id,
+            "task-0011-revision-review-0",
+            ReviewVerdict::ChangesRequested,
+        );
+        let stale_context = start.context.unwrap();
+        let snapshot = repository.review_orchestration_snapshot().unwrap();
+        assert_eq!(snapshot.flows[0].state, "revision_queued");
+        assert_eq!(snapshot.flows[0].revision_round, 1);
+        let task = &repository.load().unwrap().unwrap().state.agents[1].tasks[0];
+        assert_eq!(task.queue_state, "queued");
+        assert_eq!(task.review_status, "Changes Requested");
+        assert!(task.enqueue_sequence.unwrap() > 1);
+
+        task_0011_execute(&mut repository, task_id, "task-0011-revision-execute-1");
+        let fresh = repository.review_orchestration_snapshot().unwrap();
+        assert_eq!(fresh.flows[0].state, "awaiting_review");
+        assert_eq!(fresh.flows[0].revision_round, 1);
+        let stale_intent = ActionIntent::RunTask {
+            agent_id: 3,
+            task_owner_agent_id: 2,
+            task_id,
+            run_mode: RunMode::Review,
+            review_context: Some(stale_context),
+        };
+        assert_eq!(
+            repository
+                .request_authorization(&stale_intent)
+                .unwrap_err()
+                .code,
+            "REVIEW_INTENT_STALE"
+        );
+    }
+
+    #[test]
+    fn task_0011_invalid_text_never_approves_and_three_attempts_require_human() {
+        let (mut repository, task_id) = task_0011_repository();
+        task_0011_execute(&mut repository, task_id, "task-0011-invalid-execute");
+        for attempt_number in 1..=3 {
+            let snapshot = repository.review_orchestration_snapshot().unwrap();
+            let start = repository
+                .start_review_stage(
+                    StartReviewStageRequest {
+                        expected_revision: snapshot.revision,
+                        task_owner_agent_id: 2,
+                        task_id,
+                    },
+                    &task_0010_provider_snapshot(),
+                )
+                .unwrap();
+            let context = start.context.unwrap();
+            let intent = ActionIntent::RunTask {
+                agent_id: 3,
+                task_owner_agent_id: 2,
+                task_id,
+                run_mode: RunMode::Review,
+                review_context: Some(context),
+            };
+            let admitted = repository
+                .admit_run(
+                    &format!("task-0011-invalid-review-{attempt_number}"),
+                    &intent,
+                )
+                .unwrap();
+            repository
+                .prepare_run_attempt(
+                    admitted.attempt.id,
+                    "Ollama",
+                    "qwen2.5-coder:7b",
+                    Some("workspace-1"),
+                )
+                .unwrap();
+            repository
+                .mark_run_dispatching(admitted.attempt.id)
+                .unwrap();
+            repository.mark_run_started(admitted.attempt.id).unwrap();
+            repository
+                .complete_run(
+                    admitted.attempt.id,
+                    &RunCompletion {
+                        changed_files: Vec::new(),
+                        diff: None,
+                        ..successful_completion("VERDICT: APPROVED")
+                    },
+                )
+                .unwrap();
+        }
+        let snapshot = repository.review_orchestration_snapshot().unwrap();
+        assert_eq!(snapshot.flows[0].state, "awaiting_human");
+        assert_eq!(snapshot.flows[0].stages.len(), 3);
+        assert!(snapshot.flows[0]
+            .stages
+            .iter()
+            .all(|stage| stage.state == "invalid"));
+        assert_ne!(
+            repository.load().unwrap().unwrap().state.agents[1].tasks[0].status,
+            "Completed"
+        );
+    }
+
+    #[test]
+    fn task_0011_review_cancellation_retries_only_before_dispatch() {
+        let (mut repository, task_id) = task_0011_repository();
+        task_0011_execute(&mut repository, task_id, "task-0011-cancel-execute");
+
+        let snapshot = repository.review_orchestration_snapshot().unwrap();
+        let first = repository
+            .start_review_stage(
+                StartReviewStageRequest {
+                    expected_revision: snapshot.revision,
+                    task_owner_agent_id: 2,
+                    task_id,
+                },
+                &task_0010_provider_snapshot(),
+            )
+            .unwrap();
+        let first_intent = ActionIntent::RunTask {
+            agent_id: 3,
+            task_owner_agent_id: 2,
+            task_id,
+            run_mode: RunMode::Review,
+            review_context: first.context,
+        };
+        let admitted = repository
+            .admit_run("task-0011-cancel-safe", &first_intent)
+            .unwrap();
+        repository
+            .request_run_cancellation(admitted.attempt.id)
+            .unwrap();
+        let safe_cancel = RunCompletion::terminal_error(
+            RunAttemptStatus::Cancelled,
+            "RUN_CANCELLED",
+            "Review cancelled before dispatch.",
+            0,
+        );
+        repository
+            .complete_run(admitted.attempt.id, &safe_cancel)
+            .unwrap();
+        let retryable = repository.review_orchestration_snapshot().unwrap();
+        assert_eq!(retryable.flows[0].state, "awaiting_review");
+        assert_eq!(retryable.flows[0].stages[0].state, "cancelled");
+
+        let second = repository
+            .start_review_stage(
+                StartReviewStageRequest {
+                    expected_revision: retryable.revision,
+                    task_owner_agent_id: 2,
+                    task_id,
+                },
+                &task_0010_provider_snapshot(),
+            )
+            .unwrap();
+        let second_intent = ActionIntent::RunTask {
+            agent_id: 3,
+            task_owner_agent_id: 2,
+            task_id,
+            run_mode: RunMode::Review,
+            review_context: second.context,
+        };
+        let dispatched = repository
+            .admit_run("task-0011-cancel-uncertain", &second_intent)
+            .unwrap();
+        repository
+            .prepare_run_attempt(
+                dispatched.attempt.id,
+                "Ollama",
+                "qwen2.5-coder:7b",
+                Some("workspace-1"),
+            )
+            .unwrap();
+        repository
+            .mark_run_dispatching(dispatched.attempt.id)
+            .unwrap();
+        repository.mark_run_started(dispatched.attempt.id).unwrap();
+        repository
+            .request_run_cancellation(dispatched.attempt.id)
+            .unwrap();
+        repository
+            .complete_run(
+                dispatched.attempt.id,
+                &RunCompletion::terminal_error(
+                    RunAttemptStatus::Cancelled,
+                    "RUN_CANCELLED",
+                    "Review cancellation occurred after dispatch.",
+                    1,
+                ),
+            )
+            .unwrap();
+        let uncertain = repository.review_orchestration_snapshot().unwrap();
+        assert_eq!(uncertain.flows[0].state, "awaiting_human");
+        assert_eq!(uncertain.flows[0].stages[1].state, "cancelled");
+        assert_ne!(
+            repository.load().unwrap().unwrap().state.agents[1].tasks[0].status,
+            "Completed"
+        );
+    }
+
+    #[test]
+    fn task_0011_active_review_evidence_is_not_pruned_at_the_run_history_bound() {
+        let (mut repository, task_id) = task_0011_repository();
+        let execution = task_0011_execute(&mut repository, task_id, "task-0011-retention-execute");
+        let execution_completed_at = execution.completed_at_unix_ms.unwrap();
+        repository
+            .connection
+            .execute(
+                "WITH RECURSIVE ids(id) AS (
+                     VALUES(1)
+                     UNION ALL SELECT id + 1 FROM ids WHERE id < ?1
+                 )
+                 INSERT INTO run_attempts
+                 (request_id, intent_json, intent_fingerprint, policy_fingerprint,
+                  workspace_fingerprint, agent_id, task_owner_agent_id, task_id,
+                  task_title, run_mode, status, task_status_before, task_phase_before,
+                  review_status_before, admitted_at_unix_ms, completed_at_unix_ms)
+                 SELECT 'review-retention-history-' || id, '{}', 'history', 'history',
+                        'history', 2, 2, ?2, 'History', 'execute', 'failed', 'Pending',
+                        'Assigned', 'Not Requested', ?3 + id, ?3 + id
+                 FROM ids",
+                params![MAX_RETAINED_ATTEMPTS, task_id, execution_completed_at],
+            )
+            .unwrap();
+
+        let transaction = repository
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        prune_run_history(&transaction, execution_completed_at + 10_000).unwrap();
+        refresh_run_retention_meta(&transaction).unwrap();
+        transaction.commit().unwrap();
+
+        let snapshot = repository.review_orchestration_snapshot().unwrap();
+        assert_eq!(
+            snapshot.flows[0].latest_execution_attempt_id,
+            Some(execution.id)
+        );
+        assert!(repository
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_attempts WHERE id = ?1)",
+                [execution.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+        let run_snapshot = repository.run_snapshot().unwrap();
+        assert_eq!(
+            run_snapshot.retained_attempt_count,
+            MAX_RETAINED_ATTEMPTS as u64
+        );
+        assert_eq!(run_snapshot.pruned_attempt_count, 1);
+    }
+
+    #[test]
+    fn task_0011_three_revision_cap_requires_human_and_cannot_queue_a_fourth() {
+        let (mut repository, task_id) = task_0011_repository();
+        task_0011_execute(&mut repository, task_id, "task-0011-cap-execute-0");
+        for round in 0..=MAX_REVISION_ROUNDS {
+            task_0011_review_stage(
+                &mut repository,
+                task_id,
+                &format!("task-0011-cap-review-{round}"),
+                ReviewVerdict::ChangesRequested,
+            );
+            let snapshot = repository.review_orchestration_snapshot().unwrap();
+            if round < MAX_REVISION_ROUNDS {
+                assert_eq!(snapshot.flows[0].state, "revision_queued");
+                assert_eq!(snapshot.flows[0].revision_round, round + 1);
+                task_0011_execute(
+                    &mut repository,
+                    task_id,
+                    &format!("task-0011-cap-execute-{}", round + 1),
+                );
+            } else {
+                assert_eq!(snapshot.flows[0].state, "awaiting_human");
+                assert_eq!(snapshot.flows[0].revision_round, MAX_REVISION_ROUNDS);
+                let updated = repository
+                    .record_human_review_decision(HumanReviewDecisionRequest {
+                        expected_revision: snapshot.revision,
+                        task_owner_agent_id: 2,
+                        task_id,
+                        flow_id: snapshot.flows[0].id,
+                        verdict: ReviewVerdict::ChangesRequested,
+                        feedback: "Do not accept this task without another revision.".to_string(),
+                    })
+                    .unwrap();
+                assert_eq!(updated.flows[0].state, "failed");
+                let task = &repository.load().unwrap().unwrap().state.agents[1].tasks[0];
+                assert_eq!(task.status, "Failed");
+                assert_eq!(task.queue_state, "notQueued");
+            }
+        }
+    }
+
+    #[test]
+    fn task_0011_unavailable_exact_reviewer_never_substitutes_and_survives_renderer_save() {
+        let (mut repository, task_id) = task_0011_repository();
+        task_0011_execute(&mut repository, task_id, "task-0011-unavailable-execute");
+        let envelope = repository.load().unwrap().unwrap();
+        let mut renderer_state = envelope.state;
+        renderer_state
+            .agents
+            .iter_mut()
+            .find(|agent| agent.id == 3)
+            .unwrap()
+            .status = "Paused".to_string();
+        renderer_state.agents[1].tasks[0].status = "Completed".to_string();
+        repository
+            .save(envelope.revision, &renderer_state, false)
+            .unwrap();
+
+        let snapshot = repository.review_orchestration_snapshot().unwrap();
+        assert_eq!(snapshot.flows[0].state, "awaiting_review");
+        let start = repository
+            .start_review_stage(
+                StartReviewStageRequest {
+                    expected_revision: snapshot.revision,
+                    task_owner_agent_id: 2,
+                    task_id,
+                },
+                &task_0010_provider_snapshot(),
+            )
+            .unwrap();
+        assert_eq!(start.blocked_code.as_deref(), Some("REVIEWER_INACTIVE"));
+        assert!(start.stage.is_none());
+        assert!(start.context.is_none());
+        assert_eq!(start.snapshot.flows[0].state, "awaiting_human");
+        assert!(start.snapshot.flows[0].stages.is_empty());
+        let task = &repository.load().unwrap().unwrap().state.agents[1].tasks[0];
+        assert_eq!(task.status, "Under Review");
+        assert_eq!(task.phase, "Supervisor Approval");
+    }
+
+    #[test]
+    fn task_0011_restart_recovery_never_dispatches_and_escalates_uncertain_review() {
+        let (mut repository, task_id) = task_0011_repository();
+        task_0011_execute(&mut repository, task_id, "task-0011-recovery-execute");
+
+        let snapshot = repository.review_orchestration_snapshot().unwrap();
+        let first = repository
+            .start_review_stage(
+                StartReviewStageRequest {
+                    expected_revision: snapshot.revision,
+                    task_owner_agent_id: 2,
+                    task_id,
+                },
+                &task_0010_provider_snapshot(),
+            )
+            .unwrap();
+        let first_intent = ActionIntent::RunTask {
+            agent_id: 3,
+            task_owner_agent_id: 2,
+            task_id,
+            run_mode: RunMode::Review,
+            review_context: first.context,
+        };
+        repository
+            .admit_run("task-0011-recovery-safe", &first_intent)
+            .unwrap();
+        repository.reconcile_interrupted_runs().unwrap();
+        let safe = repository.review_orchestration_snapshot().unwrap();
+        assert_eq!(safe.flows[0].state, "awaiting_review");
+        assert_eq!(safe.flows[0].stages[0].state, "interrupted");
+
+        let second = repository
+            .start_review_stage(
+                StartReviewStageRequest {
+                    expected_revision: safe.revision,
+                    task_owner_agent_id: 2,
+                    task_id,
+                },
+                &task_0010_provider_snapshot(),
+            )
+            .unwrap();
+        let second_intent = ActionIntent::RunTask {
+            agent_id: 3,
+            task_owner_agent_id: 2,
+            task_id,
+            run_mode: RunMode::Review,
+            review_context: second.context,
+        };
+        let admitted = repository
+            .admit_run("task-0011-recovery-uncertain", &second_intent)
+            .unwrap();
+        repository
+            .prepare_run_attempt(
+                admitted.attempt.id,
+                "Ollama",
+                "qwen2.5-coder:7b",
+                Some("workspace-1"),
+            )
+            .unwrap();
+        repository
+            .mark_run_dispatching(admitted.attempt.id)
+            .unwrap();
+        repository.mark_run_started(admitted.attempt.id).unwrap();
+        repository.reconcile_interrupted_runs().unwrap();
+        let uncertain = repository.review_orchestration_snapshot().unwrap();
+        assert_eq!(uncertain.flows[0].state, "awaiting_human");
+        assert_eq!(uncertain.flows[0].stages[1].state, "interrupted");
+        assert!(repository.run_snapshot().unwrap().active_attempt.is_none());
     }
 
     #[test]
@@ -7645,7 +10391,7 @@ mod tests {
         drop(connection);
 
         let repository = StateRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 5);
+        assert_eq!(repository.schema_version().unwrap(), 6);
         let upgraded: (String, i64, String) = repository
             .connection
             .query_row(
@@ -7989,6 +10735,7 @@ mod tests {
             task_owner_agent_id: 2,
             task_id: 999,
             run_mode: RunMode::Execute,
+            review_context: None,
         };
         assert_eq!(
             repository.authorize_intent(&wrong_task).unwrap_err().code,
@@ -7999,6 +10746,7 @@ mod tests {
             task_owner_agent_id: 2,
             task_id: 41,
             run_mode: RunMode::Execute,
+            review_context: None,
         };
         assert_eq!(
             repository.authorize_intent(&wrong_agent).unwrap_err().code,

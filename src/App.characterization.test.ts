@@ -3,21 +3,10 @@ import {
   normalizeApprovalRequest,
   normalizePerformance,
   normalizePreferences,
-  reviewAgentForTask,
   taskSafetyAssessment,
   type ApprovalRequest,
-  type ModelDefinition,
 } from "./App";
 import { agentFixture, taskFixture } from "./test/fixtures";
-import { unknownProviderRegistrySnapshot } from "./providerRegistry";
-
-const registeredModels: ModelDefinition[] = [
-  { id: 1, name: "fixture-model", provider: "OpenAI" },
-];
-const readyProviderRegistry = unknownProviderRegistrySnapshot();
-readyProviderRegistry.providers = readyProviderRegistry.providers.map(
-  (status) => ({ ...status, availability: "ready" }),
-);
 
 describe("task safety characterization", () => {
   it("requires one-run approval for requested write and terminal scopes", () => {
@@ -131,59 +120,6 @@ describe("approval normalization characterization", () => {
       expiresAt: "2026-01-02T03:34:05.000Z",
       consumedAt: null,
     });
-  });
-});
-
-describe("review routing characterization", () => {
-  it("selects the matching available senior reviewer", () => {
-    const owner = agentFixture({ id: 1 });
-    const senior = agentFixture({
-      id: 3,
-      name: "Development Senior",
-      role: "Senior Agent",
-      category: "Development",
-      authorityLevel: 2,
-      capabilities: { files: "read" },
-    });
-    const teamLeader = agentFixture({
-      id: 2,
-      name: "Team Leader",
-      role: "Team Leader",
-      category: "Management",
-      authorityLevel: 3,
-      capabilities: { files: "read" },
-    });
-
-    expect(
-      reviewAgentForTask(
-        [owner, teamLeader, senior],
-        owner.id,
-        "Development",
-        registeredModels,
-        "codex",
-        readyProviderRegistry,
-      )?.id,
-    ).toBe(senior.id);
-  });
-
-  it("returns null when no eligible reviewer is available", () => {
-    const owner = agentFixture({ id: 1 });
-    const pausedSenior = agentFixture({
-      id: 2,
-      role: "Senior Agent",
-      status: "Paused",
-    });
-
-    expect(
-      reviewAgentForTask(
-        [owner, pausedSenior],
-        owner.id,
-        "Development",
-        registeredModels,
-        "codex",
-        readyProviderRegistry,
-      ),
-    ).toBeNull();
   });
 });
 

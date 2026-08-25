@@ -1,12 +1,13 @@
 use crate::{
     app_state::{Agent, AgentTask, ApplicationState, WorkspaceDefinition},
     provider_runtime::resolve_model_identity,
+    review_orchestration::ReviewIntentContext,
 };
 use serde::{Deserialize, Serialize};
 
 const MAX_INTENT_TEXT: usize = 4 * 1024;
-const POLICY_FINGERPRINT_VERSION: &str = "policy-v3";
-const INTENT_FINGERPRINT_VERSION: &str = "intent-v1";
+const POLICY_FINGERPRINT_VERSION: &str = "policy-v4";
+const INTENT_FINGERPRINT_VERSION: &str = "intent-v2";
 const WORKSPACE_FINGERPRINT_VERSION: &str = "workspace-v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +30,8 @@ pub enum ActionIntent {
         task_owner_agent_id: i64,
         task_id: i64,
         run_mode: RunMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review_context: Option<ReviewIntentContext>,
     },
     OpenWorkspaceItem {
         agent_id: i64,
@@ -137,11 +140,29 @@ impl ActionIntent {
             Self::RunTask {
                 task_owner_agent_id,
                 task_id,
+                run_mode,
+                review_context,
                 ..
-            } if *task_owner_agent_id <= 0 || *task_id <= 0 => Err(PolicyDenial::new(
-                "INVALID_TASK",
-                "The authorization intent has an invalid task identifier.",
-            )),
+            } => {
+                if *task_owner_agent_id <= 0 || *task_id <= 0 {
+                    return Err(PolicyDenial::new(
+                        "INVALID_TASK",
+                        "The authorization intent has an invalid task identifier.",
+                    ));
+                }
+                match (run_mode, review_context) {
+                    (RunMode::Execute, None) => Ok(()),
+                    (RunMode::Review, Some(context)) => context.validate().map_err(|error| {
+                        PolicyDenial::new(error.code, error.message)
+                    }),
+                    (RunMode::Execute, Some(_)) | (RunMode::Review, None) => {
+                        Err(PolicyDenial::new(
+                            "INVALID_REVIEW_CONTEXT",
+                            "Execution must not carry review context and review must carry an exact authoritative context.",
+                        ))
+                    }
+                }
+            }
             Self::OpenWorkspaceItem {
                 workspace_id,
                 item_path,
@@ -435,20 +456,33 @@ impl<'a> EvaluationContext<'a> {
                 "The task is not assigned to the selected executing agent.",
             ));
         }
-        if run_mode == RunMode::Review
-            && (task
-                .review_agent_id
-                .is_some_and(|review_agent_id| review_agent_id != self.agent.id)
-                || (task.review_agent_id.is_none()
-                    && !matches!(
-                        self.agent.role.as_str(),
-                        "Senior Agent" | "Team Leader" | "Supervisor"
-                    )))
-        {
-            return Err(PolicyDenial::new(
-                "WRONG_REVIEW_AGENT",
-                "The selected agent is not eligible to review this task.",
-            ));
+        if run_mode == RunMode::Review {
+            let context = match self.intent {
+                ActionIntent::RunTask {
+                    review_context: Some(context),
+                    ..
+                } => context,
+                _ => {
+                    return Err(PolicyDenial::new(
+                        "INVALID_REVIEW_CONTEXT",
+                        "The review is missing its authoritative stage binding.",
+                    ))
+                }
+            };
+            if task.assigned_agent_id == self.agent.id
+                || self.agent.role != context.level.expected_role()
+                || !is_exact_reporting_chain_reviewer(
+                    self.state,
+                    task.assigned_agent_id,
+                    self.agent.id,
+                    context.level.expected_role(),
+                )?
+            {
+                return Err(PolicyDenial::new(
+                    "WRONG_REVIEW_AGENT",
+                    "The selected agent is not the exact required reviewer in the executor reporting chain.",
+                ));
+            }
         }
 
         self.title = if run_mode == RunMode::Review {
@@ -829,6 +863,49 @@ impl<'a> EvaluationContext<'a> {
     }
 }
 
+fn is_exact_reporting_chain_reviewer(
+    state: &ApplicationState,
+    executor_agent_id: i64,
+    reviewer_agent_id: i64,
+    expected_role: &str,
+) -> Result<bool, PolicyDenial> {
+    let executor = state
+        .agents
+        .iter()
+        .find(|agent| agent.id == executor_agent_id)
+        .ok_or_else(|| {
+            PolicyDenial::new(
+                "REVIEW_EXECUTOR_NOT_FOUND",
+                "The task executor does not exist.",
+            )
+        })?;
+    let mut current = executor.reports_to;
+    let mut visited = std::collections::HashSet::new();
+    while let Some(agent_id) = current {
+        if !visited.insert(agent_id) {
+            return Err(PolicyDenial::new(
+                "REVIEW_REPORTING_CYCLE",
+                "The executor reporting chain contains a cycle.",
+            ));
+        }
+        let candidate = state
+            .agents
+            .iter()
+            .find(|agent| agent.id == agent_id)
+            .ok_or_else(|| {
+                PolicyDenial::new(
+                    "REVIEW_MANAGER_NOT_FOUND",
+                    "The executor reporting chain references a missing manager.",
+                )
+            })?;
+        if candidate.role == expected_role {
+            return Ok(candidate.id == reviewer_agent_id);
+        }
+        current = candidate.reports_to;
+    }
+    Ok(false)
+}
+
 fn find_workspace<'a>(
     state: &'a ApplicationState,
     workspace_id: &str,
@@ -953,6 +1030,7 @@ mod tests {
             task_owner_agent_id: 2,
             task_id: 41,
             run_mode: RunMode::Execute,
+            review_context: None,
         }
     }
 
@@ -964,8 +1042,8 @@ mod tests {
         assert_eq!(evaluation.task_id, Some(41));
         assert_eq!(evaluation.workspace_id.as_deref(), Some("workspace-1"));
         assert!(evaluation.scopes.contains(&Scope::Files));
-        assert!(evaluation.policy_fingerprint.starts_with("policy-v3|"));
-        assert!(evaluation.intent_fingerprint.starts_with("intent-v1|"));
+        assert!(evaluation.policy_fingerprint.starts_with("policy-v4|"));
+        assert!(evaluation.intent_fingerprint.starts_with("intent-v2|"));
     }
 
     #[test]
@@ -1002,6 +1080,7 @@ mod tests {
             task_owner_agent_id: 2,
             task_id: 41,
             run_mode: RunMode::Execute,
+            review_context: None,
         };
         assert_eq!(
             evaluate_policy(&state, &wrong).unwrap_err().code,

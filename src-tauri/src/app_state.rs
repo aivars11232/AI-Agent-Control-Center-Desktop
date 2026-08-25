@@ -3,7 +3,7 @@ use crate::task_orchestration::{RoutingEvidence, ROUTING_ALGORITHM_VERSION};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fmt};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 pub const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 pub const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 

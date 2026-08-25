@@ -99,6 +99,16 @@ import {
   type RoutingEvidence,
   type TaskOrchestrationSnapshot,
 } from "./taskOrchestration";
+import {
+  emptyReviewOrchestrationSnapshot,
+  reviewFlowForTask,
+  reviewFlowStatus,
+  reviewLevelLabel,
+  type ReviewIntentContext,
+  type ReviewOrchestrationSnapshot,
+  type ReviewStageStart,
+  type ReviewVerdict,
+} from "./reviewOrchestration";
 import logoUrl from "../AI-Agents.png";
 import "./App.css";
 
@@ -143,6 +153,7 @@ type BackendActionIntent =
       taskOwnerAgentId: number;
       taskId: number;
       runMode: "execute" | "review";
+      reviewContext?: ReviewIntentContext;
     }
   | {
       kind: "openWorkspaceItem";
@@ -761,52 +772,6 @@ export function normalizeApprovalRequest(
   };
 }
 
-export function reviewAgentForTask(
-  agents: Agent[],
-  ownerAgentId: number,
-  category: TaskCategory,
-  models: ModelDefinition[],
-  activeProvider: RuntimeProviderId,
-  providerRegistry: ProviderRegistrySnapshot,
-) {
-  return (
-    agents
-      .filter(
-        (agent) =>
-          agent.id !== ownerAgentId &&
-          agent.status !== "Paused" &&
-          agent.model.trim().toLowerCase() !== "none" &&
-          resolveModelAvailability(
-            models,
-            agent.model,
-            providerRegistry,
-            activeProvider,
-          ).eligible &&
-          agent.capabilities.files !== "none" &&
-          (agent.role === "Senior Agent" ||
-            agent.role === "Team Leader" ||
-            agent.role === "Supervisor"),
-      )
-      .map((agent) => {
-        let score = agent.status === "Waiting" ? 14 : 8;
-        if (agent.category === category) score += 24;
-        if (agent.role === "Senior Agent") score += 55;
-        else if (agent.role === "Team Leader") score += 45;
-        else if (agent.role === "Supervisor") score += 35;
-        else score += 8;
-        score += agent.authorityLevel * 3;
-        score -= agent.tasks.filter(
-          (task) => task.status === "Running" || task.status === "Under Review",
-        ).length * 5;
-        return { agent, score };
-      })
-      .sort(
-        (left, right) =>
-          right.score - left.score || left.agent.id - right.agent.id,
-      )[0]?.agent ?? null
-  );
-}
-
 const defaultAgentPerformance: AgentPerformance = {
   strength: 5,
   focus: "balanced",
@@ -1043,6 +1008,8 @@ function AgentsPage({
   authoritativeRegistry,
   authoritativeTaskOrchestration,
   taskOrchestration,
+  reviewOrchestration,
+  onReviewSnapshot,
   models,
   providerRegistry,
   preferences,
@@ -1063,6 +1030,8 @@ function AgentsPage({
   authoritativeRegistry: boolean;
   authoritativeTaskOrchestration: boolean;
   taskOrchestration: TaskOrchestrationSnapshot;
+  reviewOrchestration: ReviewOrchestrationSnapshot;
+  onReviewSnapshot: (snapshot: ReviewOrchestrationSnapshot) => Promise<void>;
   models: ModelDefinition[];
   providerRegistry: ProviderRegistrySnapshot;
   preferences: AppPreferences;
@@ -1584,74 +1553,152 @@ function AgentsPage({
       return;
     }
     if (!isDesktopRuntime()) {
-      setRuntimeError("Senior reviews run only in the installed desktop app.");
+      setRuntimeError("Structured reviews run only in the installed desktop app.");
       return;
     }
-
-    const workspace = workspaceForTask(task);
-    const reviewer = reviewAgentForTask(
-      activeRegistryAgents(agents),
-      selectedAgent.id,
-      task.category,
-      models,
-      preferences.activeAiProvider,
-      providerRegistry,
-    );
-    if (!workspace) {
-      setRuntimeError("The task workspace is no longer available.");
-      return;
-    }
-    if (!reviewer) {
-      setRuntimeError(
-        "No active senior reviewer has file-read access and a model executable through the active provider.",
-      );
-      return;
-    }
-    let reviewAuthorization: AuthorizationReadiness;
+    setRuntimeError("");
     try {
-      reviewAuthorization = await prepareBackendAuthorization(
-        {
+      let snapshot = await invoke<ReviewOrchestrationSnapshot>(
+        "review_orchestration_snapshot",
+      );
+      await onReviewSnapshot(snapshot);
+      for (let stageIndex = 0; stageIndex < 3; stageIndex += 1) {
+        let flow = reviewFlowForTask(snapshot, selectedAgent.id, task.id);
+        let context: ReviewIntentContext | null =
+          flow?.state === "review_pending"
+            ? (() => {
+                const pending = [...flow.stages]
+                  .reverse()
+                  .find((stage) => stage.state === "pending");
+                return pending
+                  ? {
+                      flowId: flow.id,
+                      stageAttemptId: pending.id,
+                      revisionRound: pending.revisionRound,
+                      level: pending.level,
+                      requestFingerprint: pending.requestFingerprint,
+                    }
+                  : null;
+              })()
+            : null;
+        let reviewerAgentId =
+          flow?.state === "review_pending"
+            ? [...flow.stages]
+                .reverse()
+                .find((stage) => stage.state === "pending")
+                ?.reviewerAgentId ?? null
+            : null;
+
+        let boundContext = context;
+        if (!boundContext) {
+          const start = await invoke<ReviewStageStart>("start_review_stage", {
+            request: {
+              expectedRevision: snapshot.revision,
+              taskOwnerAgentId: selectedAgent.id,
+              taskId: task.id,
+            },
+          });
+          snapshot = start.snapshot;
+          await onReviewSnapshot(snapshot);
+          if (start.blockedCode || !start.context || !start.stage) {
+            setRuntimeError(
+              start.blockedMessage ??
+                "This review requires a trusted human decision.",
+            );
+            return;
+          }
+          boundContext = start.context;
+          reviewerAgentId = start.stage.reviewerAgentId;
+        }
+
+        const reviewer = agents.find(
+          (agent) => agent.id === reviewerAgentId,
+        );
+        if (!reviewer) {
+          setRuntimeError(
+            "The backend-selected reporting-chain reviewer is unavailable.",
+          );
+          return;
+        }
+        const reviewIntent: BackendActionIntent = {
           kind: "runTask",
           agentId: reviewer.id,
           taskOwnerAgentId: selectedAgent.id,
           taskId: task.id,
           runMode: "review",
-        },
-        setApprovalRequests,
-      );
+          reviewContext: boundContext,
+        };
+        const reviewAuthorization = await prepareBackendAuthorization(
+          reviewIntent,
+          setApprovalRequests,
+        );
+        if (!reviewAuthorization.ready) {
+          setRuntimeError(
+            "This exact review stage is waiting for backend authorization. Open Approvals to approve or deny it.",
+          );
+          onOpenApprovals();
+          return;
+        }
+        await invoke<AgentRunResult>("run_agent_task", {
+          request: {
+            runId: `review-${boundContext.flowId}-${boundContext.stageAttemptId}-${Date.now()}`,
+            runMode: "review",
+            agentId: reviewer.id,
+            taskOwnerAgentId: selectedAgent.id,
+            taskId: task.id,
+            reviewContext: boundContext,
+          },
+        });
+        snapshot = await invoke<ReviewOrchestrationSnapshot>(
+          "review_orchestration_snapshot",
+        );
+        await onReviewSnapshot(snapshot);
+        flow = reviewFlowForTask(snapshot, selectedAgent.id, task.id);
+        if (!continuation || flow?.state !== "awaiting_review") {
+          return;
+        }
+      }
     } catch (error) {
       setRuntimeError(errorMessage(error));
-      return;
     }
-    if (!reviewAuthorization.ready) {
-      setRuntimeError(
-        "This review is waiting for backend authorization. Open Approvals to approve or deny it.",
-      );
-      onOpenApprovals();
-      return;
-    }
-    const reviewRunId = `review-${task.id}-${Date.now()}`;
-    setRuntimeError("");
+  }
 
+  async function recordHumanReviewDecision(
+    task: AgentTask,
+    verdict: ReviewVerdict,
+  ) {
+    if (!selectedAgent || runActive || !isDesktopRuntime()) return;
+    const feedback =
+      verdict === "changesRequested"
+        ? window.prompt("Required revision feedback")
+        : "";
+    if (feedback === null) return;
     try {
-      const result = await invoke<AgentRunResult>("run_agent_task", {
-        request: {
-          runId: reviewRunId,
-          runMode: "review",
-          agentId: reviewer.id,
-          taskOwnerAgentId: selectedAgent.id,
-          taskId: task.id,
-        },
-      });
-      const approved = /\bverdict\s*:\s*approved\b/i.test(result.output);
-      const changesRequested = /\bverdict\s*:\s*changes requested\b/i.test(
-        result.output,
+      const snapshot = await invoke<ReviewOrchestrationSnapshot>(
+        "review_orchestration_snapshot",
       );
-      if (!approved && !changesRequested) {
+      const flow = reviewFlowForTask(snapshot, selectedAgent.id, task.id);
+      if (!flow || flow.state !== "awaiting_human") {
         setRuntimeError(
-          "The reviewer returned no valid verdict. Review its result and run the senior review again.",
+          "This task is not awaiting a trusted human review decision.",
         );
+        return;
       }
+      const updated = await invoke<ReviewOrchestrationSnapshot>(
+        "record_human_review_decision",
+        {
+          request: {
+            expectedRevision: snapshot.revision,
+            taskOwnerAgentId: selectedAgent.id,
+            taskId: task.id,
+            flowId: flow.id,
+            verdict,
+            feedback,
+          },
+        },
+      );
+      await onReviewSnapshot(updated);
+      setRuntimeError("");
     } catch (error) {
       setRuntimeError(errorMessage(error));
     }
@@ -2405,6 +2452,11 @@ function AgentsPage({
                 {selectedAgent.tasks.map((task) => {
                   const entry = queueEntry(task);
                   const executor = executorForTask(task);
+                  const reviewFlow = reviewFlowForTask(
+                    reviewOrchestration,
+                    selectedAgent.id,
+                    task.id,
+                  );
                   const assessment = executor
                     ? taskSafetyAssessment(
                         task,
@@ -2450,6 +2502,24 @@ function AgentsPage({
                         {executor?.name ?? "Unknown agent"} · Workspace:{" "}
                         {workspaceForTask(task)?.name ?? "Missing"}
                       </small>
+
+                      {reviewFlow && (
+                        <div className="routing-note">
+                          <strong>{reviewFlowStatus(reviewFlow)}</strong>
+                          <small>
+                            Round {reviewFlow.revisionRound} of{" "}
+                            {reviewFlow.maxRevisions} · Required chain:{" "}
+                            {reviewFlow.requiredLevels.length > 0
+                              ? reviewFlow.requiredLevels
+                                  .map((level) => reviewLevelLabel(level))
+                                  .join(" → ")
+                              : "trusted human"}
+                          </small>
+                          {reviewFlow.lastErrorMessage && (
+                            <small>{reviewFlow.lastErrorMessage}</small>
+                          )}
+                        </div>
+                      )}
 
                       <div className="routing-note">
                         <strong>{queueStateLabel(entry)}</strong>
@@ -2527,7 +2597,7 @@ function AgentsPage({
                           <div className="run-progress-heading">
                             <strong>
                               {activeRunKind === "review"
-                                ? "Live senior review"
+                                ? "Live structured review"
                                 : "Live agent progress"}
                             </strong>
                             <small>{cancelRequested ? "Stopping…" : "Running"}</small>
@@ -2584,7 +2654,7 @@ function AgentsPage({
                         >
                           <div className="agent-result-heading">
                             <strong>
-                              Senior review · {task.reviewStatus}
+                              Structured review · {task.reviewStatus}
                             </strong>
                             <small>
                               {agents.find(
@@ -2690,19 +2760,49 @@ function AgentsPage({
                         </button>
                       )}
 
-                      {preferences.reviewMode !== "off" &&
-                        task.result &&
-                        task.reviewStatus !== "Running" &&
-                        task.reviewStatus !== "Approved" &&
-                        task.reviewStatus !== "Changes Requested" && (
+                      {reviewFlow &&
+                        (reviewFlow.state === "awaiting_review" ||
+                          reviewFlow.state === "review_pending") && (
                           <button
                             className="primary-button"
                             disabled={runActive}
-                            onClick={() => void runSeniorReview(task)}
+                            onClick={() =>
+                              void runSeniorReview(
+                                task,
+                                undefined,
+                                preferences.reviewMode === "automatic",
+                              )
+                            }
                           >
-                            Run senior review
+                            Run {reviewLevelLabel(reviewFlow.currentLevel)} review
                           </button>
                         )}
+
+                      {reviewFlow?.state === "awaiting_human" && (
+                        <>
+                          <button
+                            className="primary-button"
+                            disabled={runActive}
+                            onClick={() =>
+                              void recordHumanReviewDecision(task, "approved")
+                            }
+                          >
+                            Confirm human approval
+                          </button>
+                          <button
+                            className="danger-button"
+                            disabled={runActive}
+                            onClick={() =>
+                              void recordHumanReviewDecision(
+                                task,
+                                "changesRequested",
+                              )
+                            }
+                          >
+                            Request revision
+                          </button>
+                        </>
+                      )}
 
                       {task.queueState === "queued" && (
                           <button
@@ -6396,7 +6496,7 @@ function SettingsPage({
           </label>
 
           <label className="form-field settings-field">
-            <span>Senior review</span>
+            <span>Multi-level review</span>
             <select
               value={preferences.reviewMode}
               onChange={(event) =>
@@ -6411,7 +6511,8 @@ function SettingsPage({
               <option value="automatic">Automatic after every run</option>
             </select>
             <small>
-              Reviews use a different active agent in a read-only Codex sandbox.
+              Reviews follow the exact active reporting chain under read-only policy,
+              one stage at a time.
             </small>
           </label>
         </div>
@@ -6419,7 +6520,7 @@ function SettingsPage({
         <div className="routing-flow">
           <span>Task</span>
           <span>Best specialist</span>
-          <span>Senior reviewer</span>
+          <span>Required reporting chain</span>
           <span>Approved or revisions</span>
         </div>
       </section>
@@ -7093,6 +7194,8 @@ function App() {
     useState<RunCoordinatorUiState>(createRunCoordinatorUiState);
   const [taskOrchestration, setTaskOrchestration] =
     useState<TaskOrchestrationSnapshot>(emptyTaskOrchestrationSnapshot);
+  const [reviewOrchestration, setReviewOrchestration] =
+    useState<ReviewOrchestrationSnapshot>(emptyReviewOrchestrationSnapshot);
   const [persistencePhase, setPersistencePhase] = useState<
     "loading" | "mutating" | "hydrating" | "ready" | "error"
   >(desktopRuntime ? "loading" : "ready");
@@ -7549,6 +7652,29 @@ function App() {
     setTaskOrchestration(snapshot);
   }
 
+  async function refreshReviewOrchestrationSnapshot() {
+    if (!desktopRuntime) return;
+    const snapshot = await invoke<ReviewOrchestrationSnapshot>(
+      "review_orchestration_snapshot",
+    );
+    setReviewOrchestration(snapshot);
+  }
+
+  async function adoptReviewOrchestrationSnapshot(
+    snapshot: ReviewOrchestrationSnapshot,
+  ) {
+    setReviewOrchestration(snapshot);
+    await persistenceWriter.current?.flush();
+    const envelope = await invoke<StateEnvelope | null>(
+      "load_application_state",
+    );
+    if (envelope) {
+      persistenceWriter.current?.adoptRevision(envelope.revision);
+      applyAuthoritativeApplicationState(envelope.state);
+    }
+    await refreshTaskOrchestrationSnapshot();
+  }
+
   async function refreshAgentRegistrySnapshotAfterCommit() {
     try {
       await refreshAgentRegistrySnapshot();
@@ -7562,6 +7688,7 @@ function App() {
   async function refreshTaskOrchestrationAfterCommit() {
     try {
       await refreshTaskOrchestrationSnapshot();
+      await refreshReviewOrchestrationSnapshot();
     } catch (error) {
       setPersistenceMessage(
         `Application state was updated, but the task queue could not be refreshed: ${persistenceErrorMessage(error)}`,
@@ -7613,6 +7740,9 @@ function App() {
         void refreshTaskOrchestrationSnapshot().catch((error: unknown) => {
           if (active) setPersistenceMessage(persistenceErrorMessage(error));
         });
+        void refreshReviewOrchestrationSnapshot().catch((error: unknown) => {
+          if (active) setPersistenceMessage(persistenceErrorMessage(error));
+        });
       })
       .catch((error: unknown) => {
         if (active) {
@@ -7655,6 +7785,7 @@ function App() {
           persistenceWriter.current?.adoptRevision(envelope.revision);
           applyAuthoritativeApplicationState(envelope.state);
           await refreshTaskOrchestrationSnapshot();
+          await refreshReviewOrchestrationSnapshot();
         }
       } catch (error) {
         if (active) {
@@ -8181,7 +8312,7 @@ function App() {
               <strong>{globalActiveRun.taskTitle}</strong>
               <small>
                 {globalActiveRun.runMode === "review"
-                  ? "Senior review"
+                  ? "Structured review"
                   : "Task execution"}
                 {` · ${globalActiveRun.status.replace(/_/g, " ")}`}
                 {globalActiveRun.provider
@@ -8223,6 +8354,8 @@ function App() {
             authoritativeRegistry={desktopRuntime}
             authoritativeTaskOrchestration={desktopRuntime}
             taskOrchestration={taskOrchestration}
+            reviewOrchestration={reviewOrchestration}
+            onReviewSnapshot={adoptReviewOrchestrationSnapshot}
             models={models}
             providerRegistry={providerRegistry}
             preferences={preferences}

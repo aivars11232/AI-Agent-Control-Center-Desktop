@@ -448,6 +448,7 @@ pub(crate) fn route_task(
             task_owner_agent_id: input.task_owner_agent_id,
             task_id: input.task.id,
             run_mode: RunMode::Execute,
+            review_context: None,
         };
         if let Err(error) = evaluate_policy(&policy_state, &intent) {
             add_disqualification(&mut disqualifications, error.code, error.message);

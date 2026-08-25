@@ -13,8 +13,10 @@
 > workspace tools. TASK-0009 adds backend-authoritative agent identity,
 > lifecycle, role-derived authority, and reporting validation. TASK-0010 adds
 > backend-authoritative task routing, routing evidence, durable queue order,
-> and execute-head admission; later tasks still own structured review, voice
-> semantics, packaging, and live acceptance.
+> and execute-head admission. TASK-0011 adds backend-authoritative structured
+> review requests/results, exact reporting-chain selection, bounded revisions,
+> trusted human gates, and deterministic recovery; later tasks still own
+> complete workspace evidence, voice semantics, packaging, and live acceptance.
 
 ## Security objective
 
@@ -43,7 +45,7 @@ when stored locally.
 | React renderer/WebView | Untrusted for authorization; may be compromised or hold stale/tampered state |
 | Imported backup and <code>localStorage</code> | Untrusted serialized input requiring validation and migration |
 | Tauri IPC | Untrusted request boundary; backend must authenticate semantics, not just types |
-| Rust backend | Authoritative agent registry, task routing/queue, approval/action-policy, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
+| Rust backend | Authoritative agent registry, task routing/queue, structured review/revision, approval/action-policy, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
 | Codex/Ollama output | Untrusted content and action proposals |
 | Selected workspace | Sensitive bounded filesystem root |
 | External/local provider process | Separate process/service with its own failure and trust model |
@@ -66,8 +68,9 @@ Static inspection and deterministic tests found these implemented controls:
   capability, and error contract implemented by the Codex and Ollama adapters;
 - one provider-registry status projection whose catalog bindings explicitly
   mark Anthropic, Google, and Custom as non-executable;
-- policy-v3 provider/model fingerprints that invalidate older or mismatched run
-  approvals instead of inheriting authority across a provider decision;
+- policy-v4/intent-v2 fingerprints that bind provider/model identity and any
+  exact review flow/stage/round/level/request context, invalidating older or
+  mismatched approvals instead of inheriting authority across a decision;
 - a schema-v2 request/approve/deny/expire/validate/consume lifecycle bound to
   exact agent, task, workspace, intent, and policy fingerprints;
 - trusted native confirmation that identifies the exact normalized action or
@@ -78,6 +81,20 @@ Static inspection and deterministic tests found these implemented controls:
 - generic renderer saves that preserve backend approval rows and cannot mint or
   overwrite authorization;
 - read-only/no-terminal/no-elevation constraints for review runs;
+- versioned <code>ReviewRequestV1</code>/<code>ReviewResultV1</code> contracts
+  bound to one flow, task, execution, round, level, stage, evidence set, and
+  SHA-256 request fingerprint;
+- duplicate-key, unknown-field, trailing-text, Markdown-fence, missing/both
+  verdict, stale-binding, unknown-evidence, incomplete-approval, and malformed
+  review output rejection before any verdict transition;
+- backend-only sequential reviewer selection through the executor's exact
+  active reporting chain, with distinct levels/identities, exact provider/model
+  readiness, no substitution, and no renderer-scored reviewer authority;
+- normalized schema-v6 review flow/stage state, immutable terminal attempts,
+  three agent attempts per stage, three execution revisions, fresh queue and
+  policy/approval evaluation, and conservative legacy/restart recovery;
+- trusted native KDialog confirmation for human review decisions, rechecked
+  against the current review revision before the transaction commits;
 - rejection of a bounded list of privileged, package, power, permission, mount,
   and system-control patterns in task text;
 - selected-workspace resolution;
@@ -166,7 +183,7 @@ These controls establish the TASK-0004 authorization boundary, TASK-0005
 run-coordination boundary, TASK-0006 provider-identity boundary, TASK-0007
 Codex process/protocol boundary, TASK-0008 Ollama transport/workspace-tool
 boundary, TASK-0009 agent-registry boundary, and TASK-0010 routing/queue
-boundary. They do not establish
+boundary, plus the TASK-0011 structured-review boundary. They do not establish
 production readiness or the later live provider/platform guarantees.
 
 ## Known current gaps
@@ -225,14 +242,16 @@ workspace tools fail closed outside Linux.
 
 ### Verification coverage
 
-The checked-in non-live suite contains 41 frontend tests and 105 Rust tests. It
+The checked-in non-live suite contains 41 frontend tests and 120 Rust tests. It
 covers frontend characterization plus backend policy, authorization, run
 coordination/recovery/bounds, provider identity/fake-adapter dispatch, Codex
 compatibility/command/protocol/descendant-process cases, strict IPC,
 CSP/capability, Ollama fake-server transport/discovery/cancellation, safe
 workspace operations, agent CRUD/reopen/template/lifecycle/hierarchy behavior,
 routing eligibility/scoring/overflow evidence, global queue ordering/head
-admission/restart/recovery, persistence validation, migration, corruption,
+admission/restart/recovery, strict bound review protocols, exact reporting-chain
+selection, revision/attempt caps, human fallback, review cancellation/restart,
+schema-v5 review migration, persistence validation, migration, corruption,
 concurrency, and rollback
 cases. These checks do not establish end-to-end,
 packaging, upgrade, or live acceptance. Rust advisory status remains
@@ -243,7 +262,8 @@ indeterminate when <code>cargo-audit</code> is unavailable.
 The agent-registry and task-orchestration subsets of invariant 1, the
 approval/action subset of invariants 2 through 5, the typed-routing-input
 subset of invariant 2, the queue/coordinator subset
-of invariant 6, the Ollama workspace subset of invariant 7, and the
+of invariant 6, the structured-review binding and recovery subsets of
+invariants 2, 3, 6, and 9, the Ollama workspace subset of invariant 7, and the
 provider-identity/no-substitution plus Codex/Ollama adapter subsets of invariant
 8 are implemented for the current command surface. The full integrated
 invariants remain the release target:
@@ -325,6 +345,11 @@ least-privilege workarounds before any code change.
   outcome requiring review.
 - Abort and await an active Ollama request before reporting cancellation or
   timeout; never detach the request worker from the authoritative run.
+- Retry a review stage only when interruption occurred before dispatch; require
+  human adjudication after uncertain dispatch, missing exact reviewer state,
+  exhausted stage attempts, the revision cap, or ambiguous legacy binding.
+- Never infer or replay a review verdict from provider prose, renderer state,
+  task phase, or a prior request fingerprint.
 - Never infer success from a missing process or UI state.
 - Preserve approval records and workspace evidence needed for audit while
   applying explicit retention and redaction rules.

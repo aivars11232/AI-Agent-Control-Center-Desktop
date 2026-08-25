@@ -6,6 +6,7 @@ mod ollama_runtime;
 mod persistence;
 mod policy;
 mod provider_runtime;
+mod review_orchestration;
 mod run_coordinator;
 mod task_orchestration;
 mod workspace_tools;
@@ -43,6 +44,10 @@ use provider_runtime::{
     ProviderRunEvent, ProviderRunEvidence, ProviderRunMode, ProviderRunObserver,
     ProviderRunRequest, ProviderRunResult, ProviderRunUsage, ProviderRuntimeModel,
     ProviderRuntimeStatus, RuntimeProviderId,
+};
+use review_orchestration::{
+    review_prompt, HumanReviewDecisionRequest, ReviewIntentContext, ReviewOrchestrationSnapshot,
+    ReviewStageStart, StartReviewStageRequest,
 };
 use run_coordinator::{
     bound_diff, bound_paths, validate_request_id, BoundedText, RunAttemptProjection,
@@ -141,6 +146,8 @@ struct AgentRunRequest {
     task_owner_agent_id: i64,
     task_id: i64,
     run_mode: String,
+    #[serde(default)]
+    review_context: Option<ReviewIntentContext>,
 }
 
 #[derive(Deserialize)]
@@ -641,7 +648,7 @@ fn agent_prompt(request: &ProviderRunRequest, local_ollama: bool) -> String {
         .filter(|feedback| !feedback.trim().is_empty())
         .map(|feedback| {
             format!(
-                "\n\nSenior review feedback that must be addressed in this run:\n{}",
+                "\n\nReview feedback that must be addressed in this run:\n{}",
                 feedback.trim()
             )
         })
@@ -733,7 +740,7 @@ fn validate_run_safety(request: &ProviderRunRequest) -> Result<(), String> {
             || request.destructive_actions_approved
         {
             return Err(
-        "Senior reviews must use read-only files, no terminal, and no elevated authorization."
+        "Structured reviews must use read-only files, no terminal, and no elevated authorization."
           .to_string(),
       );
         }
@@ -823,6 +830,7 @@ fn run_action_intent(request: &AgentRunRequest) -> Result<ActionIntent, String> 
         task_owner_agent_id: request.task_owner_agent_id,
         task_id: request.task_id,
         run_mode,
+        review_context: request.review_context.clone(),
     })
 }
 
@@ -830,6 +838,7 @@ fn build_authorized_agent_run(
     request: AgentRunRequest,
     state: &ApplicationState,
     grant: &AuthorizationGrant,
+    review_request_json: Option<&str>,
 ) -> Result<ProviderRunRequest, String> {
     let run_mode = match request.run_mode.as_str() {
         "execute" => RunMode::Execute,
@@ -944,23 +953,16 @@ fn build_authorized_agent_run(
         .as_ref()
         .map(|approval| approval.scopes.clone())
         .unwrap_or_default();
-    let specialist_output = task.result.as_deref().unwrap_or("No summary returned.");
-    let changed_files = if task.changed_files.is_empty() {
-        "none".to_string()
+    let bound_review_prompt = if run_mode == RunMode::Review {
+        Some(
+            review_prompt(review_request_json.ok_or_else(|| {
+                "The admitted review run has no authoritative review request.".to_string()
+            })?)
+            .map_err(|error| error.to_string())?,
+        )
     } else {
-        task.changed_files.join(", ")
+        None
     };
-    let diff_evidence = task.diff.as_deref().map_or_else(
-        || {
-            "No Git working-tree diff is available. Inspect the relevant workspace files directly."
-                .to_string()
-        },
-        |diff| format!("Working-tree diff:\n{diff}"),
-    );
-    let review_prompt = format!(
-        "Perform an independent, read-only senior review of task {}.\n\nOriginal task: {}\n\nSpecialist summary:\n{}\n\nReported changed files: {}\n\n{}\n\nCheck correctness, completeness, regressions, safety, and whether the requested result was actually verified. Do not modify files or run commands. End with exactly one verdict line: VERDICT: APPROVED or VERDICT: CHANGES REQUESTED.",
-        task.id, task.title, specialist_output, changed_files, diff_evidence
-    );
     let execution = ProviderRunRequest {
         run_mode: match run_mode {
             RunMode::Execute => ProviderRunMode::Execute,
@@ -979,7 +981,7 @@ fn build_authorized_agent_run(
             None
         },
         task_title: if run_mode == RunMode::Review {
-            review_prompt
+            bound_review_prompt.expect("review mode always builds a bound prompt")
         } else {
             task.title.clone()
         },
@@ -3202,6 +3204,53 @@ async fn task_orchestration_snapshot(
 }
 
 #[tauri::command]
+async fn review_orchestration_snapshot(
+    state: State<'_, PersistenceService>,
+) -> Result<ReviewOrchestrationSnapshot, PersistenceError> {
+    state.inner().review_orchestration_snapshot().await
+}
+
+#[tauri::command]
+async fn start_review_stage(
+    state: State<'_, PersistenceService>,
+    request: StartReviewStageRequest,
+) -> Result<ReviewStageStart, PersistenceError> {
+    let providers = provider_registry_status().await;
+    state.inner().start_review_stage(request, providers).await
+}
+
+#[tauri::command]
+async fn record_human_review_decision(
+    state: State<'_, PersistenceService>,
+    request: HumanReviewDecisionRequest,
+) -> Result<ReviewOrchestrationSnapshot, PersistenceError> {
+    let confirmation = state
+        .inner()
+        .human_review_confirmation(request.clone())
+        .await?;
+    let confirmed = tauri::async_runtime::spawn_blocking(move || {
+        request_native_confirmation(&confirmation.title, &confirmation.message)
+    })
+    .await
+    .map_err(|_| {
+        PersistenceError::new(
+            "NATIVE_CONFIRMATION_UNAVAILABLE",
+            "The trusted human-review confirmation worker stopped unexpectedly.",
+            false,
+        )
+    })?
+    .map_err(|message| PersistenceError::new("NATIVE_CONFIRMATION_UNAVAILABLE", message, true))?;
+    if !confirmed {
+        return Err(PersistenceError::new(
+            "NATIVE_CONFIRMATION_DENIED",
+            "The human review decision was not confirmed.",
+            true,
+        ));
+    }
+    state.inner().record_human_review_decision(request).await
+}
+
+#[tauri::command]
 async fn request_authorization(
     state: State<'_, PersistenceService>,
     intent: ActionIntent,
@@ -3385,8 +3434,12 @@ async fn run_agent_task(
     let grant = admission
         .authorization
         .unwrap_or_else(AuthorizationGrant::policy_allowed);
-    let authorized = match build_authorized_agent_run(request, &admission.application_state, &grant)
-    {
+    let authorized = match build_authorized_agent_run(
+        request,
+        &admission.application_state,
+        &grant,
+        admission.review_request_json.as_deref(),
+    ) {
         Ok(authorized) => authorized,
         Err(error) => {
             let completion = RunCompletion::terminal_error(
@@ -3673,6 +3726,9 @@ pub fn run() {
             reroute_task,
             set_task_queue_disposition,
             task_orchestration_snapshot,
+            review_orchestration_snapshot,
+            start_review_stage,
+            record_human_review_decision,
             request_authorization,
             resolve_approval,
             codex_runtime_status,
@@ -3997,7 +4053,8 @@ mod tests {
                 agent_id: 2,
                 task_owner_agent_id: 2,
                 task_id: 41,
-                run_mode: RunMode::Execute
+                run_mode: RunMode::Execute,
+                review_context: None
             }
         ));
         assert!(
@@ -4172,6 +4229,9 @@ mod tests {
             model: Some("fake-model".to_string()),
             workspace_id: Some("fixture-workspace".to_string()),
             approval_id: None,
+            review_flow_id: None,
+            review_stage_attempt_id: None,
+            review_revision_round: None,
             admitted_at_unix_ms: 1,
             started_at_unix_ms,
             cancel_requested_at_unix_ms: None,
@@ -4274,7 +4334,7 @@ mod tests {
         request.file_access = "write".to_string();
         assert_safety_error(
             &request,
-            "Senior reviews must use read-only files, no terminal, and no elevated authorization.",
+            "Structured reviews must use read-only files, no terminal, and no elevated authorization.",
         );
     }
 

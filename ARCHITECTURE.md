@@ -34,9 +34,10 @@ The binding decision record is
       |-- provider availability/model projection (src/providerRegistry.ts)
       |-- dynamic agent/group/hierarchy projection (src/agentRegistry.ts)
       |-- task queue/routing evidence projection (src/taskOrchestration.ts)
+      |-- structured review-flow projection (src/reviewOrchestration.ts)
       |-- run snapshot/event projection (src/runCoordinator.ts)
       |-- browser-preview localStorage (non-authoritative compatibility only)
-      |-- renderer presentation: reviewer selection and task view state
+      |-- renderer presentation: review controls and task view state
       |
       | Tauri invoke/events
       v
@@ -44,6 +45,7 @@ The binding decision record is
       |-- application state validation + SQLite repository/migrations
       |-- authoritative agent registry/hierarchy (agent_registry.rs)
       |-- authoritative task routing/queue contract (task_orchestration.rs)
+      |-- authoritative review protocol/pipeline (review_orchestration.rs)
       |-- capability policy + authoritative one-use approvals
       |-- authoritative single-run coordinator + durable bounded ledger
       |-- provider registry/common contract (provider_runtime.rs)
@@ -71,14 +73,16 @@ compatibility path. <code>src/runCoordinator.ts</code> projects ordered backend
 snapshots/events, discards stale or cross-attempt events, and holds only
 transient progress/stop presentation state. <code>src/providerRegistry.ts</code>
 projects the common backend registry into truthful provider status and
-fail-closed model eligibility for assignment, defaults, routing, and review;
+fail-closed model eligibility for assignment, defaults, and routing;
 it is presentation and preflight logic, not the dispatch authority.
 <code>src/agentRegistry.ts</code> projects active agents, dynamic category
 groups, ancestor context, repair rows, role-derived authority, compatible
 manager choices, and stable template identities. It does not authorize or
 persist registry mutations. <code>src/taskOrchestration.ts</code> projects the
 backend queue snapshot, positions, states, and routing evidence; it does not
-score candidates or decide admission.
+score candidates or decide admission. <code>src/reviewOrchestration.ts</code>
+projects backend flow/stage history and human-fallback status; it does not pick
+reviewers, parse provider verdicts, or decide transitions.
 
 ### Rust backend
 
@@ -88,6 +92,7 @@ diff/change capture, desktop actions, and voice process management. It
 also composes <code>app_state.rs</code>, <code>policy.rs</code>,
 <code>agent_registry.rs</code>,
 <code>task_orchestration.rs</code>,
+<code>review_orchestration.rs</code>,
 <code>authorization.rs</code>, <code>run_coordinator.rs</code>,
 <code>provider_runtime.rs</code>, <code>codex_runtime.rs</code>,
 <code>ollama_runtime.rs</code>, <code>workspace_tools.rs</code>, and
@@ -98,7 +103,8 @@ and evidence bounds, provider identity/contracts/dispatch, isolated Codex
 compatibility/process/protocol handling, bounded fixed-loopback Ollama
 transport/discovery, descriptor-confined conflict-safe workspace edits,
 validated agent identity/lifecycle/hierarchy operations, deterministic routing
-and queue evidence, SQLite
+and queue evidence, structured reporting-chain review and verdict validation,
+SQLite
 schema/repository, legacy migration, and typed state IPC. The provider registry
 exposes only Codex and Ollama adapters and rejects provider/model mismatch
 without fallback. Non-run
@@ -109,8 +115,8 @@ provider startup.
 ### Persistence and migration
 
 The desktop database is <code>application-state.sqlite3</code> below Tauri's
-platform application-data directory. Migrations 0001 through 0005 establish
-schema version 5 plus a migration ledger. Repository writes replace one
+platform application-data directory. Migrations 0001 through 0006 establish
+schema version 6 plus a migration ledger. Repository writes replace one
 validated aggregate inside an immediate transaction and use a monotonically
 increasing revision to reject stale writers. Startup refuses corrupt or
 unsupported newer databases and retains the typed error for the renderer
@@ -159,6 +165,15 @@ inputs or the assigned executor; or forge queue, lifecycle, or routing
 evidence. Queue order is global and deterministic by priority, enqueue
 sequence, owner ID, and task ID.
 
+Schema v6 adds normalized review flows and stage-attempt history, one active
+flow per task, explicit revision rounds, exact request fingerprints, and review
+bindings on run attempts. Backend policy binds review admission to the current
+flow, stage, level, round, reviewer, and request fingerprint. Terminal stage
+records are immutable; generic aggregate saves preserve normalized review
+state. Migration treats legacy unbound in-flight review as human-required, and
+startup reconciliation retries only a provably pre-dispatch stage without
+automatically invoking a provider.
+
 ### Voice runtime
 
 <code>voice-runtime/listener.py</code> is a bundled local Python listener. Setup
@@ -187,8 +202,9 @@ behavior were not exercised in TASK-0001.
 2. Execute tasks enter one durable global queue. The backend snapshot orders
    them by priority, enqueue sequence, owner ID, and task ID; held tasks retain
    their queue age, while a terminal task reset receives a new sequence.
-3. The renderer sends a typed run intent containing only the run locator,
-   agent, task owner, task, and run mode.
+3. The renderer sends a typed run intent containing the run locator, agent,
+   task owner, task, and run mode. A review intent additionally echoes the
+   backend-issued flow, stage, round, level, and request fingerprint.
 4. For execute mode, the backend admits only the current queue head and
    atomically acquires the shared single-run slot. Review bypasses execute-queue
    order but uses the same run coordinator. Invalid, busy, non-head, or
@@ -213,10 +229,24 @@ behavior were not exercised in TASK-0001.
    paginated/read/hash/create/patch workspace operations.
 9. The backend persists bounded ordered events, cancellation state, terminal
    outcome, output summary, usage, and workspace evidence. Terminal attempts
-   cannot be updated.
-10. The renderer displays authoritative queue/run snapshots, routing evidence,
-    and a global Stop control across navigation; generic state saves cannot
-    overwrite run-owned task fields.
+   cannot be updated. A successful execution starts or resumes one normalized
+   review flow when review is required.
+10. The next stage is derived from the executor role and walks the exact active
+    reporting chain sequentially: Senior, Team Leader, and Supervisor as
+    applicable. Missing, repeated, inactive, or provider-unready identities
+    move the flow to explicit human review without substitution.
+11. Each agent stage receives one versioned, fingerprinted, bounded evidence
+    request under read-only policy. Only one exact structured result with all
+    required checks and matching identifiers can transition the flow; provider
+    prose and embedded workspace evidence remain untrusted data.
+12. Approval advances to the next level or completes the task. Requested
+    changes enqueue a fresh policy-evaluated execution, capped at three
+    revisions. Three invalid/failed stage attempts, an uncertain dispatch, the
+    revision cap, or a Supervisor executor requires a natively confirmed human
+    decision.
+13. The renderer displays authoritative queue/run/review snapshots, routing
+    evidence, and a global Stop control across navigation; generic state saves
+    cannot overwrite run- or review-owned task fields.
 
 ## Directional architecture
 
@@ -248,6 +278,9 @@ state.
 - **Task orchestrator** — deterministic hard eligibility, scoring, workload and
   overflow decisions, durable global execute-queue ordering, and backend queue
   admission. This boundary is implemented by TASK-0010.
+- **Review orchestrator** — versioned evidence/result protocol, exact sequential
+  reporting-chain stages, bounded revision/retry state, human gates, and
+  restart reconciliation. This boundary is implemented by TASK-0011.
 - **Run coordinator** — one active run, atomic admission,
   lifecycle transitions, cancellation, timeout, recovery, and a durable
   bounded ledger. This boundary is implemented by TASK-0005; later tasks may
@@ -282,7 +315,7 @@ task must choose the smallest structure supported by the code at that time.
 | Tasks and results | Backend SQLite aggregate plus authoritative task creation/rerouting/queue state and run-ledger-owned lifecycle/results | Backend domain store and run ledger |
 | Approval records | Backend SQLite; backend-issued rows are authoritative and imported rows are expired history | Backend policy/approval store |
 | Approval match/consume | Backend exact-match transaction | Backend exact-match transaction |
-| Routing and review | Backend owns routing and execute-queue admission; renderer still chooses reviewer candidates for the prototype review flow | Backend scheduler/orchestrator |
+| Routing and review | Backend owns routing, execute-queue admission, exact reviewer selection, structured stage transitions, revisions, human fallback, and recovery; renderer projects state and requests commands | Backend scheduler/orchestrator |
 | Active run | Backend system-wide coordinator and SQLite ledger; only live cancellation handles are in memory | Backend system-wide coordinator |
 | Provider/model truth | Backend registry and exact active-provider/catalog-model resolution; renderer projects availability | Backend provider registry |
 | Workspace evidence | Backend bounded evidence persisted per attempt | Backend durable evidence record |
@@ -298,10 +331,11 @@ task must choose the smallest structure supported by the code at that time.
             └── Senior Agent
                   └── Specialist
 
-Specialists perform bounded work. Senior agents review specialist results.
-Team leaders coordinate workload and escalation. The supervisor owns final
-cross-team coordination. Titles alone grant no filesystem, terminal, network,
-or system authority; capability and policy records do.
+Specialists perform bounded work. The implemented review pipeline traverses the
+executor's exact reporting chain through Senior, Team Leader, and Supervisor as
+applicable; Supervisor execution requires a human gate. Titles alone grant no
+filesystem, terminal, network, or system authority; capability and policy
+records do.
 
 The planned system-wide execution flow is sequential:
 
@@ -337,7 +371,8 @@ TASK-0006 establishes provider identity and the common contract; TASK-0007
 hardens the Codex adapter and TASK-0008 hardens the Ollama adapter.
 TASK-0009 establishes the dynamic agent registry and valid hierarchy;
 TASK-0010 establishes deterministic routing and sequential queueing; TASK-0011
-and TASK-0012 establish the remaining review/evidence orchestration. TASK-0013
+establishes structured review/revision/recovery, and TASK-0012 completes
+workspace evidence orchestration. TASK-0013
 and TASK-0014 modularize UI/data lifecycle. TASK-0015 and TASK-0016 own system actions and
 KDE/voice integration. TASK-0017 through TASK-0020 complete bounded roles,
 packaging, acceptance, and release.

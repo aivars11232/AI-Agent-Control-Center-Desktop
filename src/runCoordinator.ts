@@ -49,6 +49,9 @@ export type RunAttempt = {
   model: string | null;
   workspaceId: string | null;
   approvalId: number | null;
+  reviewFlowId: number | null;
+  reviewStageAttemptId: number | null;
+  reviewRevisionRound: number | null;
   admittedAtUnixMs: number;
   startedAtUnixMs: number | null;
   cancelRequestedAtUnixMs: number | null;
@@ -177,4 +180,3 @@ export function hasVisibleTruncation(attempt: RunAttempt): boolean {
     evidence.afterSnapshotTruncated
   );
 }
-

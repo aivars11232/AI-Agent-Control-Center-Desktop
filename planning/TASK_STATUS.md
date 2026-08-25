@@ -31,8 +31,8 @@ ready merely because its predecessor's code was edited.
 | TASK-0007 | TASK-0006 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Codex runtime isolation, cancellation, and evidence hardening |
 | TASK-0008 | TASK-0007 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Ollama discovery, transport, cancellation, and safe workspace tools |
 | TASK-0009 | TASK-0008 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Dynamic agent registry and valid organizational hierarchy |
-| TASK-0010 | TASK-0009 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Deterministic routing, queueing, workload, and sequential scheduling |
-| TASK-0011 | TASK-0010 | NOT STARTED | NO | NOT STARTED | — | — | Structured multi-level review, revisions, and recovery |
+| TASK-0010 | TASK-0009 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Deterministic routing, queueing, workload, and sequential scheduling |
+| TASK-0011 | TASK-0010 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Structured multi-level review, revisions, and recovery |
 | TASK-0012 | TASK-0011 | NOT STARTED | NO | NOT STARTED | — | — | Complete workspace change evidence and Git/non-Git inspection |
 | TASK-0013 | TASK-0012 | NOT STARTED | NO | NOT STARTED | — | — | Frontend modularization, accessibility, and responsive operation |
 | TASK-0014 | TASK-0013 | NOT STARTED | NO | NOT STARTED | — | — | Data lifecycle, strict backup, retention, and truthful monitoring |
@@ -570,10 +570,117 @@ ready merely because its predecessor's code was edited.
   existing private SQLite store; stale writes and invalid queue transitions
   fail closed; migration and allocator updates are atomic; restart preserves
   queue order/evidence and reconciles pre- versus post-dispatch failures
-- Remaining limits: TASK-0011 owns structured multi-level review/revision;
-  TASK-0012 owns complete workspace evidence; TASK-0014 owns strict future
-  backup/lifecycle UX; live and packaged-platform acceptance remain with
-  TASK-0020
+- Remaining limits at TASK-0010 closure: TASK-0011 owned structured multi-level
+  review/revision; TASK-0012 owns complete workspace evidence; TASK-0014 owns
+  strict future backup/lifecycle UX; live and packaged-platform acceptance
+  remain with TASK-0020
+- Git closure: implementation commit
+  <code>080c5883ac88ae58093fc8e1580ab21b0d413ac0</code>
+  (<code>task10</code>) was identified from actual Git history and was the
+  checked-out <code>main</code> HEAD at the TASK-0011 preflight. It was reachable
+  from <code>origin/main</code>; checked-out <code>main</code> and
+  <code>origin/main</code> resolved to that commit with zero ahead/behind and a
+  clean working tree. Its actual 20-file scope matched the retained TASK-0010
+  report with no unexplained intervening state, so all seven
+  successor-preflight closure conditions passed.
+
+## TASK-0011 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>080c5883ac88ae58093fc8e1580ab21b0d413ac0</code>
+  (<code>task10</code>)
+- Starting status: clean; <code>main</code> matched <code>origin/main</code> with
+  zero ahead/behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0010 as
+  recorded above; its implementation commit, origin reachability, branch
+  alignment, clean tree, and actual scope were verified rather than inferred
+  from the stale tracker label
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0011 AS PLANNED.</code>
+- Added versioned <code>ReviewRequestV1</code>/<code>ReviewResultV1</code>
+  contracts and a strict duplicate-key-free JSON parser. Results bind the exact
+  flow, task, execution, round, level, stage, request fingerprint, and bounded
+  evidence, and must report requirements, correctness, verification, security,
+  and scope exactly once
+- Removed substring verdict authority: Markdown fences, trailing content,
+  unknown fields/evidence, duplicate keys, stale identifiers, missing/both
+  verdicts, incomplete evidence, failure checks, issues, and feedback cannot
+  produce agent approval
+- Added schema version 6 and migration 0006 for one normalized active review
+  flow per task, immutable terminal stage-attempt history, explicit rounds,
+  run/stage bindings, request fingerprints, and a review-specific revision.
+  Ambiguous schema-v5 in-flight review migrates conservatively to trusted human
+  review and startup never automatically dispatches a provider
+- Added backend-only sequential role pipelines: Specialist → Senior → Team
+  Leader → Supervisor; Senior → Team Leader → Supervisor; Team Leader →
+  Supervisor; and Supervisor → human. Each agent stage uses the exact active
+  reporting-chain identity, requires a distinct active/unpaused read-capable
+  reviewer with an exact ready provider/model, and never substitutes another
+  agent
+- Bound review authorization and admission under
+  <code>policy-v4</code>/<code>intent-v2</code> to the current flow, stage,
+  round, level, reviewer, request fingerprint, and provider/model decision.
+  Review remains read-only with no terminal, elevated, approval-granting, or
+  workspace-write authority
+- Added sequential manual/automatic renderer flow, authoritative review
+  projection/history, reporting-chain and revision status, exact pending-stage
+  resume, and explicit human controls. The renderer no longer selects or scores
+  reviewers or parses provider prose for verdict labels
+- Requested changes allocate a fresh execute-queue sequence and re-evaluate
+  current policy/approval state. Revision execution is capped at three; each
+  agent stage is capped at three attempts. Exhaustion, unavailable exact
+  reviewers, uncertain dispatch, or ambiguous recovery moves to human review;
+  a fourth revision is never queued
+- Human decisions use the existing native <code>/usr/bin/kdialog
+  --warningyesno</code> trust boundary, name the exact task/flow/round/verdict,
+  recheck the current review revision, and fail closed when unavailable,
+  denied, stale, or malformed. Tests never invoked KDialog
+- Safe pre-dispatch review cancellation/restart records an interrupted attempt
+  and returns to the exact pending stage without provider dispatch. Uncertain
+  post-dispatch cancellation/restart requires human adjudication; stale stage
+  contexts and prior approvals cannot replay
+- No dependency, package-lock, Cargo manifest/lock, provider adapter, workspace
+  tool, voice, platform integration, installer, backup-format, or release
+  version change was required
+- Focused verification passed on 2026-08-25: 15 TASK-0011 Rust tests cover
+  strict schemas, malicious/colliding output, role chains, schema-v5 migration,
+  exact sequential completion, changes/requeue, invalid output, cancellation,
+  reviewer unavailability, revision cap, human adjudication, active-flow
+  evidence retention, and restart;
+  2 renderer review-projection tests and all 41 frontend tests passed;
+  TypeScript and rustfmt passed
+- Complete fast gate: <code>npm run verify:fast</code> passed with 8 frontend
+  files/41 tests and 120 locked/offline Rust tests
+- Full non-live gate: <code>npm run verify:full</code> passed on 2026-08-25 with
+  8 frontend files/41 tests, TypeScript, rustfmt, 120 locked/offline Rust tests,
+  a 42-module production build, Clippy with warnings denied,
+  shell/Python/strict-JSON checks, npm/Cargo dependency trees, and production
+  plus full npm audits reporting zero vulnerabilities
+- Rust advisory result: **indeterminate** because <code>cargo-audit</code> is
+  unavailable; the full route records the skip explicitly and this
+  environmental limitation is not a pass
+- Live Codex/Ollama generation, provider authentication, microphone/listener,
+  portal, native KDialog, install/remove, desktop package, and
+  desktop/system-control actions: not run
+- Security/privacy and migration effects: renderer/provider/model/workspace
+  strings remain untrusted evidence; normalized review records and bounded
+  output stay in the existing private SQLite database; logical backend checks
+  bind flows to aggregate agent/task state so whole-state save replacement
+  cannot erase or forge review authority; stale, corrupt, ambiguous, or
+  unsupported state fails closed
+- Minor in-scope implementation detail: review tables deliberately avoid
+  foreign-key ownership by aggregate agent/task rows because compatible generic
+  saves delete and reinsert those parents. Dedicated transactions validate the
+  exact identities and preserve normalized review rows; stable run-attempt
+  evidence retains its database foreign key
+- Remaining limits: TASK-0012 owns complete Git/non-Git workspace evidence;
+  TASK-0013 owns broad frontend modularization/accessibility; TASK-0014 owns the
+  strict future backup/lifecycle UX; live native dialog/provider and packaged
+  platform acceptance remain with TASK-0020
 - Git closure: **PENDING USER** review, commit, push, and clean-tree evidence
 
 ## Successor-preflight closure rule
