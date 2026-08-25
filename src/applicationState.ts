@@ -3,6 +3,7 @@ import type {
   RoutingEvidence,
   TaskQueueState,
 } from "./taskOrchestration";
+import type { WorkspaceChangeEvidence } from "./workspaceEvidence";
 
 export type VoiceState = "VOICE_OFF" | "VOICE_PASSIVE" | "VOICE_ACTIVE";
 export type AccessLevel = "none" | "read" | "write" | "full";
@@ -143,6 +144,7 @@ export type AgentTask = {
   workspaceId: string | null;
   changedFiles: string[];
   diff: string | null;
+  workspaceChanges: WorkspaceChangeEvidence | null;
   durationSeconds: number | null;
   routingMode: RoutingMode;
   routedFromAgentId: number | null;

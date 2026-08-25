@@ -32,8 +32,8 @@ ready merely because its predecessor's code was edited.
 | TASK-0008 | TASK-0007 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Ollama discovery, transport, cancellation, and safe workspace tools |
 | TASK-0009 | TASK-0008 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Dynamic agent registry and valid organizational hierarchy |
 | TASK-0010 | TASK-0009 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Deterministic routing, queueing, workload, and sequential scheduling |
-| TASK-0011 | TASK-0010 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Structured multi-level review, revisions, and recovery |
-| TASK-0012 | TASK-0011 | NOT STARTED | NO | NOT STARTED | — | — | Complete workspace change evidence and Git/non-Git inspection |
+| TASK-0011 | TASK-0010 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Structured multi-level review, revisions, and recovery |
+| TASK-0012 | TASK-0011 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Complete workspace change evidence and Git/non-Git inspection |
 | TASK-0013 | TASK-0012 | NOT STARTED | NO | NOT STARTED | — | — | Frontend modularization, accessibility, and responsive operation |
 | TASK-0014 | TASK-0013 | NOT STARTED | NO | NOT STARTED | — | — | Data lifecycle, strict backup, retention, and truthful monitoring |
 | TASK-0015 | TASK-0014 | NOT STARTED | NO | NOT STARTED | — | — | Unified voice intent and system-action policy gateway |
@@ -681,6 +681,102 @@ ready merely because its predecessor's code was edited.
   TASK-0013 owns broad frontend modularization/accessibility; TASK-0014 owns the
   strict future backup/lifecycle UX; live native dialog/provider and packaged
   platform acceptance remain with TASK-0020
+- Git closure: implementation commit
+  <code>e6b7547f7ee6a2e586b91bce5ab817783e4b7e1b</code>
+  (<code>task11</code>) was identified from actual Git history and was the
+  checked-out <code>main</code> HEAD at the TASK-0012 preflight. It was reachable
+  from <code>origin/main</code>; checked-out <code>main</code> and
+  <code>origin/main</code> resolved to that commit with zero ahead/behind and a
+  clean working tree. Its actual 19-file scope matched the retained TASK-0011
+  report with no unexplained intervening state, so all seven
+  successor-preflight closure conditions passed.
+
+## TASK-0012 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>e6b7547f7ee6a2e586b91bce5ab817783e4b7e1b</code>
+  (<code>task11</code>)
+- Starting status: clean; <code>main</code> matched <code>origin/main</code> with
+  zero ahead/behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0011 as
+  recorded above; its exact implementation commit, origin reachability, branch
+  alignment, clean tree, and 19-file actual scope were freshly verified
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0012 AS PLANNED.</code>
+- Added versioned <code>WorkspaceChangeEvidenceV1</code> with explicit Git,
+  filesystem, not-collected, and unavailable modes; complete/partial status;
+  agent/human/unavailable reviewability; before/after file and Git state;
+  change/detail/issue records; exact summary counts; and persisted collection
+  limits
+- Added descriptor-confined full-root before/after capture around every execute
+  provider result, including failure/cancellation/timeout paths.
+  <code>.git</code> metadata directories are the sole unconditional name
+  exclusion; symlinks and special files are recorded without being followed;
+  non-Git unique hash/size pairs identify unambiguous renames
+- Added hardened direct Git porcelain-v2, staged-diff, and unstaged-diff
+  inspection with bounded output/time and disabled optional locks, lazy fetch,
+  pagers, hooks, fsmonitor, external diff/textconv, and configured filter
+  helpers. Unusable or changing Git state is explicit rather than silently
+  accepted; a changed Git HEAD is recorded and requires human inspection
+- Added bounded hashes and text details, detected-secret redaction, sensitive
+  path hash/content omission, binary metadata-only records, and explicit
+  entry/time/hash/path/detail/status/issue truncation. Any incomplete,
+  sensitive, binary, conflicted, unsupported, or inconsistent record requires
+  human review
+- Added schema version 7 and migration 0007 for checked workspace-evidence JSON
+  on run attempts and task aggregates. Terminal completion validates, counts,
+  and writes the same record transactionally; legacy nulls project explicit
+  unavailable evidence; terminal triggers and generic-save field preservation
+  prevent renderer forgery or post-completion mutation
+- Bound structured workspace evidence into review requests. Agent approval now
+  requires a complete matching record and matching redacted compatibility
+  paths/diff; older requests still parse for history but cannot produce agent
+  approval without structured evidence
+- Added task, dashboard, agent-activity, and global activity views sourced from
+  the authoritative run/task ledger. Deleted, missing, symlink, and special
+  final states are visibly not openable; the existing backend open command
+  still revalidates the selected workspace and final path
+- Preserved exact provider dispatch, one global run, queue/review behavior,
+  legacy redacted flat changed-file/diff projections, non-authoritative browser
+  preview compatibility, and current version <code>0.5.1</code>. No dependency,
+  package-lock, Cargo manifest/lock, provider protocol, authorization policy,
+  voice, KDE/Wayland, installer, backup format, or release-version change was
+  required
+- Focused verification passed on 2026-08-25: 8 Git/non-Git collector tests;
+  2 structured persistence/review tests; 6 renderer workspace/run projection
+  tests; TypeScript; and the complete 130-test Rust suite across the focused
+  runs
+- Complete fast gate: <code>npm run verify:fast</code> passed with 9 frontend
+  files/44 tests, TypeScript, rustfmt, and 130 locked/offline Rust tests
+- Full non-live gate: <code>npm run verify:full</code> passed on 2026-08-25 with
+  the same fast checks, a 43-module production build, Clippy with warnings
+  denied, shell/Python/strict-JSON checks, npm/Cargo dependency trees, and
+  production plus full npm audits reporting zero vulnerabilities
+- Rust advisory result: **indeterminate** because <code>cargo-audit</code> is
+  unavailable; the full route recorded the skip explicitly and this
+  environmental limitation is not a pass
+- Live Codex/Ollama generation, provider authentication, microphone/listener,
+  portal, native KDialog, install/remove, desktop package, and
+  desktop/system-control actions: not run
+- Security/privacy and recovery effects: workspace content and Git state remain
+  sensitive untrusted input; collection is bounded and fail-closed for review;
+  secrets and binary bodies are not deliberately persisted; evidence is
+  retained in the existing private SQLite ledger and counted toward pruning;
+  provider failures and restart-loss cases retain explicit evidence status
+- Minor in-scope implementation details: structured evidence on provider errors
+  is boxed to preserve the existing compact error contract and satisfy the
+  warnings-denied Clippy gate; payload-size inputs are grouped without changing
+  counted fields; audit review additionally removed hashes after content-level
+  secret detection and made Git attribute-forced binary/HEAD changes human-only
+- Remaining limits: redaction is pattern-based and cannot guarantee discovery
+  of every secret; Git helpers are deliberately disabled rather than executed;
+  no automatic rollback or Git commit is created; live provider/platform and
+  packaged acceptance remain with TASK-0020; TASK-0013 owns frontend
+  modularization/accessibility and is not started
 - Git closure: **PENDING USER** review, commit, push, and clean-tree evidence
 
 ## Successor-preflight closure rule

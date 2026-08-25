@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{fmt, path::Path};
+use std::{fmt, path::Path, time::Instant};
 
 const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_LIST_LIMIT: usize = 200;
@@ -83,6 +83,37 @@ pub(crate) struct WorkspaceListResult {
     pub(crate) entries: Vec<WorkspaceListEntry>,
     pub(crate) next_cursor: Option<String>,
     pub(crate) truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceEvidenceListResult {
+    pub(crate) entries: Vec<WorkspaceEvidenceListEntry>,
+    pub(crate) truncated: bool,
+    pub(crate) timed_out: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct WorkspaceEvidenceListEntry {
+    pub(crate) path: String,
+    pub(crate) kind: String,
+    pub(crate) size_bytes: Option<u64>,
+    pub(crate) mode: u32,
+    pub(crate) modified_seconds: i64,
+    pub(crate) modified_nanos: u64,
+    pub(crate) changed_seconds: i64,
+    pub(crate) changed_nanos: u64,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceEvidenceFile {
+    pub(crate) size_bytes: u64,
+    pub(crate) sha256: String,
+    pub(crate) preview: Vec<u8>,
+    pub(crate) preview_truncated: bool,
+    pub(crate) binary: bool,
+    pub(crate) mode: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -216,6 +247,48 @@ impl WorkspaceTools {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (path, offset);
+            Err(platform_unsupported())
+        }
+    }
+
+    pub(crate) fn evidence_list(
+        &self,
+        path: &str,
+        limit: usize,
+        deadline: Instant,
+    ) -> Result<WorkspaceEvidenceListResult, WorkspaceToolError> {
+        validate_limit(limit, 1, 20_000, "evidence listing")?;
+        #[cfg(target_os = "linux")]
+        {
+            self.platform.evidence_list(path, limit, deadline)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (path, deadline);
+            Err(platform_unsupported())
+        }
+    }
+
+    pub(crate) fn evidence_file(
+        &self,
+        path: &str,
+        hash_limit: u64,
+        preview_limit: usize,
+        deadline: Instant,
+    ) -> Result<WorkspaceEvidenceFile, WorkspaceToolError> {
+        if hash_limit == 0 {
+            return Err(WorkspaceToolError::invalid(
+                "The evidence hash limit must be positive.",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.platform
+                .evidence_file(path, hash_limit, preview_limit, deadline)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (path, hash_limit, preview_limit, deadline);
             Err(platform_unsupported())
         }
     }
@@ -700,6 +773,82 @@ mod linux {
             })
         }
 
+        pub(super) fn evidence_list(
+            &self,
+            path: &str,
+            limit: usize,
+            deadline: Instant,
+        ) -> Result<WorkspaceEvidenceListResult, WorkspaceToolError> {
+            let relative = validated_relative_path(path, true)?;
+            let directory = secure_open(&self.root, &relative, DIRECTORY_FLAGS)?;
+            let mut reader = Dir::read_from(&directory).map_err(|error| {
+                WorkspaceToolError::io(format!("Could not read the workspace directory: {error}"))
+            })?;
+            let mut smallest = BinaryHeap::new();
+            let retained_capacity = limit.saturating_add(1);
+            let mut timed_out = false;
+            while let Some(entry) = reader.read() {
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    break;
+                }
+                let entry = entry.map_err(|error| {
+                    WorkspaceToolError::io(format!(
+                        "Could not continue reading the workspace directory: {error}"
+                    ))
+                })?;
+                let name = entry.file_name().to_str().map_err(|_| {
+                    WorkspaceToolError::unsupported(
+                        "The workspace directory contains a non-UTF-8 file name.",
+                    )
+                })?;
+                if matches!(name, "." | ".." | ".git") {
+                    continue;
+                }
+                let stat =
+                    statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
+                        WorkspaceToolError::io(format!(
+                            "Could not inspect workspace entry `{name}`: {error}"
+                        ))
+                    })?;
+                let file_type = FileType::from_raw_mode(stat.st_mode);
+                let (kind, size_bytes) = match file_type {
+                    FileType::Directory => ("directory", None),
+                    FileType::RegularFile => ("file", u64::try_from(stat.st_size).ok()),
+                    FileType::Symlink => ("blocked-symlink", None),
+                    _ => ("unsupported", None),
+                };
+                smallest.push((
+                    name.to_string(),
+                    WorkspaceEvidenceListEntry {
+                        path: join_display_path(&relative, name),
+                        kind: kind.to_string(),
+                        size_bytes,
+                        mode: stat.st_mode,
+                        modified_seconds: stat.st_mtime,
+                        modified_nanos: stat.st_mtime_nsec,
+                        changed_seconds: stat.st_ctime,
+                        changed_nanos: stat.st_ctime_nsec,
+                        device: stat.st_dev,
+                        inode: stat.st_ino,
+                    },
+                ));
+                if smallest.len() > retained_capacity {
+                    smallest.pop();
+                }
+            }
+            let mut entries = smallest.into_sorted_vec();
+            let over_limit = entries.len() > limit;
+            if over_limit {
+                entries.pop();
+            }
+            Ok(WorkspaceEvidenceListResult {
+                entries: entries.into_iter().map(|(_, entry)| entry).collect(),
+                truncated: over_limit || timed_out,
+                timed_out,
+            })
+        }
+
         pub(super) fn read(
             &self,
             path: &str,
@@ -747,6 +896,18 @@ mod linux {
                 next_offset,
                 truncated: offset > 0 || end < content.len(),
             })
+        }
+
+        pub(super) fn evidence_file(
+            &self,
+            path: &str,
+            hash_limit: u64,
+            preview_limit: usize,
+            deadline: Instant,
+        ) -> Result<WorkspaceEvidenceFile, WorkspaceToolError> {
+            let relative = validated_relative_path(path, false)?;
+            let fd = secure_open(&self.root, &relative, FILE_FLAGS)?;
+            read_evidence_fd(fd, hash_limit, preview_limit, deadline)
         }
 
         pub(super) fn create_file(
@@ -1089,6 +1250,80 @@ mod linux {
             sha256: sha256_hex(&bytes),
             bytes,
             stat: after,
+        })
+    }
+
+    fn read_evidence_fd(
+        fd: OwnedFd,
+        hash_limit: u64,
+        preview_limit: usize,
+        deadline: Instant,
+    ) -> Result<WorkspaceEvidenceFile, WorkspaceToolError> {
+        let before = fstat(&fd).map_err(|error| {
+            WorkspaceToolError::io(format!("Could not inspect the workspace file: {error}"))
+        })?;
+        if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile {
+            return Err(WorkspaceToolError::invalid(
+                "The requested workspace item is not a regular file.",
+            ));
+        }
+        let size_bytes = u64::try_from(before.st_size).map_err(|_| {
+            WorkspaceToolError::limit("The workspace file size cannot be represented safely.")
+        })?;
+        if size_bytes > hash_limit {
+            return Err(WorkspaceToolError::limit(format!(
+                "The workspace file exceeds the remaining {hash_limit}-byte evidence hash budget."
+            )));
+        }
+        let mut file = File::from(fd);
+        let mut hasher = Sha256::new();
+        let file_capacity = usize::try_from(size_bytes).unwrap_or(preview_limit);
+        let mut preview = Vec::with_capacity(preview_limit.min(file_capacity));
+        let mut buffer = [0_u8; 16 * 1024];
+        let mut total = 0_u64;
+        let mut contains_nul = false;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(WorkspaceToolError::limit(
+                    "The workspace evidence scan reached its time limit while hashing a file.",
+                ));
+            }
+            let read = file.read(&mut buffer).map_err(|error| {
+                WorkspaceToolError::io(format!("Could not read the workspace file: {error}"))
+            })?;
+            if read == 0 {
+                break;
+            }
+            total = total.saturating_add(read as u64);
+            if total > hash_limit {
+                return Err(WorkspaceToolError::limit(format!(
+                    "The workspace file grew beyond the remaining {hash_limit}-byte evidence hash budget."
+                )));
+            }
+            let bytes = &buffer[..read];
+            contains_nul |= bytes.contains(&0);
+            hasher.update(bytes);
+            let remaining = preview_limit.saturating_sub(preview.len());
+            preview.extend_from_slice(&bytes[..read.min(remaining)]);
+        }
+        let after = fstat(&file).map_err(|error| {
+            WorkspaceToolError::io(format!(
+                "Could not re-inspect the workspace file after hashing: {error}"
+            ))
+        })?;
+        if !same_snapshot(&before, &after) || total != size_bytes {
+            return Err(WorkspaceToolError::conflict(
+                "The workspace file changed while evidence was being collected.",
+            ));
+        }
+        let binary = contains_nul || std::str::from_utf8(&preview).is_err();
+        Ok(WorkspaceEvidenceFile {
+            size_bytes,
+            sha256: format!("{:x}", hasher.finalize()),
+            preview_truncated: total > preview.len() as u64,
+            preview,
+            binary,
+            mode: after.st_mode,
         })
     }
 

@@ -27,6 +27,7 @@ export function taskFixture(overrides: Partial<AgentTask> = {}): AgentTask {
     workspaceId: "workspace-1",
     changedFiles: [],
     diff: null,
+    workspaceChanges: null,
     durationSeconds: null,
     routingMode: "selected",
     routedFromAgentId: null,

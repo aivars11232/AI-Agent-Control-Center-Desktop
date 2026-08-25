@@ -75,7 +75,7 @@ final release evidence and release commit.
 | TASK-0009 | P1 | M3 | TASK-0008 | Dynamic agent registry and valid organizational hierarchy |
 | TASK-0010 | P1 | M3 | TASK-0009 | Deterministic routing, queueing, workload, and sequential scheduling |
 | TASK-0011 | P1 | M3 | TASK-0010 | Structured multi-level review, revisions, and recovery |
-| TASK-0012 | P1 | M3 | TASK-0011 | Complete workspace change evidence and Git/non-Git inspection |
+| TASK-0012 | P1 | M3 | TASK-0011 | Versioned, bounded, persisted Git/non-Git workspace evidence for execution and review |
 | TASK-0013 | P1 | M4 | TASK-0012 | Frontend modularization, accessibility, and responsive operation |
 | TASK-0014 | P1 | M4 | TASK-0013 | Data lifecycle, strict backup, retention, and truthful monitoring |
 | TASK-0015 | P0 | M5 | TASK-0014 | Unified voice intent and system-action policy gateway |
@@ -92,7 +92,7 @@ final release evidence and release commit.
 | M0 — Controlled baseline | TASK-0001–TASK-0002 | Authoritative project truth, deterministic tests, formatting, and dependency baseline |
 | M1 — Authoritative state and safety | TASK-0003–TASK-0005 | Backend state, fail-closed policy, one active run, and durable ledger |
 | M2 — Reliable providers | TASK-0006–TASK-0008 | Truthful registry and hardened Codex/Ollama runtimes |
-| M3 — Real orchestration | TASK-0009–TASK-0012 | Dynamic hierarchy, routing, review/recovery, and complete change evidence |
+| M3 — Real orchestration | TASK-0009–TASK-0012 | Dynamic hierarchy, routing, review/recovery, and versioned bounded change evidence |
 | M4 — Maintainable application and data lifecycle | TASK-0013–TASK-0014 | Modular accessible frontend and safe, truthful data lifecycle |
 | M5 — Voice and KDE safety | TASK-0015–TASK-0016 | Unified voice policy and reliable privacy-safe KDE/Wayland integration |
 | M6 — Core agent completion | TASK-0017–TASK-0018 | Bounded specialists, reminders, memory, and management handoffs |
@@ -128,8 +128,10 @@ tools.
 
 TASK-0009 makes the agent registry and hierarchy dynamic. TASK-0010 adds
 deterministic routing and sequential scheduling. TASK-0011 implements
-multi-level review, bounded revisions, and recovery. TASK-0012 completes
-workspace evidence for Git and non-Git roots.
+multi-level review, bounded revisions, and recovery. TASK-0012 brackets every
+execution with bounded workspace capture, persists versioned Git/non-Git
+evidence, and requires explicit human review whenever that evidence is not
+complete and internally consistent.
 
 ### M4 — Make the application maintainable
 

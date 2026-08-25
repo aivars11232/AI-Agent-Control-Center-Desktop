@@ -15,8 +15,10 @@
 > backend-authoritative task routing, routing evidence, durable queue order,
 > and execute-head admission. TASK-0011 adds backend-authoritative structured
 > review requests/results, exact reporting-chain selection, bounded revisions,
-> trusted human gates, and deterministic recovery; later tasks still own
-> complete workspace evidence, voice semantics, packaging, and live acceptance.
+> trusted human gates, and deterministic recovery. TASK-0012 adds bounded
+> descriptor-confined Git/non-Git evidence, redaction, immutable persistence,
+> and fail-closed review eligibility; later tasks still own voice semantics,
+> packaging, and live acceptance.
 
 ## Security objective
 
@@ -45,7 +47,7 @@ when stored locally.
 | React renderer/WebView | Untrusted for authorization; may be compromised or hold stale/tampered state |
 | Imported backup and <code>localStorage</code> | Untrusted serialized input requiring validation and migration |
 | Tauri IPC | Untrusted request boundary; backend must authenticate semantics, not just types |
-| Rust backend | Authoritative agent registry, task routing/queue, structured review/revision, approval/action-policy, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
+| Rust backend | Authoritative agent registry, task routing/queue, structured review/revision, workspace evidence, approval/action-policy, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
 | Codex/Ollama output | Untrusted content and action proposals |
 | Selected workspace | Sensitive bounded filesystem root |
 | External/local provider process | Separate process/service with its own failure and trust model |
@@ -129,7 +131,22 @@ Static inspection and deterministic tests found these implemented controls:
   exchange rename semantics, with displaced-inode/content revalidation and
   rollback rather than silent overwrite on conflict;
 - per-run cancellation flags and bounded timeouts;
-- changed-file and Git diff capture where available;
+- versioned before/after workspace evidence captured around every execute
+  dispatch and persisted for success, cancellation, timeout, and failure;
+- descriptor-confined traversal that never follows symlinks/special files,
+  uses <code>.git</code> metadata directories as the sole unconditional name
+  exclusion, hashes bounded regular files, and reports every timeout, size,
+  entry, command, or unsupported-case limit;
+- hardened direct Git porcelain-v2/staged/unstaged inspection with optional
+  locks, lazy fetch, pagers, hooks, fsmonitor, external diffs, textconv, and
+  configured clean/smudge/process filter helpers disabled;
+- typed classification for staged, unstaged, untracked, deleted, renamed,
+  binary, redacted, and non-Git cases, with sensitive hashes/content and binary
+  raw data omitted from persistence;
+- agent-review approval gated on a complete internally valid structured record
+  whose redacted compatibility paths/diff match the run fields; every partial,
+  unavailable, binary, redacted, conflicted, or inconsistent case requires
+  human review;
 - typed, bounded backend validation for persisted application state;
 - dedicated revision-checked agent create/update/logical-delete/template-restore
   IPC with renderer attempts to mutate registry structure through generic saves
@@ -183,7 +200,8 @@ These controls establish the TASK-0004 authorization boundary, TASK-0005
 run-coordination boundary, TASK-0006 provider-identity boundary, TASK-0007
 Codex process/protocol boundary, TASK-0008 Ollama transport/workspace-tool
 boundary, TASK-0009 agent-registry boundary, and TASK-0010 routing/queue
-boundary, plus the TASK-0011 structured-review boundary. They do not establish
+boundary, the TASK-0011 structured-review boundary, and the TASK-0012 workspace
+evidence boundary. They do not establish
 production readiness or the later live provider/platform guarantees.
 
 ## Known current gaps
@@ -242,7 +260,7 @@ workspace tools fail closed outside Linux.
 
 ### Verification coverage
 
-The checked-in non-live suite contains 41 frontend tests and 120 Rust tests. It
+The checked-in non-live suite contains 44 frontend tests and 130 Rust tests. It
 covers frontend characterization plus backend policy, authorization, run
 coordination/recovery/bounds, provider identity/fake-adapter dispatch, Codex
 compatibility/command/protocol/descendant-process cases, strict IPC,
@@ -252,7 +270,9 @@ routing eligibility/scoring/overflow evidence, global queue ordering/head
 admission/restart/recovery, strict bound review protocols, exact reporting-chain
 selection, revision/attempt caps, human fallback, review cancellation/restart,
 schema-v5 review migration, persistence validation, migration, corruption,
-concurrency, and rollback
+concurrency, rollback, Git/non-Git add/modify/delete/rename/binary/staging,
+explicit collection limits, symlink containment, redaction, disabled Git
+helpers, structured persistence, and review eligibility
 cases. These checks do not establish end-to-end,
 packaging, upgrade, or live acceptance. Rust advisory status remains
 indeterminate when <code>cargo-audit</code> is unavailable.
@@ -263,7 +283,8 @@ The agent-registry and task-orchestration subsets of invariant 1, the
 approval/action subset of invariants 2 through 5, the typed-routing-input
 subset of invariant 2, the queue/coordinator subset
 of invariant 6, the structured-review binding and recovery subsets of
-invariants 2, 3, 6, and 9, the Ollama workspace subset of invariant 7, and the
+invariants 2, 3, 6, and 9, the Ollama workspace and TASK-0012 evidence subsets
+of invariants 7 and 11, and the
 provider-identity/no-substitution plus Codex/Ollama adapter subsets of invariant
 8 are implemented for the current command surface. The full integrated
 invariants remain the release target:
@@ -361,9 +382,11 @@ least-privilege workarounds before any code change.
 - Do not store provider credentials in ordinary renderer state or backups.
 - Treat the SQLite application-state database as sensitive local user data;
   keep its path out of routine errors and preserve private filesystem modes.
-- Treat run summaries, progress, stderr excerpts, changed paths, and diffs in
-  the bounded local ledger as sensitive workspace evidence; truncation and
-  retention limits reduce growth but are not redaction.
+- Treat run summaries, progress, stderr excerpts, changed paths, diffs, hashes,
+  and structured workspace records in the bounded local ledger as sensitive
+  workspace evidence. TASK-0012 redacts detected secret lines and sensitive
+  paths and omits binary bodies, but those bounded controls are not a guarantee
+  that all sensitive content can be recognized; retention remains required.
 - Do not include secrets, complete private prompts, workspace contents, or raw
   microphone audio in routine logs.
 - Make retention and deletion behavior explicit and testable.

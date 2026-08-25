@@ -1,3 +1,5 @@
+import type { WorkspaceChangeEvidence } from "./workspaceEvidence";
+
 export type RunAttemptMode = "execute" | "review";
 
 export type RunAttemptStatus =
@@ -63,6 +65,7 @@ export type RunAttempt = {
   usage: RunUsage;
   changedFiles: string[];
   diff: string | null;
+  workspaceChanges: WorkspaceChangeEvidence;
   errorCode: string | null;
   errorMessage: string | null;
   progressEventCount: number;
@@ -177,6 +180,8 @@ export function hasVisibleTruncation(attempt: RunAttempt): boolean {
     evidence.changedFilesTruncated ||
     evidence.progressTruncated ||
     evidence.beforeSnapshotTruncated ||
-    evidence.afterSnapshotTruncated
+    evidence.afterSnapshotTruncated ||
+    attempt.workspaceChanges.status === "partial" ||
+    attempt.workspaceChanges.status === "unavailable"
   );
 }

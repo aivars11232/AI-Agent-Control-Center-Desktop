@@ -4,6 +4,7 @@ use crate::{
         resolve_model_identity, ProviderAvailability, ProviderRegistrySnapshot, RuntimeProviderId,
     },
     run_coordinator::{RunAttemptProjection, RunTruncationEvidence},
+    workspace_evidence::WorkspaceChangeEvidenceV1,
 };
 use serde::{
     de::{Error as DeError, MapAccess, SeqAccess, Visitor},
@@ -24,12 +25,13 @@ const MAX_REVIEW_FINDING_BYTES: usize = 8 * 1024;
 const MAX_BLOCKING_ISSUES: usize = 32;
 const MAX_EVIDENCE_REFERENCES: usize = 16;
 
-const EVIDENCE_IDS: [&str; 5] = [
+const EVIDENCE_IDS: [&str; 6] = [
     "task.requirements",
     "execution.summary",
     "execution.changedFiles",
     "execution.diff",
     "execution.truncation",
+    "execution.workspaceChanges",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -177,6 +179,8 @@ pub struct ReviewExecutionEvidenceV1 {
     pub summary: String,
     pub changed_files: Vec<String>,
     pub diff: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_changes: Option<WorkspaceChangeEvidenceV1>,
     pub truncation: RunTruncationEvidence,
     pub evidence_ids: Vec<String>,
 }
@@ -184,6 +188,10 @@ pub struct ReviewExecutionEvidenceV1 {
 impl ReviewExecutionEvidenceV1 {
     pub fn is_complete_for_agent_approval(&self) -> bool {
         let evidence = &self.truncation;
+        let structured_matches_projection = self.workspace_changes.as_ref().is_some_and(|value| {
+            value.compatibility_paths() == self.changed_files
+                && value.compatibility_diff() == self.diff
+        });
         !evidence.stdout_truncated
             && !evidence.stderr_truncated
             && !evidence.summary_truncated
@@ -192,6 +200,11 @@ impl ReviewExecutionEvidenceV1 {
             && !evidence.progress_truncated
             && !evidence.before_snapshot_truncated
             && !evidence.after_snapshot_truncated
+            && self
+                .workspace_changes
+                .as_ref()
+                .is_some_and(WorkspaceChangeEvidenceV1::is_complete_for_agent_approval)
+            && structured_matches_projection
     }
 }
 
@@ -575,6 +588,7 @@ pub fn build_review_request(
                 .unwrap_or_else(|| "No execution summary was returned.".to_string()),
             changed_files: execution.changed_files.clone(),
             diff: execution.diff.clone(),
+            workspace_changes: Some(execution.workspace_changes.clone()),
             truncation: execution.truncation.clone(),
             evidence_ids: EVIDENCE_IDS
                 .iter()
@@ -980,8 +994,11 @@ mod tests {
                 output_tokens: None,
                 total_tokens: None,
             },
-            changed_files: vec!["src/parser.rs".to_string()],
-            diff: Some("diff --git a/src/parser.rs b/src/parser.rs".to_string()),
+            changed_files: Vec::new(),
+            diff: None,
+            workspace_changes: WorkspaceChangeEvidenceV1::complete_without_changes(
+                crate::workspace_evidence::WorkspaceEvidenceMode::Filesystem,
+            ),
             error_code: None,
             error_message: None,
             progress_event_count: 0,
@@ -1014,6 +1031,7 @@ mod tests {
             workspace_id: Some("workspace-1".to_string()),
             changed_files: Vec::new(),
             diff: None,
+            workspace_changes: None,
             duration_seconds: None,
             routing_mode: "selected".to_string(),
             routed_from_agent_id: None,
@@ -1159,6 +1177,36 @@ mod tests {
             .code,
             "REVIEW_APPROVAL_UNSUPPORTED"
         );
+    }
+
+    #[test]
+    fn task_0012_review_requires_matching_structured_evidence_but_parses_legacy_requests() {
+        let request = request();
+        assert!(request.execution.is_complete_for_agent_approval());
+
+        let mut mismatched = request.clone();
+        mismatched.execution.changed_files = vec!["forged.txt".to_string()];
+        assert!(!mismatched.execution.is_complete_for_agent_approval());
+        assert_eq!(
+            parse_review_result(
+                &result_json(&mismatched, ReviewVerdict::Approved),
+                &mismatched
+            )
+            .unwrap_err()
+            .code,
+            "REVIEW_APPROVAL_UNSUPPORTED"
+        );
+
+        let mut legacy_value = serde_json::to_value(&request).unwrap();
+        legacy_value
+            .get_mut("execution")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .remove("workspaceChanges");
+        let legacy: ReviewRequestV1 = serde_json::from_value(legacy_value).unwrap();
+        assert_eq!(legacy.request_fingerprint, request.request_fingerprint);
+        assert!(legacy.execution.workspace_changes.is_none());
+        assert!(!legacy.execution.is_complete_for_agent_approval());
     }
 
     #[test]

@@ -1007,6 +1007,7 @@ mod tests {
             workspace_id: Some("workspace-1".to_string()),
             changed_files: Vec::new(),
             diff: None,
+            workspace_changes: None,
             duration_seconds: None,
             routing_mode: "selected".to_string(),
             routed_from_agent_id: None,

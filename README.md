@@ -25,6 +25,8 @@ The current checkout contains:
   reviewers, structured verdicts, bounded revisions, and human fallback;
 - a backend-authoritative single-run coordinator with a durable, bounded run
   ledger;
+- versioned, bounded Git and non-Git workspace-change evidence captured around
+  execution and persisted in the authoritative task/run ledger;
 - a truthful Codex/Ollama provider registry with exact model/runtime dispatch
   and no silent fallback;
 - a Linux Codex execution path with capability checks, explicit configuration
@@ -43,9 +45,9 @@ dispatch use a common backend contract. Codex process/protocol hardening is
 implemented for the current Linux path; bounded Ollama transport and workspace
 tools are implemented for the current Linux path. Deterministic task routing,
 overflow handling, queue ordering, and execute-head admission are
-backend-authoritative. Structured multi-level review and recovery are also
-backend-authoritative; complete workspace evidence and live provider acceptance
-remain later prototype boundaries.
+backend-authoritative. Structured multi-level review/recovery and complete
+workspace evidence are also backend-authoritative; live provider acceptance
+remains a later prototype boundary.
 Agent identity, lifecycle, role-derived authority, reporting relationships,
 and template restoration are backend-authoritative; dashboard, agent, routing,
 review, voice, reminder, approval, and settings projections consume active
@@ -90,8 +92,8 @@ Run the deterministic fast characterization gate from the repository root:
 npm run verify:fast
 ```
 
-It runs 41 frontend characterization/persistence/coordinator/provider/registry/
-orchestration tests, the TypeScript check, the Rust format check, and 120
+It runs 44 frontend characterization/persistence/coordinator/provider/registry/
+orchestration tests, the TypeScript check, the Rust format check, and 130
 locked/offline Rust tests.
 The full gate adds the
 frontend build, Clippy, shell/Python/JSON checks, dependency-tree checks, and

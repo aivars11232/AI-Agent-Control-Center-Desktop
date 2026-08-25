@@ -109,6 +109,15 @@ import {
   type ReviewStageStart,
   type ReviewVerdict,
 } from "./reviewOrchestration";
+import {
+  normalizeWorkspaceEvidence,
+  workspaceChangeCanOpen,
+  workspaceChangeLabel,
+  workspaceEvidenceHasVisibleLimit,
+  workspaceEvidenceStatusLabel,
+  workspaceReviewabilityLabel,
+  type WorkspaceChangeEvidence,
+} from "./workspaceEvidence";
 import logoUrl from "../AI-Agents.png";
 import "./App.css";
 
@@ -124,6 +133,7 @@ type AgentRunResult = {
   };
   changedFiles: string[];
   diff: string | null;
+  workspaceChanges: WorkspaceChangeEvidence;
   durationSeconds: number;
 };
 
@@ -292,6 +302,7 @@ function DashboardPage({
   agents,
   approvalRequests,
   taskOrchestration,
+  runCoordinator,
   onOpenAgents,
   onOpenTasks,
   onOpenApprovals,
@@ -299,6 +310,7 @@ function DashboardPage({
   agents: Agent[];
   approvalRequests: ApprovalRequest[];
   taskOrchestration: TaskOrchestrationSnapshot;
+  runCoordinator: RunCoordinatorUiState;
   onOpenAgents: () => void;
   onOpenTasks: () => void;
   onOpenApprovals: () => void;
@@ -317,11 +329,6 @@ function DashboardPage({
   );
 
   const waitingTaskCount = taskOrchestration.executeQueue.length;
-
-  const totalActivityCount = agents.reduce(
-    (total, agent) => total + agent.activity.length,
-    0,
-  );
 
   const supervisorQueue = [
     ...(taskOrchestration.activeExecute
@@ -396,10 +403,44 @@ function DashboardPage({
         </article>
 
         <article className="summary-card">
-          <span>Activity events</span>
-          <strong>{totalActivityCount}</strong>
-          <small>Recorded locally</small>
+          <span>Retained runs</span>
+          <strong>{runCoordinator.snapshot.retainedAttemptCount}</strong>
+          <small>Immutable evidence ledger</small>
         </article>
+      </section>
+
+      <section className="panel">
+        <div className="panel-heading">
+          <div>
+            <span className="eyebrow">AUTHORITATIVE RUN EVIDENCE</span>
+            <h2>Recent execution records</h2>
+            <p className="page-message">
+              Backend-owned outcomes and bounded workspace evidence; local activity messages are not used here.
+            </p>
+          </div>
+        </div>
+        {runCoordinator.snapshot.recentAttempts.length === 0 ? (
+          <p className="page-message">No retained run attempts.</p>
+        ) : (
+          <div className="agent-list">
+            {runCoordinator.snapshot.recentAttempts.slice(0, 6).map((attempt) => (
+              <article className="agent-card" key={attempt.id}>
+                <div>
+                  <h3>{attempt.taskTitle}</h3>
+                  <p>
+                    {attempt.runMode === "review" ? "Review" : "Execution"} · {attempt.status.replace(/_/g, " ")}
+                  </p>
+                  <small>
+                    {workspaceEvidenceStatusLabel(attempt.workspaceChanges)} · {attempt.workspaceChanges.summary.totalChanges} observed changes
+                  </small>
+                </div>
+                <span className={`agent-status ${attempt.status === "succeeded" ? "waiting" : attempt.status === "running" ? "working" : "paused"}`}>
+                  {workspaceReviewabilityLabel(attempt.workspaceChanges)}
+                </span>
+              </article>
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="panel">
@@ -1091,6 +1132,9 @@ function AgentsPage({
   );
 
   const selectedAgentTasks = selectedAgent?.tasks ?? [];
+  const selectedAgentRuns = runCoordinator.snapshot.recentAttempts
+    .filter((attempt) => attempt.agentId === selectedAgentId)
+    .slice(0, 8);
   const completedTaskCount = selectedAgentTasks.filter(
     (task) => task.status === "Completed",
   ).length;
@@ -1161,6 +1205,10 @@ function AgentsPage({
         attempt.taskOwnerAgentId === selectedAgent?.id &&
         attempt.taskId === task.id,
     );
+  }
+
+  function workspaceEvidenceForTask(task: AgentTask) {
+    return task.workspaceChanges ?? latestRunForTask(task)?.workspaceChanges ?? null;
   }
 
   function createActivity(message: string): ActivityEntry {
@@ -2452,6 +2500,8 @@ function AgentsPage({
                 {selectedAgent.tasks.map((task) => {
                   const entry = queueEntry(task);
                   const executor = executorForTask(task);
+                  const latestRun = latestRunForTask(task);
+                  const workspaceEvidence = workspaceEvidenceForTask(task);
                   const reviewFlow = reviewFlowForTask(
                     reviewOrchestration,
                     selectedAgent.id,
@@ -2610,8 +2660,7 @@ function AgentsPage({
                         </div>
                       )}
 
-                      {latestRunForTask(task) &&
-                        hasVisibleTruncation(latestRunForTask(task)!) && (
+                      {latestRun && hasVisibleTruncation(latestRun) && (
                           <div className="run-evidence-warning" role="status">
                             Stored run evidence reached a safety bound. The run
                             ledger records which output, progress, diff, file list,
@@ -2619,10 +2668,9 @@ function AgentsPage({
                           </div>
                         )}
 
-                      {latestRunForTask(task)?.status === "interrupted" && (
+                      {latestRun?.status === "interrupted" && (
                         <div className="run-evidence-warning" role="alert">
-                          {latestRunForTask(task)?.recoveryDisposition ===
-                          "safe_to_retry"
+                          {latestRun.recoveryDisposition === "safe_to_retry"
                             ? "The previous run stopped before dispatch and is safe to retry."
                             : "The previous run may have reached the workspace. Inspect its files before retrying."}
                         </div>
@@ -2672,9 +2720,110 @@ function AgentsPage({
                         </div>
                       )}
 
-                      {task.changedFiles.length > 0 && (
+                      {workspaceEvidence && (
+                        <div className="workspace-evidence">
+                          <div className="agent-result-heading">
+                            <strong>
+                              {workspaceEvidenceStatusLabel(workspaceEvidence)}
+                            </strong>
+                            <small>
+                              {workspaceReviewabilityLabel(workspaceEvidence)} · observed during run
+                            </small>
+                          </div>
+                          <div className="workspace-evidence-counts">
+                            <span>{workspaceEvidence.summary.totalChanges} changes</span>
+                            <span>{workspaceEvidence.summary.staged} staged</span>
+                            <span>{workspaceEvidence.summary.unstaged} unstaged</span>
+                            <span>{workspaceEvidence.summary.untracked} untracked</span>
+                            <span>{workspaceEvidence.summary.binary} binary</span>
+                            {workspaceEvidence.baselineGitHead !== workspaceEvidence.finalGitHead && (
+                              <span>
+                                HEAD {workspaceEvidence.baselineGitHead?.slice(0, 12) ?? "unborn"} → {workspaceEvidence.finalGitHead?.slice(0, 12) ?? "unborn"}
+                              </span>
+                            )}
+                          </div>
+                          {workspaceEvidenceHasVisibleLimit(workspaceEvidence) && (
+                            <div className="run-evidence-warning" role="status">
+                              Evidence is explicitly partial. Use human review and inspect the listed issues before relying on it.
+                            </div>
+                          )}
+                          {workspaceEvidence.issues.length > 0 && (
+                            <details className="evidence-issues">
+                              <summary>
+                                Collection issues ({workspaceEvidence.issues.length}
+                                {workspaceEvidence.issuesTruncated ? "+" : ""})
+                              </summary>
+                              <ul>
+                                {workspaceEvidence.issues.map((issue, index) => (
+                                  <li key={`${issue.code}-${issue.path ?? index}`}>
+                                    <code>{issue.code}</code> · {issue.message}
+                                    {issue.path ? ` · ${issue.path}` : ""}
+                                  </li>
+                                ))}
+                              </ul>
+                            </details>
+                          )}
+                          {workspaceEvidence.changes.length > 0 && (
+                            <div className="evidence-change-list">
+                              {workspaceEvidence.changes.map((change) => {
+                                const openable = workspaceChangeCanOpen(change);
+                                const displayPath = change.previousPath
+                                  ? `${change.previousPath} → ${change.path}`
+                                  : change.path;
+                                const state = change.after ?? change.before;
+                                return (
+                                  <div className="evidence-change-row" key={`${change.previousPath ?? ""}-${change.path}`}>
+                                    {openable ? (
+                                      <button
+                                        type="button"
+                                        className="file-chip"
+                                        onClick={() => openTaskFile(task, change.path)}
+                                      >
+                                        {displayPath}
+                                      </button>
+                                    ) : (
+                                      <span className="file-chip evidence-file-unavailable">
+                                        {displayPath}
+                                      </span>
+                                    )}
+                                    <small>
+                                      {workspaceChangeLabel(change)}
+                                      {change.gitAfter?.indexStatus ? ` · staged ${change.gitAfter.indexStatus}` : ""}
+                                      {change.gitAfter?.worktreeStatus ? ` · unstaged ${change.gitAfter.worktreeStatus}` : ""}
+                                      {change.gitAfter?.untracked ? " · untracked" : ""}
+                                      {state?.sizeBytes !== null && state?.sizeBytes !== undefined
+                                        ? ` · ${state.sizeBytes.toLocaleString()} bytes`
+                                        : ""}
+                                      {state?.sha256 ? ` · sha256 ${state.sha256.slice(0, 12)}…` : ""}
+                                      {change.binary ? " · binary" : ""}
+                                      {change.contentRedacted ? " · content redacted" : ""}
+                                      {change.detailTruncated ? " · detail truncated" : ""}
+                                      {!openable ? " · not openable from final workspace state" : ""}
+                                    </small>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                          {workspaceEvidence.details.some((detail) => detail.content) && (
+                            <details className="diff-review">
+                              <summary>Review bounded redacted details</summary>
+                              {workspaceEvidence.details
+                                .filter((detail) => detail.content)
+                                .map((detail) => (
+                                  <section key={`${detail.kind}-${detail.path}`}>
+                                    <strong>{detail.path} · {detail.kind}</strong>
+                                    <pre>{detail.content}</pre>
+                                  </section>
+                                ))}
+                            </details>
+                          )}
+                        </div>
+                      )}
+
+                      {!workspaceEvidence && task.changedFiles.length > 0 && (
                         <div className="changed-files">
-                          <strong>Changed files ({task.changedFiles.length})</strong>
+                          <strong>Legacy changed files ({task.changedFiles.length})</strong>
                           <div className="file-chip-list">
                             {task.changedFiles.map((file) => (
                               <button
@@ -2692,7 +2841,7 @@ function AgentsPage({
 
                       {task.diff && (
                         <details className="diff-review">
-                          <summary>Review working-tree diff</summary>
+                          <summary>Review redacted compatibility diff</summary>
                           <pre>{task.diff}</pre>
                         </details>
                       )}
@@ -2855,7 +3004,7 @@ function AgentsPage({
                 <span className="eyebrow">ACTIVITY</span>
                 <h2>Agent activity log</h2>
                 <p className="page-message">
-                  Recent configuration and task changes for this agent.
+                  Immutable run-ledger evidence followed by local configuration events.
                 </p>
               </div>
 
@@ -2869,9 +3018,30 @@ function AgentsPage({
               )}
             </div>
 
+            <div className="authoritative-run-list">
+              <h3>Authoritative run ledger</h3>
+              {selectedAgentRuns.length === 0 ? (
+                <p className="page-message">No retained run attempts for this agent.</p>
+              ) : (
+                selectedAgentRuns.map((attempt) => (
+                  <article className="agent-card" key={attempt.id}>
+                    <div>
+                      <h3>{attempt.taskTitle}</h3>
+                      <p>
+                        {attempt.runMode === "review" ? "Review" : "Execution"} · {attempt.status.replace(/_/g, " ")}
+                      </p>
+                      <small>
+                        {workspaceEvidenceStatusLabel(attempt.workspaceChanges)} · {attempt.workspaceChanges.summary.totalChanges} observed changes
+                      </small>
+                    </div>
+                  </article>
+                ))
+              )}
+            </div>
+
             {selectedAgent.activity.length === 0 ? (
               <p className="page-message">
-                No activity recorded yet.
+                No local configuration activity recorded yet.
               </p>
             ) : (
               <div className="agent-list">
@@ -3906,11 +4076,13 @@ function ApprovalsPage({
 function ActivityPage({
   agents,
   setAgents,
+  runCoordinator,
   retentionDays,
   setRetentionDays,
 }: {
   agents: Agent[];
   setAgents: React.Dispatch<React.SetStateAction<Agent[]>>;
+  runCoordinator: RunCoordinatorUiState;
   retentionDays: HistoryRetentionDays;
   setRetentionDays: React.Dispatch<
     React.SetStateAction<HistoryRetentionDays>
@@ -4058,10 +4230,41 @@ function ActivityPage({
         </article>
 
         <article className="summary-card">
-          <span>Activity events</span>
-          <strong>{allActivity.length}</strong>
-          <small>Recorded locally</small>
+          <span>Retained runs</span>
+          <strong>{runCoordinator.snapshot.retainedAttemptCount}</strong>
+          <small>Backend-owned evidence</small>
         </article>
+      </section>
+
+      <section className="panel">
+        <div className="panel-heading">
+          <div>
+            <span className="eyebrow">AUTHORITATIVE RUN LEDGER</span>
+            <h2>Execution and review evidence</h2>
+            <p className="page-message">
+              These records come from the immutable backend run ledger and cannot be cleared through the local activity controls.
+            </p>
+          </div>
+        </div>
+        {runCoordinator.snapshot.recentAttempts.length === 0 ? (
+          <p className="page-message">No retained run attempts.</p>
+        ) : (
+          <div className="agent-list">
+            {runCoordinator.snapshot.recentAttempts.map((attempt) => (
+              <article className="agent-card" key={attempt.id}>
+                <div>
+                  <h3>{attempt.taskTitle}</h3>
+                  <p>
+                    {attempt.runMode === "review" ? "Review" : "Execution"} · {attempt.status.replace(/_/g, " ")}
+                  </p>
+                  <small>
+                    {workspaceEvidenceStatusLabel(attempt.workspaceChanges)} · {attempt.workspaceChanges.summary.totalChanges} observed changes · {workspaceReviewabilityLabel(attempt.workspaceChanges)}
+                  </small>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="panel">
@@ -4212,7 +4415,7 @@ function ActivityPage({
         <div className="panel-heading">
           <div>
             <span className="eyebrow">TIMELINE</span>
-            <h2>System audit trail</h2>
+            <h2>Local configuration timeline</h2>
           </div>
         </div>
 
@@ -6130,6 +6333,9 @@ function SettingsPage({
                     ? task.changedFiles
                     : [],
                   diff: typeof task.diff === "string" ? task.diff : null,
+                  workspaceChanges: normalizeWorkspaceEvidence(
+                    task.workspaceChanges,
+                  ),
                   durationSeconds:
                     typeof task.durationSeconds === "number"
                       ? task.durationSeconds
@@ -7428,6 +7634,7 @@ function App() {
               workspaceId?: string | null;
               changedFiles?: string[];
               diff?: string | null;
+              workspaceChanges?: unknown;
               durationSeconds?: number | null;
               routingMode?: RoutingMode;
               routedFromAgentId?: number | null;
@@ -7548,6 +7755,9 @@ function App() {
                 : [],
               diff:
                 typeof legacyTask.diff === "string" ? legacyTask.diff : null,
+              workspaceChanges: normalizeWorkspaceEvidence(
+                legacyTask.workspaceChanges,
+              ),
               durationSeconds:
                 typeof legacyTask.durationSeconds === "number"
                   ? legacyTask.durationSeconds
@@ -8340,6 +8550,7 @@ function App() {
             agents={operationalAgents}
             approvalRequests={approvalRequests}
             taskOrchestration={taskOrchestration}
+            runCoordinator={runCoordinator}
             onOpenAgents={() => setActivePage("Agents")}
             onOpenTasks={() => setActivePage("Tasks")}
             onOpenApprovals={() => setActivePage("Approvals")}
@@ -8400,6 +8611,7 @@ function App() {
           <ActivityPage
             agents={agents}
             setAgents={setAgents}
+            runCoordinator={runCoordinator}
             retentionDays={activityRetentionDays}
             setRetentionDays={setActivityRetentionDays}
           />

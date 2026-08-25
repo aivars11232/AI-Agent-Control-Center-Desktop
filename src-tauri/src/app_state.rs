@@ -1,9 +1,12 @@
 use crate::agent_registry::{normalize_legacy_agents, validate_agent_registry};
 use crate::task_orchestration::{RoutingEvidence, ROUTING_ALGORITHM_VERSION};
+use crate::workspace_evidence::{
+    WorkspaceChangeEvidenceV1, MAX_PERSISTED_WORKSPACE_EVIDENCE_BYTES,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fmt};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 pub const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 pub const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -237,6 +240,8 @@ pub struct AgentTask {
     pub workspace_id: Option<String>,
     pub changed_files: Vec<String>,
     pub diff: Option<String>,
+    #[serde(default)]
+    pub workspace_changes: Option<WorkspaceChangeEvidenceV1>,
     pub duration_seconds: Option<f64>,
     pub routing_mode: String,
     pub routed_from_agent_id: Option<i64>,
@@ -1178,6 +1183,23 @@ fn validate_task(path: &str, task: &AgentTask) -> Result<(), StateValidationErro
             MAX_PATH_TEXT,
             false,
         )?;
+    }
+    if let Some(evidence) = &task.workspace_changes {
+        evidence.validate().map_err(|message| {
+            StateValidationError::new(format!("{path}.workspaceChanges"), message)
+        })?;
+        let bytes = serde_json::to_vec(evidence).map_err(|_| {
+            StateValidationError::new(
+                format!("{path}.workspaceChanges"),
+                "workspace evidence could not be normalized",
+            )
+        })?;
+        if bytes.len() > MAX_PERSISTED_WORKSPACE_EVIDENCE_BYTES {
+            return Err(StateValidationError::new(
+                format!("{path}.workspaceChanges"),
+                "workspace evidence exceeds the persisted payload bound",
+            ));
+        }
     }
     Ok(())
 }

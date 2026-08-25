@@ -8,6 +8,7 @@ import {
   type RunCoordinatorEvent,
   type RunCoordinatorSnapshot,
 } from "./runCoordinator";
+import { unavailableWorkspaceEvidence } from "./workspaceEvidence";
 
 function attempt(id: number): RunAttempt {
   return {
@@ -37,6 +38,7 @@ function attempt(id: number): RunAttempt {
     usage: { inputTokens: null, outputTokens: null, totalTokens: null },
     changedFiles: [],
     diff: null,
+    workspaceChanges: unavailableWorkspaceEvidence(),
     errorCode: null,
     errorMessage: null,
     progressEventCount: 0,

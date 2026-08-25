@@ -1,3 +1,4 @@
+use crate::workspace_evidence::WorkspaceChangeEvidenceV1;
 use serde::{Deserialize, Serialize};
 
 pub const MAX_RUN_REQUEST_ID_BYTES: usize = 128;
@@ -12,8 +13,6 @@ pub const MAX_SUMMARY_BYTES: usize = 128 * 1024;
 pub const MAX_ERROR_BYTES: usize = 64 * 1024;
 pub const MAX_DIFF_CHARS: usize = 120_000;
 pub const MAX_DIFF_BYTES: usize = 512 * 1024;
-pub const MAX_SNAPSHOT_FILES: usize = 20_000;
-pub const MAX_SNAPSHOT_MILLIS: u64 = 5_000;
 pub const MAX_CHANGED_FILES: usize = 250;
 pub const MAX_CHANGED_FILE_BYTES: usize = 256 * 1024;
 pub const MAX_RETAINED_ATTEMPTS: i64 = 1_000;
@@ -198,6 +197,7 @@ pub struct RunAttemptProjection {
     pub usage: RunUsage,
     pub changed_files: Vec<String>,
     pub diff: Option<String>,
+    pub workspace_changes: WorkspaceChangeEvidenceV1,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub progress_event_count: u64,
@@ -241,6 +241,7 @@ pub struct RunCompletion {
     pub usage: RunUsage,
     pub changed_files: Vec<String>,
     pub diff: Option<String>,
+    pub workspace_changes: WorkspaceChangeEvidenceV1,
     pub duration_seconds: u64,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
@@ -271,6 +272,9 @@ impl RunCompletion {
             },
             changed_files: Vec::new(),
             diff: None,
+            workspace_changes: WorkspaceChangeEvidenceV1::legacy_unavailable(
+                "The run ended before bounded workspace evidence was attached.",
+            ),
             duration_seconds,
             error_code: Some(code.into()),
             error_message: Some(bounded.as_str().to_string()),

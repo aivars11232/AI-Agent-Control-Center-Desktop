@@ -36,6 +36,7 @@ The binding decision record is
       |-- task queue/routing evidence projection (src/taskOrchestration.ts)
       |-- structured review-flow projection (src/reviewOrchestration.ts)
       |-- run snapshot/event projection (src/runCoordinator.ts)
+      |-- structured workspace-evidence projection (src/workspaceEvidence.ts)
       |-- browser-preview localStorage (non-authoritative compatibility only)
       |-- renderer presentation: review controls and task view state
       |
@@ -52,7 +53,7 @@ The binding decision record is
       |     |-- isolated Codex CLI runtime (codex_runtime.rs)
       |     |-- bounded Ollama HTTP runtime (ollama_runtime.rs)
       |     |-- descriptor-confined workspace tools (workspace_tools.rs)
-      |-- filesystem/Git inspection
+      |-- versioned filesystem/Git evidence collector (workspace_evidence.rs)
       |-- application/window/input control
       |-- Python voice listener process
       v
@@ -83,6 +84,9 @@ backend queue snapshot, positions, states, and routing evidence; it does not
 score candidates or decide admission. <code>src/reviewOrchestration.ts</code>
 projects backend flow/stage history and human-fallback status; it does not pick
 reviewers, parse provider verdicts, or decide transitions.
+<code>src/workspaceEvidence.ts</code> defensively projects the backend's
+versioned evidence into task, dashboard, and activity views and only offers a
+file-open action for an existing final regular file or directory.
 
 ### Rust backend
 
@@ -95,13 +99,14 @@ also composes <code>app_state.rs</code>, <code>policy.rs</code>,
 <code>review_orchestration.rs</code>,
 <code>authorization.rs</code>, <code>run_coordinator.rs</code>,
 <code>provider_runtime.rs</code>, <code>codex_runtime.rs</code>,
-<code>ollama_runtime.rs</code>, <code>workspace_tools.rs</code>, and
-<code>persistence.rs</code>. Those modules
+<code>ollama_runtime.rs</code>, <code>workspace_tools.rs</code>,
+<code>workspace_evidence.rs</code>, and <code>persistence.rs</code>. Those modules
 own the versioned state contract, normalized action intents, fail-closed
 capability evaluation, authoritative approval lifecycle, legal run transitions
 and evidence bounds, provider identity/contracts/dispatch, isolated Codex
 compatibility/process/protocol handling, bounded fixed-loopback Ollama
-transport/discovery, descriptor-confined conflict-safe workspace edits,
+transport/discovery, descriptor-confined conflict-safe workspace edits and
+before/after evidence capture, hardened Git inspection,
 validated agent identity/lifecycle/hierarchy operations, deterministic routing
 and queue evidence, structured reporting-chain review and verdict validation,
 SQLite
@@ -115,8 +120,8 @@ provider startup.
 ### Persistence and migration
 
 The desktop database is <code>application-state.sqlite3</code> below Tauri's
-platform application-data directory. Migrations 0001 through 0006 establish
-schema version 6 plus a migration ledger. Repository writes replace one
+platform application-data directory. Migrations 0001 through 0007 establish
+schema version 7 plus a migration ledger. Repository writes replace one
 validated aggregate inside an immediate transaction and use a monotonically
 increasing revision to reject stale writers. Startup refuses corrupt or
 unsupported newer databases and retains the typed error for the renderer
@@ -174,6 +179,13 @@ state. Migration treats legacy unbound in-flight review as human-required, and
 startup reconciliation retries only a provably pre-dispatch stage without
 automatically invoking a provider.
 
+Schema v7 adds one nullable, JSON-checked versioned workspace-evidence record
+to each run attempt and task aggregate. A null legacy value becomes explicit
+unavailable evidence when projected. Completion validates and persists the
+record transactionally, accounts it against run retention, and relies on the
+existing terminal-attempt trigger plus generic-save field preservation to keep
+the evidence backend-owned and immutable after completion.
+
 ### Voice runtime
 
 <code>voice-runtime/listener.py</code> is a bundled local Python listener. Setup
@@ -191,7 +203,9 @@ behavior were not exercised in TASK-0001.
 - Workspaces are user-selected filesystem roots.
 - KDE/Wayland integration crosses application, window, input, portal, desktop
   entry, and XDG data/config boundaries.
-- Git evidence is read from a selected workspace when available.
+- Git evidence is read through direct hardened Git commands in a selected
+  workspace; descriptor-confined filesystem evidence is the explicit fallback
+  for non-Git roots or unusable Git state.
 
 ## Current run flow
 
@@ -227,26 +241,32 @@ behavior were not exercised in TASK-0001.
    through <code>/api/show</code>, holds one cancellable async session and task
    deadline across its bounded tool loop, and exposes only descriptor-confined
    paginated/read/hash/create/patch workspace operations.
-9. The backend persists bounded ordered events, cancellation state, terminal
-   outcome, output summary, usage, and workspace evidence. Terminal attempts
-   cannot be updated. A successful execution starts or resumes one normalized
-   review flow when review is required.
+9. For execution, the backend brackets provider dispatch with bounded
+   descriptor-confined snapshots and hardened Git status/diff inspection. It
+   persists the validated structured result with ordered events, cancellation
+   state, terminal outcome, output summary, and usage. Terminal attempts cannot
+   be updated. A successful execution starts or resumes one normalized review
+   flow when review is required.
 10. The next stage is derived from the executor role and walks the exact active
     reporting chain sequentially: Senior, Team Leader, and Supervisor as
     applicable. Missing, repeated, inactive, or provider-unready identities
     move the flow to explicit human review without substitution.
 11. Each agent stage receives one versioned, fingerprinted, bounded evidence
-    request under read-only policy. Only one exact structured result with all
-    required checks and matching identifiers can transition the flow; provider
-    prose and embedded workspace evidence remain untrusted data.
+    request under read-only policy. Agent approval additionally requires a
+    complete matching structured workspace record; partial, unavailable,
+    redacted, binary, conflicted, or inconsistent evidence requires human
+    review. Only one exact structured result with all required checks and
+    matching identifiers can transition the flow; provider prose and embedded
+    workspace evidence remain untrusted data.
 12. Approval advances to the next level or completes the task. Requested
     changes enqueue a fresh policy-evaluated execution, capped at three
     revisions. Three invalid/failed stage attempts, an uncertain dispatch, the
     revision cap, or a Supervisor executor requires a natively confirmed human
     decision.
-13. The renderer displays authoritative queue/run/review snapshots, routing
-    evidence, and a global Stop control across navigation; generic state saves
-    cannot overwrite run- or review-owned task fields.
+13. The renderer displays authoritative queue/run/review snapshots, routing and
+    workspace evidence, explicit partial/unavailable states, and a global Stop
+    control across navigation; generic state saves cannot overwrite run- or
+    review-owned task fields.
 
 ## Directional architecture
 
@@ -297,8 +317,9 @@ state.
   tools. Bounded transport/discovery, cancellable requests, per-model metadata,
   and conflict-safe workspace tools are implemented by TASK-0008; live
   acceptance remains with TASK-0020.
-- **Workspace service** — canonical roots, path containment, snapshots, diffs,
-  and change evidence.
+- **Workspace service** — canonical roots, descriptor-confined path containment,
+  bounded before/after snapshots, hardened Git status/diffs, redaction, and
+  versioned change evidence. This boundary is implemented by TASK-0012.
 - **Voice/system gateway** — intent normalization and policy-checked desktop
   actions.
 - **Platform integration** — KDE, Wayland, XDG portals, desktop entries, and
@@ -318,7 +339,7 @@ task must choose the smallest structure supported by the code at that time.
 | Routing and review | Backend owns routing, execute-queue admission, exact reviewer selection, structured stage transitions, revisions, human fallback, and recovery; renderer projects state and requests commands | Backend scheduler/orchestrator |
 | Active run | Backend system-wide coordinator and SQLite ledger; only live cancellation handles are in memory | Backend system-wide coordinator |
 | Provider/model truth | Backend registry and exact active-provider/catalog-model resolution; renderer projects availability | Backend provider registry |
-| Workspace evidence | Backend bounded evidence persisted per attempt | Backend durable evidence record |
+| Workspace evidence | Backend captures and validates bounded Git/non-Git evidence around execution, persists it per attempt/task, and supplies only complete matching records to agent review | Backend durable evidence record |
 | Reminders | Backend SQLite; renderer manages behavior | Backend passive reminder service |
 | UI preferences | Backend SQLite for desktop; preview storage in browsers | Local settings store, with UI ownership where safe |
 
@@ -371,8 +392,8 @@ TASK-0006 establishes provider identity and the common contract; TASK-0007
 hardens the Codex adapter and TASK-0008 hardens the Ollama adapter.
 TASK-0009 establishes the dynamic agent registry and valid hierarchy;
 TASK-0010 establishes deterministic routing and sequential queueing; TASK-0011
-establishes structured review/revision/recovery, and TASK-0012 completes
-workspace evidence orchestration. TASK-0013
+establishes structured review/revision/recovery; TASK-0012 establishes complete
+bounded workspace evidence orchestration. TASK-0013
 and TASK-0014 modularize UI/data lifecycle. TASK-0015 and TASK-0016 own system actions and
 KDE/voice integration. TASK-0017 through TASK-0020 complete bounded roles,
 packaging, acceptance, and release.

@@ -1568,6 +1568,76 @@ button:disabled {
   margin-top: 14px;
 }
 
+.workspace-evidence {
+  display: grid;
+  gap: 12px;
+  margin-top: 15px;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border-radius: 11px;
+  background: var(--surface-input);
+}
+
+.workspace-evidence-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.workspace-evidence-counts span {
+  padding: 5px 8px;
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--surface-raised);
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.evidence-issues {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.evidence-issues summary {
+  color: var(--warning);
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.evidence-issues ul {
+  margin: 9px 0 0;
+  padding-left: 20px;
+}
+
+.evidence-change-list,
+.evidence-change-row,
+.authoritative-run-list {
+  display: grid;
+  gap: 9px;
+}
+
+.evidence-change-row {
+  align-items: start;
+  grid-template-columns: minmax(0, max-content) minmax(180px, 1fr);
+}
+
+.evidence-change-row small {
+  align-self: center;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.evidence-file-unavailable,
+.evidence-file-unavailable:hover {
+  border-color: var(--border);
+  color: var(--muted);
+  cursor: default;
+}
+
+.authoritative-run-list {
+  margin-bottom: 18px;
+}
+
 .file-chip-list {
   display: flex;
   flex-wrap: wrap;

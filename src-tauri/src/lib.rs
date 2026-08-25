@@ -9,6 +9,7 @@ mod provider_runtime;
 mod review_orchestration;
 mod run_coordinator;
 mod task_orchestration;
+mod workspace_evidence;
 mod workspace_tools;
 
 use agent_registry::{
@@ -49,17 +50,18 @@ use review_orchestration::{
     review_prompt, HumanReviewDecisionRequest, ReviewIntentContext, ReviewOrchestrationSnapshot,
     ReviewStageStart, StartReviewStageRequest,
 };
+#[cfg(test)]
+use run_coordinator::BoundedText;
 use run_coordinator::{
-    bound_diff, bound_paths, validate_request_id, BoundedText, RunAttemptProjection,
-    RunAttemptStatus, RunCompletion, RunCoordinatorSnapshot, RunTruncationEvidence, RunUsage,
-    MAX_DIFF_BYTES, MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_MILLIS,
+    bound_diff, validate_request_id, RunAttemptProjection, RunAttemptStatus, RunCompletion,
+    RunCoordinatorSnapshot, RunTruncationEvidence, RunUsage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     env, fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -67,7 +69,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use task_orchestration::{
     CreateRoutedTaskRequest, RerouteTaskRequest, SetTaskQueueDispositionRequest,
@@ -78,6 +80,7 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, State, WindowEvent,
 };
+use workspace_evidence::{WorkspaceChangeEvidenceV1, WorkspaceEvidenceBaseline};
 use workspace_tools::{ollama_workspace_tools, WorkspaceTools};
 
 const KEYRING_SERVICE: &str = "com.aivarsrocens.aiagentcontrolcenter";
@@ -240,6 +243,7 @@ struct AgentRunResult {
     usage: AgentRunUsage,
     changed_files: Vec<String>,
     diff: Option<String>,
+    workspace_changes: WorkspaceChangeEvidenceV1,
     duration_seconds: u64,
 }
 
@@ -250,21 +254,11 @@ struct RunCoordinatorProviderObserver {
     attempt_id: i64,
 }
 
+#[cfg(test)]
 struct CapturedText {
     text: String,
     original_bytes: u64,
     truncated: bool,
-}
-
-struct WorkspaceSnapshot {
-    files: HashMap<String, FileFingerprint>,
-    truncated: bool,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct FileFingerprint {
-    length: u64,
-    modified_nanos: u128,
 }
 
 fn openai_entry() -> Result<Entry, String> {
@@ -1047,109 +1041,8 @@ impl ProviderRunObserver for RunCoordinatorProviderObserver {
     }
 }
 
-fn should_skip_directory(name: &str) -> bool {
-    matches!(name, ".git" | "node_modules" | "target" | ".codex" | "dist")
-}
-
-fn snapshot_directory(
-    root: &Path,
-    directory: &Path,
-    snapshot: &mut HashMap<String, FileFingerprint>,
-    started: Instant,
-    truncated: &mut bool,
-) {
-    if snapshot.len() >= MAX_SNAPSHOT_FILES
-        || started.elapsed() >= Duration::from_millis(MAX_SNAPSHOT_MILLIS)
-    {
-        *truncated = true;
-        return;
-    }
-
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        if snapshot.len() >= MAX_SNAPSHOT_FILES
-            || started.elapsed() >= Duration::from_millis(MAX_SNAPSHOT_MILLIS)
-        {
-            *truncated = true;
-            return;
-        }
-
-        let path = entry.path();
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-
-        if file_type.is_symlink() {
-            continue;
-        }
-
-        if file_type.is_dir() {
-            if !should_skip_directory(&file_name) {
-                snapshot_directory(root, &path, snapshot, started, truncated);
-            }
-            continue;
-        }
-
-        if !file_type.is_file() {
-            continue;
-        }
-
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        let modified_nanos = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .to_string();
-
-        snapshot.insert(
-            relative,
-            FileFingerprint {
-                length: metadata.len(),
-                modified_nanos,
-            },
-        );
-    }
-}
-
-fn workspace_snapshot(workspace: &Path) -> WorkspaceSnapshot {
-    let mut files = HashMap::new();
-    let mut truncated = false;
-    snapshot_directory(
-        workspace,
-        workspace,
-        &mut files,
-        Instant::now(),
-        &mut truncated,
-    );
-    WorkspaceSnapshot { files, truncated }
-}
-
-fn compare_snapshots(before: &WorkspaceSnapshot, after: &WorkspaceSnapshot) -> Vec<String> {
-    let mut all_paths: HashSet<&String> = before.files.keys().collect();
-    all_paths.extend(after.files.keys());
-
-    let mut changed: Vec<String> = all_paths
-        .into_iter()
-        .filter(|path| before.files.get(*path) != after.files.get(*path))
-        .map(|path| path.to_string())
-        .collect();
-    changed.sort();
-    changed
-}
-
-fn read_bounded_capture(reader: impl Read, limit: usize) -> CapturedText {
+#[cfg(test)]
+fn read_bounded_capture(reader: impl std::io::Read, limit: usize) -> CapturedText {
     let mut reader = reader;
     let mut retained = Vec::with_capacity(limit.min(64 * 1024));
     let mut original_bytes = 0_u64;
@@ -1168,38 +1061,6 @@ fn read_bounded_capture(reader: impl Read, limit: usize) -> CapturedText {
         text: bounded.as_str().to_string(),
         original_bytes,
         truncated: original_bytes > retained.len() as u64 || bounded.truncated(),
-    }
-}
-
-fn git_working_tree_diff(workspace: &Path) -> Option<CapturedText> {
-    let inside = Command::new("git")
-        .current_dir(workspace)
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .ok()?;
-
-    if !inside.status.success() {
-        return None;
-    }
-
-    let mut child = Command::new("git")
-        .current_dir(workspace)
-        .args(["diff", "--no-ext-diff", "--no-color", "--", "."])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let stdout = child.stdout.take()?;
-    let mut capture = read_bounded_capture(stdout, MAX_DIFF_BYTES);
-    let status = child.wait().ok()?;
-    if !status.success() {
-        return None;
-    }
-    capture.text = capture.text.trim().to_string();
-    if capture.text.is_empty() {
-        None
-    } else {
-        Some(capture)
     }
 }
 
@@ -1347,7 +1208,6 @@ fn run_ollama_task_with_session(
         ProviderEventKind::Status,
         format!("Starting local Ollama model {model} in the selected workspace"),
     )?;
-    let before_snapshot = workspace_snapshot(&workspace);
     let tools = ollama_workspace_tools(&request.file_access);
     let mut messages = vec![json!({ "role": "system", "content": prompt })];
     let mut input_tokens = 0_u64;
@@ -1418,18 +1278,9 @@ fn run_ollama_task_with_session(
                 .with_provider(provider_id)
                 .with_model(model));
             }
-            context.emit(ProviderEventKind::Status, "Checking workspace changes…")?;
-            let after_snapshot = workspace_snapshot(&workspace);
-            let bounded_paths = bound_paths(compare_snapshots(&before_snapshot, &after_snapshot));
-            let diff_capture = git_working_tree_diff(&workspace);
-            let (diff, original_diff_bytes, diff_truncated) =
-                bound_diff(diff_capture.as_ref().map(|capture| capture.text.clone()));
             context.emit(
                 ProviderEventKind::Complete,
-                format!(
-                    "Completed with {} changed file(s).",
-                    bounded_paths.original_count
-                ),
+                "Provider completed; bounded workspace evidence will be finalized.",
             )?;
             return Ok(ProviderRunResult {
                 provider_id,
@@ -1441,23 +1292,10 @@ fn run_ollama_task_with_session(
                     output_tokens: used_usage.then_some(output_tokens),
                     total_tokens: used_usage.then_some(input_tokens.saturating_add(output_tokens)),
                 },
-                changed_files: bounded_paths.paths,
-                diff,
+                changed_files: Vec::new(),
+                diff: None,
                 duration_seconds: started.elapsed().as_secs(),
-                evidence: ProviderRunEvidence {
-                    diff_truncated: diff_truncated
-                        || diff_capture
-                            .as_ref()
-                            .is_some_and(|capture| capture.truncated),
-                    changed_files_truncated: bounded_paths.truncated,
-                    before_snapshot_truncated: before_snapshot.truncated,
-                    after_snapshot_truncated: after_snapshot.truncated,
-                    original_diff_bytes: diff_capture
-                        .as_ref()
-                        .map_or(original_diff_bytes as u64, |capture| capture.original_bytes),
-                    original_changed_file_count: bounded_paths.original_count as u64,
-                    ..ProviderRunEvidence::default()
-                },
+                evidence: ProviderRunEvidence::default(),
             });
         }
 
@@ -1564,7 +1402,6 @@ fn run_codex_task(
         ProviderEventKind::Status,
         format!("Starting {model} in the selected workspace"),
     )?;
-    let before_snapshot = workspace_snapshot(&workspace);
     let runtime = codex_runtime::run_codex(
         &context,
         CodexRunSpec {
@@ -1580,18 +1417,9 @@ fn run_codex_task(
         },
     )?;
 
-    context.emit(ProviderEventKind::Status, "Checking workspace changes…")?;
-    let after_snapshot = workspace_snapshot(&workspace);
-    let bounded_paths = bound_paths(compare_snapshots(&before_snapshot, &after_snapshot));
-    let diff_capture = git_working_tree_diff(&workspace);
-    let (diff, original_diff_bytes, diff_truncated) =
-        bound_diff(diff_capture.as_ref().map(|capture| capture.text.clone()));
     context.emit(
         ProviderEventKind::Complete,
-        format!(
-            "Completed with {} changed file(s).",
-            bounded_paths.original_count
-        ),
+        "Provider completed; bounded workspace evidence will be finalized.",
     )?;
 
     Ok(ProviderRunResult {
@@ -1600,23 +1428,10 @@ fn run_codex_task(
         response_id: runtime.response_id,
         model,
         usage: runtime.usage,
-        changed_files: bounded_paths.paths,
-        diff,
+        changed_files: Vec::new(),
+        diff: None,
         duration_seconds: started.elapsed().as_secs(),
-        evidence: ProviderRunEvidence {
-            diff_truncated: diff_truncated
-                || diff_capture
-                    .as_ref()
-                    .is_some_and(|capture| capture.truncated),
-            changed_files_truncated: bounded_paths.truncated,
-            before_snapshot_truncated: before_snapshot.truncated,
-            after_snapshot_truncated: after_snapshot.truncated,
-            original_diff_bytes: diff_capture
-                .as_ref()
-                .map_or(original_diff_bytes as u64, |capture| capture.original_bytes),
-            original_changed_file_count: bounded_paths.original_count as u64,
-            ..runtime.evidence
-        },
+        evidence: runtime.evidence,
     })
 }
 
@@ -3324,6 +3139,7 @@ fn run_result_from_attempt(attempt: &RunAttemptProjection) -> Result<AgentRunRes
         },
         changed_files: attempt.changed_files.clone(),
         diff: attempt.diff.clone(),
+        workspace_changes: attempt.workspace_changes.clone(),
         duration_seconds: attempt.duration_seconds.unwrap_or_default(),
     })
 }
@@ -3341,7 +3157,54 @@ fn agent_run_result_from_provider(result: &ProviderRunResult) -> AgentRunResult 
         },
         changed_files: result.changed_files.clone(),
         diff: result.diff.clone(),
+        workspace_changes: result.evidence.workspace_changes.clone(),
         duration_seconds: result.duration_seconds,
+    }
+}
+
+fn attach_workspace_evidence(
+    result: Result<ProviderRunResult, ProviderError>,
+    workspace_changes: WorkspaceChangeEvidenceV1,
+) -> Result<ProviderRunResult, ProviderError> {
+    let changed_files = workspace_changes.compatibility_paths();
+    let compatibility_diff = workspace_changes.compatibility_diff();
+    let (diff, bounded_diff_bytes, compatibility_diff_truncated) = bound_diff(compatibility_diff);
+    let original_diff_bytes = workspace_changes
+        .details
+        .iter()
+        .fold(0_u64, |total, detail| {
+            total.saturating_add(detail.original_bytes)
+        })
+        .max(bounded_diff_bytes as u64);
+    let original_changed_file_count = workspace_changes.summary.total_changes;
+    let changed_files_truncated = workspace_changes.changes_truncated;
+    let before_snapshot_truncated = workspace_changes.before_snapshot_truncated;
+    let after_snapshot_truncated = workspace_changes.after_snapshot_truncated;
+    let diff_truncated = workspace_changes.details_truncated || compatibility_diff_truncated;
+
+    let apply = |evidence: &mut ProviderRunEvidence| {
+        evidence.diff_truncated |= diff_truncated;
+        evidence.changed_files_truncated |= changed_files_truncated;
+        evidence.before_snapshot_truncated |= before_snapshot_truncated;
+        evidence.after_snapshot_truncated |= after_snapshot_truncated;
+        evidence.original_diff_bytes = evidence.original_diff_bytes.max(original_diff_bytes);
+        evidence.original_changed_file_count = evidence
+            .original_changed_file_count
+            .max(original_changed_file_count);
+        evidence.workspace_changes = workspace_changes.clone();
+    };
+
+    match result {
+        Ok(mut result) => {
+            apply(&mut result.evidence);
+            result.changed_files = changed_files;
+            result.diff = diff;
+            Ok(result)
+        }
+        Err(mut error) => {
+            apply(&mut error.evidence);
+            Err(error)
+        }
     }
 }
 
@@ -3376,6 +3239,7 @@ fn provider_error_completion(
     let original_summary_bytes = completion.truncation.original_summary_bytes;
     completion.stderr_excerpt = error.evidence.stderr_excerpt.clone();
     completion.runtime_model = error.model.clone();
+    completion.workspace_changes = error.evidence.workspace_changes.clone();
     completion.truncation = RunTruncationEvidence {
         summary_truncated,
         original_summary_bytes,
@@ -3529,16 +3393,39 @@ async fn run_agent_task(
                 .with_provider(provider_id)
                 .with_model(authorized.model.runtime_model.clone())
             })?;
-        if dispatching.status == RunAttemptStatus::CancelRequested || context.is_cancelled() {
-            return Err(ProviderError::new(
-                ProviderErrorCode::Cancelled,
-                "Agent run cancelled by the user.",
-                true,
+        let workspace_baseline = if authorized.run_mode == ProviderRunMode::Execute {
+            resolve_workspace(&authorized.workspace_path)
+                .ok()
+                .map(|workspace| WorkspaceEvidenceBaseline::begin(&workspace))
+        } else {
+            None
+        };
+        let fallback_evidence = if authorized.run_mode == ProviderRunMode::Review {
+            WorkspaceChangeEvidenceV1::not_collected(
+                "Read-only review attempts do not own workspace mutation evidence.",
             )
-            .with_provider(provider_id)
-            .with_model(authorized.model.runtime_model.clone()));
-        }
-        production_provider_registry()?.run(provider_id, context, authorized)
+        } else {
+            WorkspaceChangeEvidenceV1::legacy_unavailable(
+                "The execution workspace could not be resolved for bounded evidence collection.",
+            )
+        };
+        let execution =
+            if dispatching.status == RunAttemptStatus::CancelRequested || context.is_cancelled() {
+                Err(ProviderError::new(
+                    ProviderErrorCode::Cancelled,
+                    "Agent run cancelled by the user.",
+                    true,
+                )
+                .with_provider(provider_id)
+                .with_model(authorized.model.runtime_model.clone()))
+            } else {
+                production_provider_registry()
+                    .and_then(|registry| registry.run(provider_id, context, authorized))
+            };
+        let workspace_changes = workspace_baseline
+            .map(WorkspaceEvidenceBaseline::finish)
+            .unwrap_or(fallback_evidence);
+        attach_workspace_evidence(execution, workspace_changes)
     })
     .await;
 
@@ -3566,6 +3453,7 @@ async fn run_agent_task(
                 },
                 changed_files: runtime.changed_files.clone(),
                 diff: runtime.diff.clone(),
+                workspace_changes: runtime.evidence.workspace_changes.clone(),
                 duration_seconds: runtime.duration_seconds,
                 error_code: None,
                 error_message: None,
@@ -3764,7 +3652,7 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::{
-        io::Write,
+        io::{Read, Write},
         net::{TcpListener, TcpStream},
         sync::atomic::AtomicU64,
     };
@@ -4152,7 +4040,9 @@ mod tests {
         assert!(run_body.contains("admit_run"));
         assert!(run_body.contains("prepare_run_attempt"));
         assert!(run_body.contains("complete_run"));
-        assert!(run_body.contains("production_provider_registry()?.run"));
+        assert!(run_body.contains("production_provider_registry()"));
+        assert!(run_body.contains("registry.run(provider_id, context, authorized)"));
+        assert!(run_body.contains("attach_workspace_evidence"));
         assert!(!run_body.contains("is_ollama_provider"));
     }
 
@@ -4247,6 +4137,9 @@ mod tests {
             },
             changed_files: Vec::new(),
             diff: None,
+            workspace_changes: WorkspaceChangeEvidenceV1::legacy_unavailable(
+                "Fixture run has no structured workspace evidence.",
+            ),
             error_code: None,
             error_message: None,
             progress_event_count: 0,
@@ -4399,13 +4292,17 @@ mod tests {
         let (endpoint, server) = start_ollama_tool_server(OllamaToolScenario::CreateThenFinish);
         let session = OllamaSession::for_test_endpoint(&endpoint)
             .expect("test Ollama session should be created");
+        let baseline = WorkspaceEvidenceBaseline::begin(&workspace.path);
 
-        let result = run_ollama_task_with_session(
-            ollama_run_context(),
-            ollama_run_request(&workspace.path),
-            session,
+        let result = attach_workspace_evidence(
+            run_ollama_task_with_session(
+                ollama_run_context(),
+                ollama_run_request(&workspace.path),
+                session,
+            ),
+            baseline.finish(),
         )
-        .expect("bounded Ollama tool run should finish");
+        .expect("bounded Ollama tool run should finish with workspace evidence");
 
         server.join().expect("test Ollama server should finish");
         assert_eq!(result.output, "Created and verified the requested file.");

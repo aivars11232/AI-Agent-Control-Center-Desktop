@@ -1,4 +1,5 @@
 use crate::app_state::ModelDefinition;
+use crate::workspace_evidence::WorkspaceChangeEvidenceV1;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -272,7 +273,7 @@ pub(crate) struct ProviderRunUsage {
     pub(crate) total_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderRunEvidence {
     pub(crate) stderr_excerpt: Option<String>,
     pub(crate) stdout_truncated: bool,
@@ -285,6 +286,28 @@ pub(crate) struct ProviderRunEvidence {
     pub(crate) original_stderr_bytes: u64,
     pub(crate) original_diff_bytes: u64,
     pub(crate) original_changed_file_count: u64,
+    pub(crate) workspace_changes: WorkspaceChangeEvidenceV1,
+}
+
+impl Default for ProviderRunEvidence {
+    fn default() -> Self {
+        Self {
+            stderr_excerpt: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            diff_truncated: false,
+            changed_files_truncated: false,
+            before_snapshot_truncated: false,
+            after_snapshot_truncated: false,
+            original_stdout_bytes: 0,
+            original_stderr_bytes: 0,
+            original_diff_bytes: 0,
+            original_changed_file_count: 0,
+            workspace_changes: WorkspaceChangeEvidenceV1::not_collected(
+                "Workspace evidence has not been attached to this provider result.",
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -434,7 +457,7 @@ pub(crate) struct ProviderError {
     pub(crate) provider_id: Option<RuntimeProviderId>,
     pub(crate) model: Option<String>,
     pub(crate) retryable: bool,
-    pub(crate) evidence: ProviderRunEvidence,
+    pub(crate) evidence: Box<ProviderRunEvidence>,
 }
 
 impl ProviderError {
@@ -449,7 +472,7 @@ impl ProviderError {
             provider_id: None,
             model: None,
             retryable,
-            evidence: ProviderRunEvidence::default(),
+            evidence: Box::new(ProviderRunEvidence::default()),
         }
     }
 
@@ -464,7 +487,7 @@ impl ProviderError {
     }
 
     pub(crate) fn with_evidence(mut self, evidence: ProviderRunEvidence) -> Self {
-        self.evidence = evidence;
+        self.evidence = Box::new(evidence);
         self
     }
 }

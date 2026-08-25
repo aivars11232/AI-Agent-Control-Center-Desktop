@@ -1,12 +1,12 @@
 # Current State
 
 > **Classification: Current static and fresh non-live evidence.** This snapshot
-> was refreshed for TASK-0011 on 2026-08-25 from starting commit
-> <code>080c5883ac88ae58093fc8e1580ab21b0d413ac0</code>
-> (<code>task10</code>) on branch <code>main</code>. At the TASK-0011 preflight,
+> was refreshed for TASK-0012 on 2026-08-25 from starting commit
+> <code>e6b7547f7ee6a2e586b91bce5ab817783e4b7e1b</code>
+> (<code>task11</code>) on branch <code>main</code>. At the TASK-0012 preflight,
 > checked-out <code>main</code> and <code>origin/main</code> both resolved to that
 > commit, with zero ahead/behind and a clean working tree. Its actual scope
-> matched the retained TASK-0010 implementation evidence. Reverify later
+> matched the retained TASK-0011 implementation evidence. Reverify later
 > implementation facts when they may have drifted.
 
 This document owns statements about what is implemented now. Planned behavior
@@ -37,11 +37,13 @@ global execute queue, and queue-head admission into the existing single-run
 coordinator. TASK-0011 adds schema-v6 structured review flows and attempts,
 strict bound request/result protocols, exact sequential reporting-chain
 reviewers, bounded revisions and review retries, trusted human decisions, and
-deterministic restart recovery.
+deterministic restart recovery. TASK-0012 adds schema-v7 versioned Git/non-Git
+workspace-change evidence, bounded before/after capture around every execution,
+structured review binding, and authoritative task/run-ledger presentation.
 Fresh deterministic checks establish the non-live verification baseline
 described below; they do not establish live runtime readiness.
 
-TASK-0011 did **not** run a live Codex task, Ollama, or another model/provider.
+TASK-0012 did **not** run a live Codex task, Ollama, or another model/provider.
 It also did not capture microphone input; import or start the Python listener;
 authorize a KDE/XDG portal; execute install/remove scripts; build a desktop
 package; or perform a desktop/system-control action. The retained TASK-0008
@@ -76,6 +78,7 @@ remain historical unless this document identifies a fresh result.
 | <code>src/taskOrchestration.ts</code> | Typed projection of backend queue order, positions, state, head admission, and routing evidence |
 | <code>src/reviewOrchestration.ts</code> | Typed projection of backend review flows, levels, attempts, human fallback, and revision state |
 | <code>src/runCoordinator.ts</code> | Typed renderer projection of authoritative run snapshots/events, stale-event rejection, and global stop state |
+| <code>src/workspaceEvidence.ts</code> | Versioned renderer projection, defensive shape normalization, truthful labels, and safe final-state openability for workspace evidence |
 | <code>src/persistence.ts</code> | Typed desktop bootstrap, one-time legacy cleanup, serialized writes, backup import, and reset adapter |
 | <code>src/App.css</code> | Main application styling and responsive behavior |
 | <code>src/voiceCommand.ts</code> | Renderer voice-command interpretation |
@@ -84,6 +87,7 @@ remain historical unless this document identifies a fresh result.
 | <code>src-tauri/src/codex_runtime.rs</code> | Linux Codex compatibility probing, isolated command construction, bounded JSONL protocol handling, lifecycle containment, cancellation, timeout, and evidence capture |
 | <code>src-tauri/src/ollama_runtime.rs</code> | Fixed-loopback Ollama discovery, per-model metadata, bounded async HTTP, task-deadline cancellation, and chat transport |
 | <code>src-tauri/src/workspace_tools.rs</code> | Linux descriptor-confined listing, ranged reads, hashes, create-only writes, preconditioned patches, and atomic conflict handling |
+| <code>src-tauri/src/workspace_evidence.rs</code> | Bounded descriptor-confined before/after snapshots, hardened Git inspection, change classification, detail redaction, and evidence validation |
 | <code>src-tauri/src/app_state.rs</code> | Backend application-state types, validation, canonical seed loading, and legacy normalization |
 | <code>src-tauri/src/agent_registry.rs</code> | Agent-registry DTOs, template catalog, role authority, legacy repair, and hierarchy validation |
 | <code>src-tauri/src/task_orchestration.rs</code> | Deterministic routing eligibility/scoring, workload/overflow decisions, and queue DTOs |
@@ -125,7 +129,7 @@ backup through the UI; TASK-0014 still owns the strict long-term backup format.
 
 In the desktop runtime, core product state and the run ledger are stored in
 <code>application-state.sqlite3</code> below Tauri's operating-system-provided
-application data directory. Schema version 6 stores:
+application data directory. Schema version 7 stores:
 
 - agents, stable template identity, lifecycle/repair metadata, reporting
   structure, and their nested tasks, activity, memory, roles, and policies;
@@ -138,14 +142,15 @@ application data directory. Schema version 6 stores:
   thresholds, overflow policy, and orchestration allocators/revision;
 - normalized review flows, revision rounds, structured stage attempts,
   request/result bindings, and review-orchestration revision;
-- immutable terminal run attempts, bounded progress/evidence, approval
-  reservations, and coordinator metadata.
+- immutable terminal run attempts, bounded progress/evidence, versioned
+  workspace changes on run attempts and task aggregates, approval reservations,
+  and coordinator metadata.
 
 The backend validates aggregate size, counts, identifiers, enums, numeric
 ranges, text bounds, and selected relationships before an atomic replacement.
 SQLite foreign keys, rollback-journal mode, full synchronous writes, integrity
 checks, transactional aggregate reads, a migration ledger,
-<code>PRAGMA user_version = 6</code>, and compare-and-swap revisions protect the
+<code>PRAGMA user_version = 7</code>, and compare-and-swap revisions protect the
 repository boundary. The database and its parent directory are restricted to
 the current user on Unix.
 
@@ -191,6 +196,13 @@ legacy in-flight review state to <code>awaiting_human</code>; it does not infer 
 provider verdict or resume dispatch. Dedicated backend commands start the exact
 next stage and record natively confirmed human decisions. Generic renderer
 saves preserve the normalized review ledger and cannot complete a review flow.
+
+Migration 0007 adds checked structured workspace-evidence JSON to run attempts
+and task aggregates. Terminal completion validates and writes the same bounded
+record into the immutable run ledger and its backend-owned task projection in
+one transaction, counts it toward ledger payload retention, and maps legacy
+null rows to explicit unavailable evidence. Generic renderer saves preserve
+the backend-owned task field and cannot forge or erase it.
 
 Privilege-increasing workspace-root, capability, approval-policy, review-role,
 safety-mode, approval-lifetime, and microphone changes require a trusted native
@@ -390,8 +402,21 @@ was checked in TASK-0008.
   and released when cancellation or failure occurs before dispatch. Once
   dispatch may have occurred, recovery never restores that approval for replay.
 - The backend keeps only the live cancellation handle in memory. Admission,
-  cancellation requests, task projections, events, outcomes, usage, changed
-  paths, diffs, errors, and recovery disposition are durable in SQLite.
+  cancellation requests, task projections, events, outcomes, usage, structured
+  workspace changes, bounded compatibility paths/diffs, errors, and recovery
+  disposition are durable in SQLite.
+- Execute runs take descriptor-confined before and after snapshots around the
+  provider call, regardless of success, cancellation, timeout, or failure. Git
+  roots additionally use hardened direct porcelain-v2 status plus staged and
+  unstaged diff commands; non-Git roots compare filesystem metadata and bounded
+  hashes. Review runs explicitly record that collection was not requested.
+- Evidence classifies staged, unstaged, untracked, added, modified, deleted,
+  renamed, type/status-changed, binary, redacted, and truncated cases. It never
+  follows symlinks or special files, uses <code>.git</code> metadata directories
+  as the sole unconditional name exclusion, and records every collection or limit
+  issue. Partial, unavailable, binary, redacted, conflicted, or inconsistent
+  evidence requires human review; legacy flat paths/diffs remain redacted
+  compatibility projections rather than review authority.
 - A Specialist result follows Senior → Team Leader → Supervisor; a Senior result
   follows Team Leader → Supervisor; a Team Leader result follows Supervisor;
   and a Supervisor result requires a trusted human decision. Each agent stage
@@ -435,10 +460,13 @@ Progress is limited to 256 events, 8 KiB per message, and 512 KiB per attempt.
 Codex prompts/JSON lines/stdout/stderr are limited to 256 KiB/64 KiB/1 MiB/
 512 KiB before the common ledger bounds apply; Ollama response and conversation
 payloads are limited to 2 MiB each; summaries to 128 KiB; errors to 64 KiB;
-diffs to 120,000 characters and 512 KiB; snapshots to 20,000 files or five
-seconds; and changed-file evidence to 250 paths and 256 KiB. The ledger keeps
-original counts/sizes and explicit truncation flags, which the renderer
-surfaces instead of implying complete evidence.
+diffs to 120,000 characters and 512 KiB; each workspace snapshot to 20,000
+entries, five seconds, and 512 MiB of hashing; and retained change evidence to
+250 entries and 256 KiB of path text. Structured evidence additionally limits
+each detail to 64 KiB, aggregate details to 512 KiB, Git status output to
+4 MiB, issues to 64, and its persisted JSON to 2 MiB. The ledger keeps original
+counts/sizes and explicit truncation flags, which the renderer surfaces instead
+of implying complete evidence.
 
 Ollama workspace listings expose at most 200 entries per page and reads expose
 at most 64 KiB per range. Full-file hashing and patches are limited to 8 MiB,
@@ -548,14 +576,14 @@ The repository-root entry points are:
   Clippy, shell/Python/strict-JSON syntax checks, npm/Cargo dependency trees,
   and production plus full npm audits.
 
-TASK-0011 focused checks passed on 2026-08-25: 15 structured-review protocol,
-migration, policy, lifecycle, cancellation, and recovery Rust tests; 2 review
-projection tests; all 41 frontend tests; TypeScript; and rustfmt. The complete
-<code>npm run verify:fast</code> and <code>npm run verify:full</code> routes
-passed with 41 frontend tests, 120 locked/offline Rust tests, a 42-module
-production build, Clippy with warnings
-denied, shell/Python/JSON checks, dependency trees, and both npm audits reporting
-zero vulnerabilities. Exact task evidence is recorded in
+TASK-0012 focused checks passed on 2026-08-25: 8 Git/non-Git collection tests,
+2 persistence/review binding tests, 6 renderer workspace/run projection tests,
+TypeScript, and the complete 130-test Rust suite across the focused runs.
+<code>npm run verify:fast</code> and <code>npm run verify:full</code> passed with
+9 frontend files/44 tests, TypeScript, rustfmt, 130 locked/offline Rust tests, a
+43-module production build, Clippy with warnings denied, shell/Python/JSON
+checks, dependency trees, and both npm audits reporting zero vulnerabilities.
+Exact task evidence is recorded in
 [planning/TASK_STATUS.md](planning/TASK_STATUS.md).
 
 <code>cargo-audit</code> is not installed in the inspected environment. The
@@ -570,7 +598,6 @@ belongs to TASK-0019.
 | Mandatory installed/CI Rust advisory tooling | TASK-0019 |
 | Live Codex compatibility, authentication, model, and packaged-platform acceptance | TASK-0020 |
 | Live Ollama connectivity, installed-model behavior, cancellation, and packaged-platform acceptance | TASK-0020 |
-| Complete Git/non-Git workspace change evidence | TASK-0012 |
 | Frontend modularity, strict backup, and full data lifecycle | TASK-0013–TASK-0014 |
 | Voice/system policy and KDE/XDG integration | TASK-0015–TASK-0016 |
 | Bounded specialist capabilities and management handoffs | TASK-0017–TASK-0018 |

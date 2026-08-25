@@ -33,6 +33,9 @@ use crate::task_orchestration::{
     route_task, CreateRoutedTaskRequest, QueueDisposition, RerouteTaskRequest, RoutingTaskInput,
     SetTaskQueueDispositionRequest, TaskOrchestrationSnapshot, TaskQueueEntry,
 };
+use crate::workspace_evidence::{
+    WorkspaceChangeEvidenceV1, MAX_PERSISTED_WORKSPACE_EVIDENCE_BYTES,
+};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::{
@@ -52,6 +55,8 @@ const TASK_ORCHESTRATION_MIGRATION: &str =
     include_str!("../migrations/0005_task_orchestration.sql");
 const REVIEW_ORCHESTRATION_MIGRATION: &str =
     include_str!("../migrations/0006_review_orchestration.sql");
+const WORKSPACE_EVIDENCE_MIGRATION: &str =
+    include_str!("../migrations/0007_workspace_evidence.sql");
 const MAX_AUTHORIZATION_RECORDS: i64 = 10_000;
 
 #[derive(Debug, Clone)]
@@ -983,6 +988,7 @@ impl StateRepository {
             workspace_id: Some(request.workspace_id),
             changed_files: Vec::new(),
             diff: None,
+            workspace_changes: None,
             duration_seconds: None,
             routing_mode: request.routing_mode,
             routed_from_agent_id: None,
@@ -1200,6 +1206,7 @@ impl StateRepository {
                 task.total_tokens = None;
                 task.changed_files.clear();
                 task.diff = None;
+                task.workspace_changes = None;
                 task.duration_seconds = None;
                 task.review_agent_id = None;
                 task.review_status = "Not Requested".to_string();
@@ -1217,10 +1224,11 @@ impl StateRepository {
                  SET queue_state = ?1, enqueue_sequence = ?2, status = ?3, phase = ?4,
                      completed_at = ?5, result = ?6, response_id = ?7,
                      runtime_model = ?8, total_tokens = ?9, diff = ?10,
-                     duration_seconds = ?11, review_agent_id = ?12,
-                     review_status = ?13, review_result = ?14, review_model = ?15,
-                     review_duration_seconds = ?16, reviewed_at = ?17
-                 WHERE owner_agent_id = ?18 AND id = ?19",
+                     workspace_evidence_json = ?11,
+                     duration_seconds = ?12, review_agent_id = ?13,
+                     review_status = ?14, review_result = ?15, review_model = ?16,
+                     review_duration_seconds = ?17, reviewed_at = ?18
+                 WHERE owner_agent_id = ?19 AND id = ?20",
                 params![
                     task.queue_state,
                     task.enqueue_sequence,
@@ -1232,6 +1240,15 @@ impl StateRepository {
                     task.runtime_model,
                     task.total_tokens,
                     task.diff,
+                    task.workspace_changes
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(|_| PersistenceError::new(
+                            "INVALID_WORKSPACE_EVIDENCE",
+                            "Task workspace evidence could not be normalized.",
+                            false,
+                        ))?,
                     task.duration_seconds,
                     task.review_agent_id,
                     task.review_status,
@@ -2884,6 +2901,28 @@ impl StateRepository {
                 false,
             )
         })?;
+        completion.workspace_changes.validate().map_err(|message| {
+            PersistenceError::new(
+                "INVALID_WORKSPACE_EVIDENCE",
+                format!("Workspace evidence is invalid: {message}."),
+                false,
+            )
+        })?;
+        let workspace_evidence_json = serde_json::to_string(&completion.workspace_changes)
+            .map_err(|_| {
+                PersistenceError::new(
+                    "INVALID_WORKSPACE_EVIDENCE",
+                    "Workspace evidence could not be normalized.",
+                    false,
+                )
+            })?;
+        if workspace_evidence_json.len() > MAX_PERSISTED_WORKSPACE_EVIDENCE_BYTES {
+            return Err(PersistenceError::new(
+                "RUN_OUTPUT_TOO_LARGE",
+                "Workspace evidence exceeds the persisted payload bound.",
+                false,
+            ));
+        }
         let mut truncation = completion.truncation.clone();
         if let Some(summary) = &summary {
             truncation.summary_truncated |= summary.truncated();
@@ -2928,13 +2967,16 @@ impl StateRepository {
         let stderr_text = stderr.as_ref().map(|value| value.as_str());
         let error_text = error_message.as_ref().map(|value| value.as_str());
         let payload_bytes = run_payload_bytes(
-            summary_text,
-            stderr_text,
-            completion.response_id.as_deref(),
+            [
+                summary_text,
+                stderr_text,
+                completion.response_id.as_deref(),
+                diff.as_deref(),
+                completion.error_code.as_deref(),
+                error_text,
+            ],
             &changed_files_json,
-            diff.as_deref(),
-            completion.error_code.as_deref(),
-            error_text,
+            &workspace_evidence_json,
         )?
         .checked_add(progress_evidence.2)
         .ok_or_else(|| {
@@ -2959,8 +3001,9 @@ impl StateRepository {
                      original_stdout_bytes = ?24, original_stderr_bytes = ?25,
                      original_summary_bytes = ?26, original_diff_bytes = ?27,
                      original_changed_file_count = ?28,
-                     omitted_progress_event_count = ?29, recovery_disposition = ?30
-                 WHERE id = ?31 AND status = ?32",
+                     omitted_progress_event_count = ?29, recovery_disposition = ?30,
+                     workspace_evidence_json = ?31
+                 WHERE id = ?32 AND status = ?33",
                 params![
                     terminal_status.as_str(),
                     timestamp,
@@ -2992,6 +3035,7 @@ impl StateRepository {
                     bounded_i64(truncation.original_changed_file_count),
                     bounded_i64(truncation.omitted_progress_event_count),
                     recovery_disposition,
+                    &workspace_evidence_json,
                     attempt_id,
                     current.status.as_str()
                 ],
@@ -3011,6 +3055,7 @@ impl StateRepository {
             completion.usage.total_tokens,
             &bounded_paths.paths,
             diff.as_deref(),
+            &workspace_evidence_json,
             completion.duration_seconds,
             timestamp,
             recovery_disposition,
@@ -3154,6 +3199,11 @@ impl StateRepository {
                     6,
                     "structured_review_orchestration",
                     REVIEW_ORCHESTRATION_MIGRATION,
+                )?,
+                6 => self.apply_migration(
+                    7,
+                    "structured_workspace_evidence",
+                    WORKSPACE_EVIDENCE_MIGRATION,
                 )?,
                 version => {
                     return Err(PersistenceError::new(
@@ -4249,6 +4299,7 @@ struct StoredRunAttempt {
     original_diff_bytes: i64,
     original_changed_file_count: i64,
     omitted_progress_event_count: i64,
+    workspace_evidence_json: Option<String>,
 }
 
 fn map_stored_run_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRunAttempt> {
@@ -4299,6 +4350,7 @@ fn map_stored_run_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRun
         original_diff_bytes: row.get(43)?,
         original_changed_file_count: row.get(44)?,
         omitted_progress_event_count: row.get(45)?,
+        workspace_evidence_json: row.get(46)?,
     })
 }
 
@@ -4314,7 +4366,7 @@ const RUN_ATTEMPT_PROJECTION_QUERY: &str =
             changed_files_truncated, progress_truncated, before_snapshot_truncated,
             after_snapshot_truncated, original_stdout_bytes, original_stderr_bytes,
             original_summary_bytes, original_diff_bytes, original_changed_file_count,
-            omitted_progress_event_count
+            omitted_progress_event_count, workspace_evidence_json
      FROM run_attempts WHERE id = ?1";
 
 fn read_run_attempt(
@@ -4347,6 +4399,36 @@ fn read_run_attempt(
                 false,
             )
         })?;
+    let workspace_changes = match stored.workspace_evidence_json.as_deref() {
+        Some(json) => {
+            if json.len() > MAX_PERSISTED_WORKSPACE_EVIDENCE_BYTES {
+                return Err(PersistenceError::new(
+                    "RUN_LEDGER_INVALID",
+                    "Stored workspace evidence exceeds its payload bound.",
+                    false,
+                ));
+            }
+            let evidence =
+                serde_json::from_str::<WorkspaceChangeEvidenceV1>(json).map_err(|_| {
+                    PersistenceError::new(
+                        "RUN_LEDGER_INVALID",
+                        "Stored workspace evidence is invalid.",
+                        false,
+                    )
+                })?;
+            evidence.validate().map_err(|message| {
+                PersistenceError::new(
+                    "RUN_LEDGER_INVALID",
+                    format!("Stored workspace evidence is invalid: {message}."),
+                    false,
+                )
+            })?;
+            evidence
+        }
+        None => WorkspaceChangeEvidenceV1::legacy_unavailable(
+            "This run predates structured workspace evidence persistence.",
+        ),
+    };
     Ok(RunAttemptProjection {
         id: stored.id,
         request_id: stored.request_id,
@@ -4378,6 +4460,7 @@ fn read_run_attempt(
         },
         changed_files,
         diff: stored.diff,
+        workspace_changes,
         error_code: stored.error_code,
         error_message: stored.error_message,
         progress_event_count: nonnegative_u64(stored.progress_event_count)?,
@@ -5028,6 +5111,7 @@ fn project_run_completion_to_task(
     total_tokens: Option<u64>,
     changed_files: &[String],
     diff: Option<&str>,
+    workspace_evidence_json: &str,
     duration_seconds: u64,
     timestamp: i64,
     recovery_disposition: Option<&str>,
@@ -5045,6 +5129,19 @@ fn project_run_completion_to_task(
             recovery_disposition,
         );
     }
+    transaction
+        .execute(
+            "UPDATE agent_tasks
+             SET workspace_evidence_json = ?1, diff = ?2
+             WHERE owner_agent_id = ?3 AND id = ?4",
+            params![
+                workspace_evidence_json,
+                diff,
+                attempt.task_owner_agent_id,
+                attempt.task_id
+            ],
+        )
+        .map_err(PersistenceError::database)?;
     match status {
         RunAttemptStatus::Succeeded => {
             let review_mode: String = transaction
@@ -5110,28 +5207,6 @@ fn project_run_completion_to_task(
                         ],
                     )
                     .map_err(PersistenceError::database)?;
-            transaction
-                .execute(
-                    "DELETE FROM task_changed_files
-                         WHERE owner_agent_id = ?1 AND task_id = ?2",
-                    params![attempt.task_owner_agent_id, attempt.task_id],
-                )
-                .map_err(PersistenceError::database)?;
-            for (position, path) in changed_files.iter().enumerate() {
-                transaction
-                    .execute(
-                        "INSERT INTO task_changed_files
-                             (owner_agent_id, task_id, position, path)
-                             VALUES (?1, ?2, ?3, ?4)",
-                        params![
-                            attempt.task_owner_agent_id,
-                            attempt.task_id,
-                            position as i64,
-                            path
-                        ],
-                    )
-                    .map_err(PersistenceError::database)?;
-            }
         }
         RunAttemptStatus::Cancelled | RunAttemptStatus::StartupFailed => {
             transaction
@@ -5179,6 +5254,28 @@ fn project_run_completion_to_task(
                 false,
             ));
         }
+    }
+    transaction
+        .execute(
+            "DELETE FROM task_changed_files
+             WHERE owner_agent_id = ?1 AND task_id = ?2",
+            params![attempt.task_owner_agent_id, attempt.task_id],
+        )
+        .map_err(PersistenceError::database)?;
+    for (position, path) in changed_files.iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO task_changed_files
+                 (owner_agent_id, task_id, position, path)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    attempt.task_owner_agent_id,
+                    attempt.task_id,
+                    position as i64,
+                    path
+                ],
+            )
+            .map_err(PersistenceError::database)?;
     }
     Ok(())
 }
@@ -5569,34 +5666,26 @@ fn project_recovered_attempt_to_task(
 }
 
 fn run_payload_bytes(
-    summary: Option<&str>,
-    stderr: Option<&str>,
-    response_id: Option<&str>,
+    text_parts: [Option<&str>; 6],
     changed_files_json: &str,
-    diff: Option<&str>,
-    error_code: Option<&str>,
-    error_message: Option<&str>,
+    workspace_evidence_json: &str,
 ) -> PersistenceResult<i64> {
-    let total = [
-        summary,
-        stderr,
-        response_id,
-        diff,
-        error_code,
-        error_message,
-    ]
-    .into_iter()
-    .flatten()
-    .try_fold(changed_files_json.len(), |total, value| {
-        total.checked_add(value.len())
-    })
-    .ok_or_else(|| {
-        PersistenceError::new(
-            "RUN_OUTPUT_TOO_LARGE",
-            "Run output size could not be represented safely.",
-            false,
+    let total = text_parts
+        .into_iter()
+        .flatten()
+        .try_fold(
+            changed_files_json
+                .len()
+                .saturating_add(workspace_evidence_json.len()),
+            |total, value| total.checked_add(value.len()),
         )
-    })?;
+        .ok_or_else(|| {
+            PersistenceError::new(
+                "RUN_OUTPUT_TOO_LARGE",
+                "Run output size could not be represented safely.",
+                false,
+            )
+        })?;
     i64::try_from(total).map_err(|_| {
         PersistenceError::new(
             "RUN_OUTPUT_TOO_LARGE",
@@ -5897,6 +5986,9 @@ fn copy_run_owned_task_fields(target: &mut AgentTask, source: &AgentTask) {
     target.total_tokens = source.total_tokens;
     target.changed_files.clone_from(&source.changed_files);
     target.diff.clone_from(&source.diff);
+    target
+        .workspace_changes
+        .clone_from(&source.workspace_changes);
     target.duration_seconds = source.duration_seconds;
     target.queue_state.clone_from(&source.queue_state);
     target.enqueue_sequence = source.enqueue_sequence;
@@ -7370,6 +7462,18 @@ fn write_task(
                 false,
             )
         })?;
+    let workspace_evidence_json = task
+        .workspace_changes
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| {
+            PersistenceError::new(
+                "INVALID_WORKSPACE_EVIDENCE",
+                "Task workspace evidence could not be normalized.",
+                false,
+            )
+        })?;
     transaction
         .execute(
             "INSERT INTO agent_tasks
@@ -7378,10 +7482,10 @@ fn write_task(
               total_tokens, workspace_id, diff, duration_seconds, routing_mode,
               routed_from_agent_id, routing_reason, review_agent_id, review_status,
               review_result, review_model, review_duration_seconds, reviewed_at,
-              queue_state, enqueue_sequence, routing_evidence_json)
+              queue_state, enqueue_sequence, routing_evidence_json, workspace_evidence_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                      ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                     ?25, ?26, ?27, ?28, ?29, ?30)",
+                     ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
             params![
                 owner_agent_id,
                 task.id,
@@ -7412,7 +7516,8 @@ fn write_task(
                 task.reviewed_at,
                 task.queue_state,
                 task.enqueue_sequence,
-                routing_evidence_json
+                routing_evidence_json,
+                workspace_evidence_json
             ],
         )
         .map_err(PersistenceError::database)?;
@@ -7647,7 +7752,7 @@ fn read_tasks(connection: &Connection, owner_agent_id: i64) -> PersistenceResult
                     workspace_id, diff, duration_seconds, routing_mode, routed_from_agent_id,
                     routing_reason, review_agent_id, review_status, review_result, review_model,
                     review_duration_seconds, reviewed_at, queue_state, enqueue_sequence,
-                    routing_evidence_json
+                    routing_evidence_json, workspace_evidence_json
              FROM agent_tasks WHERE owner_agent_id = ?1 ORDER BY position",
         )
         .map_err(PersistenceError::database)?;
@@ -7665,6 +7770,25 @@ fn read_tasks(connection: &Connection, owner_agent_id: i64) -> PersistenceResult
                     })
                 })
                 .transpose()?;
+            let workspace_evidence_json: Option<String> = row.get(28)?;
+            let workspace_changes = Some(
+                workspace_evidence_json
+                    .map(|json| {
+                        serde_json::from_str(&json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                28,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| {
+                        WorkspaceChangeEvidenceV1::legacy_unavailable(
+                            "This task predates structured workspace evidence persistence.",
+                        )
+                    }),
+            );
             Ok(AgentTask {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -7682,6 +7806,7 @@ fn read_tasks(connection: &Connection, owner_agent_id: i64) -> PersistenceResult
                 workspace_id: row.get(13)?,
                 changed_files: Vec::new(),
                 diff: row.get(14)?,
+                workspace_changes,
                 duration_seconds: row.get(15)?,
                 routing_mode: row.get(16)?,
                 routed_from_agent_id: row.get(17)?,
@@ -8018,7 +8143,8 @@ mod tests {
                     (3, "authoritative_run_coordination".to_string()),
                     (4, "dynamic_agent_registry".to_string()),
                     (5, "authoritative_task_orchestration".to_string()),
-                    (6, "structured_review_orchestration".to_string())
+                    (6, "structured_review_orchestration".to_string()),
+                    (7, "structured_workspace_evidence".to_string())
                 ]
             );
             let journal_mode: String = repository
@@ -8100,6 +8226,12 @@ mod tests {
         pending_review.title = "Legacy pending review".to_string();
         pending_review.review_status = "Pending".to_string();
         state.agents[1].tasks.push(pending_review);
+        connection
+            .execute(
+                "ALTER TABLE agent_tasks ADD COLUMN workspace_evidence_json TEXT",
+                [],
+            )
+            .unwrap();
         let transaction = connection.transaction().unwrap();
         write_application_state(
             &transaction,
@@ -8119,10 +8251,16 @@ mod tests {
             )
             .unwrap();
         transaction.commit().unwrap();
+        connection
+            .execute(
+                "ALTER TABLE agent_tasks DROP COLUMN workspace_evidence_json",
+                [],
+            )
+            .unwrap();
         drop(connection);
 
         let mut repository = StateRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 6);
+        assert_eq!(repository.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         let snapshot = repository.review_orchestration_snapshot().unwrap();
         assert_eq!(snapshot.flows.len(), 2);
         assert!(snapshot
@@ -9186,6 +9324,7 @@ mod tests {
             workspace_id: Some("workspace-authorization".to_string()),
             changed_files: Vec::new(),
             diff: None,
+            workspace_changes: None,
             duration_seconds: None,
             routing_mode: "selected".to_string(),
             routed_from_agent_id: None,
@@ -9275,14 +9414,76 @@ mod tests {
                 output_tokens: Some(20),
                 total_tokens: Some(30),
             },
-            changed_files: vec!["src/example.rs".to_string()],
-            diff: Some("diff --git a/src/example.rs b/src/example.rs".to_string()),
+            changed_files: Vec::new(),
+            diff: None,
+            workspace_changes: WorkspaceChangeEvidenceV1::complete_without_changes(
+                crate::workspace_evidence::WorkspaceEvidenceMode::Filesystem,
+            ),
             duration_seconds: 3,
             error_code: None,
             error_message: None,
             truncation: RunTruncationEvidence::default(),
             recovery_disposition: None,
         }
+    }
+
+    #[test]
+    fn task_0012_structured_evidence_is_persisted_projected_protected_and_immutable() {
+        let mut repository = initialized_authorization_repository();
+        let intent = authorization_intent();
+        approve_authorization(&mut repository, &intent);
+        let admitted = repository.admit_run("task-0012-evidence", &intent).unwrap();
+        repository
+            .prepare_run_attempt(admitted.attempt.id, "Ollama", "fixture-model", None)
+            .unwrap();
+        repository
+            .mark_run_dispatching(admitted.attempt.id)
+            .unwrap();
+        repository.mark_run_started(admitted.attempt.id).unwrap();
+        let completion = successful_completion("Structured evidence persisted.");
+        let completed = repository
+            .complete_run(admitted.attempt.id, &completion)
+            .unwrap();
+        assert_eq!(completed.workspace_changes, completion.workspace_changes);
+
+        let (stored_json, payload_bytes): (String, i64) = repository
+            .connection
+            .query_row(
+                "SELECT workspace_evidence_json, payload_bytes
+                 FROM run_attempts WHERE id = ?1",
+                [admitted.attempt.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorkspaceChangeEvidenceV1>(&stored_json).unwrap(),
+            completion.workspace_changes
+        );
+        assert!(payload_bytes >= stored_json.len() as i64);
+
+        let envelope = repository.load().unwrap().unwrap();
+        assert_eq!(
+            envelope.state.agents[1].tasks[0].workspace_changes.as_ref(),
+            Some(&completion.workspace_changes)
+        );
+        let mut forged = envelope.state;
+        forged.agents[1].tasks[0].workspace_changes = None;
+        repository
+            .save(envelope.revision, &forged, true)
+            .expect("generic renderer save should preserve backend-owned evidence");
+        assert_eq!(
+            repository.load().unwrap().unwrap().state.agents[1].tasks[0]
+                .workspace_changes
+                .as_ref(),
+            Some(&completion.workspace_changes)
+        );
+        assert!(repository
+            .connection
+            .execute(
+                "UPDATE run_attempts SET workspace_evidence_json = NULL WHERE id = ?1",
+                [admitted.attempt.id],
+            )
+            .is_err());
     }
 
     fn task_0011_repository() -> (StateRepository, i64) {
@@ -10391,7 +10592,7 @@ mod tests {
         drop(connection);
 
         let repository = StateRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 6);
+        assert_eq!(repository.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         let upgraded: (String, i64, String) = repository
             .connection
             .query_row(
