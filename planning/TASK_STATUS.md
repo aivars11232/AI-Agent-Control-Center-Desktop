@@ -33,8 +33,8 @@ ready merely because its predecessor's code was edited.
 | TASK-0009 | TASK-0008 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Dynamic agent registry and valid organizational hierarchy |
 | TASK-0010 | TASK-0009 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Deterministic routing, queueing, workload, and sequential scheduling |
 | TASK-0011 | TASK-0010 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Structured multi-level review, revisions, and recovery |
-| TASK-0012 | TASK-0011 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Complete workspace change evidence and Git/non-Git inspection |
-| TASK-0013 | TASK-0012 | NOT STARTED | NO | NOT STARTED | — | — | Frontend modularization, accessibility, and responsive operation |
+| TASK-0012 | TASK-0011 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Complete workspace change evidence and Git/non-Git inspection |
+| TASK-0013 | TASK-0012 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Frontend modularization, accessibility, and responsive operation |
 | TASK-0014 | TASK-0013 | NOT STARTED | NO | NOT STARTED | — | — | Data lifecycle, strict backup, retention, and truthful monitoring |
 | TASK-0015 | TASK-0014 | NOT STARTED | NO | NOT STARTED | — | — | Unified voice intent and system-action policy gateway |
 | TASK-0016 | TASK-0015 | NOT STARTED | NO | NOT STARTED | — | — | Offline voice runtime, KDE portal control, and XDG integration |
@@ -772,11 +772,125 @@ ready merely because its predecessor's code was edited.
   warnings-denied Clippy gate; payload-size inputs are grouped without changing
   counted fields; audit review additionally removed hashes after content-level
   secret detection and made Git attribute-forced binary/HEAD changes human-only
-- Remaining limits: redaction is pattern-based and cannot guarantee discovery
-  of every secret; Git helpers are deliberately disabled rather than executed;
-  no automatic rollback or Git commit is created; live provider/platform and
-  packaged acceptance remain with TASK-0020; TASK-0013 owns frontend
-  modularization/accessibility and is not started
+- Remaining limits at TASK-0012 closure: redaction is pattern-based and cannot
+  guarantee discovery of every secret; Git helpers are deliberately disabled
+  rather than executed; no automatic rollback or Git commit is created; live
+  provider/platform and packaged acceptance remain with TASK-0020
+- Git closure: implementation commit
+  <code>c937bd6c9d1ac3fb0db73a33e1ceb6901b2540ff</code>
+  (<code>task12</code>) was identified from actual Git history and was the
+  checked-out <code>main</code> HEAD at the TASK-0013 preflight. It was reachable
+  from <code>origin/main</code>; checked-out <code>main</code> and
+  <code>origin/main</code> resolved to that commit with zero ahead/behind and a
+  clean working tree. Its actual 26-file scope matched the retained TASK-0012
+  report with no unexplained intervening state, so all seven
+  successor-preflight closure conditions passed.
+
+## TASK-0013 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>c937bd6c9d1ac3fb0db73a33e1ceb6901b2540ff</code>
+  (<code>task12</code>)
+- Starting status: clean; <code>main</code> matched <code>origin/main</code> with
+  zero ahead/behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0012 as
+  recorded above; its exact implementation commit, origin reachability, branch
+  alignment, clean tree, and 26-file actual scope were freshly verified
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0013 AS PLANNED.</code>
+- Extracted pure task-safety, normalization, model-default, and error domains;
+  a typed desktop command/event client and shared authorization presentation;
+  a thin renderer entry; controller and shell; shared interaction primitives;
+  all nine feature pages; ordered shared styles; and Dashboard/Settings-owned
+  styles. <code>src/App.tsx</code> is now 13 lines and
+  <code>src/App.css</code> is a nine-import style entry rather than carrying
+  application and style ownership themselves
+- Added native <code>&lt;dialog&gt;</code> semantics with an accessible name,
+  priority initial focus, Escape/cancel handling, modal background inertness,
+  and opener-focus restoration; APG roving-tabindex/Arrow/Home/End tabs;
+  Enter/Space agent-card operation; skip navigation; page-heading focus on
+  navigation; labelled provider status; and polite live-status announcements
+- Retained the nine pages, browser-preview fallback, persisted state shapes,
+  routing/queue/review/workspace evidence, provider/model identities, and exact
+  Tauri command/event names and payloads. The typed client centralizes the
+  renderer seam but adds no renderer authority; backend authorization,
+  revisions, provider dispatch, durable state, and workspace safety remain
+  authoritative
+- Kept provider selection and system status visible at narrow widths, changed
+  the compact navigation and workspace tabs to usable wrapping layouts,
+  bounded narrow dialogs to the viewport, preserved touch target size, and
+  disabled nonessential transitions under reduced-motion preference without a
+  visual-brand redesign
+- Added exact development-only test dependencies:
+  <code>@testing-library/react@16.3.2</code>,
+  <code>@testing-library/user-event@14.6.6</code>,
+  <code>axe-core@4.13.0</code>, and <code>jsdom@30.0.1</code>. No production
+  dependency, Cargo manifest/lock, backend IPC, schema, migration, policy,
+  provider protocol, voice, KDE/portal, installer, backup format, or release
+  version changed
+- Focused slice verification remained green while extraction advanced: domain
+  characterization reached 10 files/45 tests; the typed desktop seam 11/48;
+  shell/dialog/tabs/navigation 14/53; workflow feature extraction 15/54; and
+  the final component/Dashboard/responsive selection ran 6 files/11 focused
+  tests. TypeScript passed at each slice boundary; the final focused production
+  build compiled 65 modules
+- Fresh native WebKitGTK 2.52.6 browser-preview acceptance verified keyboard
+  skip-to-main, sidebar activation and heading focus, named modal initial focus,
+  modal background exclusion, Escape and return focus, Enter activation of an
+  agent card, and Arrow-key tab activation. Provider controls remained visible
+  and the Dashboard reflow remained usable at 1280, 900, 680, and 520 CSS
+  pixels. MiniBrowser/KWin enforced a 405-pixel native client minimum; measured
+  WebKit page zoom produced <code>innerWidth=360</code> and
+  <code>innerWidth=320</code> equivalents, where the same controls remained
+  visible and usable. At a KWin-reported 508-pixel outer width, the
+  462-by-650-pixel dialog remained contained
+- A temporary native WebKitGTK probe set <code>gtk-enable-animations=false</code>
+  inside its own process only. The loaded product reported the OS media query
+  as true and computed both transition and animation duration as
+  <code>0.000001s</code>. This changed no personal desktop setting. All native
+  checks were non-authoritative browser-preview evidence, not installed or
+  packaged Tauri acceptance
+- Deterministic DOM tests cover the desktop client payload/event mappings,
+  dialog/tab/card interactions, shell navigation/focus, representative axe
+  checks, and responsive/reduced-motion CSS. Axe color-contrast evaluation is
+  not claimed from jsdom because it lacks a real canvas/layout engine; the
+  native preview was also visually inspected, while packaged accessibility
+  remains with TASK-0020
+- Complete fast gate: <code>npm run verify:fast</code> passed on 2026-08-26
+  with 17 frontend files/59 tests, TypeScript, rustfmt, and 130 locked/offline
+  Rust tests
+- Full non-live gate: <code>npm run verify:full</code> passed on 2026-08-26 with
+  the same fast checks, a 65-module production build, Clippy with warnings
+  denied, shell/Python/strict-JSON checks, npm/Cargo dependency trees, and
+  production plus full npm audits reporting zero vulnerabilities
+- Rust advisory result: **indeterminate** because <code>cargo-audit</code> is
+  unavailable; the full route recorded the skip explicitly and this
+  environmental limitation is not a pass
+- Live Codex/Ollama generation, provider authentication, microphone/listener,
+  portal authorization, native KDialog, install/remove, desktop package, and
+  application desktop-control actions: not run
+- Security/privacy/failure/recovery effects: renderer inputs remain untrusted;
+  no credential, provider output, workspace content, or microphone data was
+  added to tests or documentation; stale revisions and denied backend actions
+  keep their existing behavior; dialog cancellation is non-mutating; and all
+  persistence/restart recovery remains in the unchanged backend boundary
+- Minor in-scope implementation details: Vitest CSS processing was enabled so
+  responsive contracts exercise resolved CSS imports; feature extraction used
+  cohesive workflow groupings rather than artificial one-file checkpoints; and
+  native WebKit exposed both selector-order and autofocus timing defects in the
+  first dialog implementation, which were corrected with deterministic target
+  priority plus immediate/animation-frame focus and a regression test. The
+  final evidence audit also found that reduced motion covered only the app
+  preference; the OS <code>prefers-reduced-motion</code> path and its regression
+  assertion were added before rerunning the gates
+- Remaining limits: browser-preview WebKitGTK evidence does not establish
+  installed Tauri/WebView or packaged-platform behavior; TASK-0020 owns that
+  acceptance. TASK-0014 owns strict backup, retention, and full data lifecycle.
+  No TASK-0014 work was started
 - Git closure: **PENDING USER** review, commit, push, and clean-tree evidence
 
 ## Successor-preflight closure rule

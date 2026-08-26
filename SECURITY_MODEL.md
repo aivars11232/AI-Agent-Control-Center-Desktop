@@ -17,8 +17,10 @@
 > review requests/results, exact reporting-chain selection, bounded revisions,
 > trusted human gates, and deterministic recovery. TASK-0012 adds bounded
 > descriptor-confined Git/non-Git evidence, redaction, immutable persistence,
-> and fail-closed review eligibility; later tasks still own voice semantics,
-> packaging, and live acceptance.
+> and fail-closed review eligibility. TASK-0013 adds a typed renderer desktop
+> client and accessible feature boundaries without moving any authorization or
+> durable-state authority into the WebView; later tasks still own voice
+> semantics, packaging, and live acceptance.
 
 ## Security objective
 
@@ -225,11 +227,12 @@ retention, deletion, export, and recovery UX.
 ### Residual IPC and web content work
 
 The current privileged invoke surface is policy-gated and production CSP plus
-Tauri core permissions are narrowed. TASK-0013 still owns frontend
-modularization and a single renderer IPC adapter; TASK-0015 owns structured
-voice-intent semantics; TASK-0019 owns mandatory dependency/CI and packaged
-application gates. Current source tests do not replace installed-WebView or
-live platform acceptance.
+Tauri core permissions are narrowed. TASK-0013 centralizes renderer invokes and
+event listeners behind a typed desktop client, but the backend remains the
+authority and persistence keeps its revision-aware injected invoke boundary.
+TASK-0015 owns structured voice-intent semantics; TASK-0019 owns mandatory
+dependency/CI gates; TASK-0020 owns installed and packaged platform acceptance.
+Current source tests do not replace those later live gates.
 
 ### Heuristic task-text checks
 
@@ -260,8 +263,10 @@ workspace tools fail closed outside Linux.
 
 ### Verification coverage
 
-The checked-in non-live suite contains 44 frontend tests and 130 Rust tests. It
-covers frontend characterization plus backend policy, authorization, run
+The checked-in non-live suite contains 59 frontend tests and 130 Rust tests. It
+covers frontend characterization, typed IPC mapping, keyboard/dialog/tab
+interaction, deterministic axe checks, responsive-style contracts, plus backend
+policy, authorization, run
 coordination/recovery/bounds, provider identity/fake-adapter dispatch, Codex
 compatibility/command/protocol/descendant-process cases, strict IPC,
 CSP/capability, Ollama fake-server transport/discovery/cancellation, safe

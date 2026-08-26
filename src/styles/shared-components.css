@@ -1,0 +1,282 @@
+.main-content > * {
+  width: min(100%, 1580px);
+  margin-right: auto;
+  margin-left: auto;
+}
+
+.topbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  min-width: 0;
+  gap: 24px;
+  margin-bottom: 28px;
+}
+
+.topbar > div:first-child,
+.panel-heading > div:first-child {
+  min-width: 0;
+}
+
+.eyebrow {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+}
+
+.page-message {
+  margin-top: 7px;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.topbar-actions,
+.button-row,
+.workspace-tabs,
+.modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.workspace-tabs {
+  margin-bottom: 20px;
+}
+
+.button-row {
+  padding-top: 18px;
+}
+
+.primary-button,
+.secondary-button,
+.danger-button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 42px;
+  padding: 0 16px;
+  overflow: hidden;
+  border-radius: 10px;
+  font-weight: 650;
+  line-height: 1.2;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: transform 150ms ease, border-color 150ms ease,
+    background 150ms ease, box-shadow 150ms ease;
+}
+
+.primary-button:hover,
+.secondary-button:hover,
+.danger-button:hover {
+  transform: translateY(-1px);
+}
+
+.primary-button:active,
+.secondary-button:active,
+.danger-button:active {
+  transform: translateY(0);
+}
+
+.primary-button {
+  border: 1px solid transparent;
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  color: white;
+  box-shadow: 0 9px 24px var(--accent-glow);
+}
+
+.primary-button:hover {
+  box-shadow: 0 12px 30px var(--accent-glow);
+}
+
+.secondary-button {
+  border: 1px solid var(--border-strong);
+  background: var(--surface-input);
+  color: var(--text);
+}
+
+.secondary-button:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: var(--surface-hover);
+}
+
+.danger-button {
+  border: 1px solid var(--danger-border);
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.danger-button:hover {
+  border-color: var(--danger);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none !important;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(215px, 100%), 1fr));
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.summary-card,
+.panel {
+  min-width: 0;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 96%, transparent);
+  box-shadow: var(--shadow);
+}
+
+.summary-card {
+  min-height: 138px;
+  padding: 20px;
+  overflow: hidden;
+  border-radius: 15px;
+  transition: transform 180ms ease, border-color 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.summary-card:hover {
+  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+  box-shadow: var(--shadow-hover);
+}
+
+.summary-card span,
+.summary-card small {
+  display: block;
+}
+
+.summary-card span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.summary-card strong {
+  display: block;
+  margin: 20px 0 5px;
+  overflow-wrap: anywhere;
+  font-size: clamp(24px, 2.2vw, 30px);
+  letter-spacing: -0.03em;
+}
+
+.summary-card select {
+  margin-bottom: 8px;
+}
+
+.panel {
+  padding: clamp(17px, 2vw, 23px);
+  border-radius: 16px;
+}
+
+.panel + .panel,
+.summary-grid + .panel {
+  margin-top: 18px;
+}
+
+.panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  gap: 20px;
+  flex-wrap: wrap;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.agent-list {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  padding-top: 16px;
+}
+
+.agent-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  min-height: 82px;
+  gap: 20px;
+  padding: 17px 18px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: var(--surface-raised);
+  transition: transform 160ms ease, border-color 160ms ease,
+    background 160ms ease;
+}
+
+.agent-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+  background: color-mix(in srgb, var(--surface-raised) 92%, var(--accent));
+}
+
+.hierarchy-card {
+  padding: 0;
+  border-left: 3px solid var(--accent);
+}
+
+.hierarchy-card-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-width: 0;
+  gap: 20px;
+  padding: 17px 18px;
+  border-radius: inherit;
+  cursor: pointer;
+}
+
+.hierarchy-card-action:focus-visible,
+.team-agent-summary:focus-visible {
+  outline: 3px solid var(--accent-soft);
+  outline-offset: 2px;
+}
+
+.registry-warning {
+  display: block;
+  margin-top: 6px;
+  color: var(--warning);
+}
+
+.inline-error {
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border));
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--warning) 9%, var(--surface));
+  color: var(--text);
+}
+
+.agent-card > * {
+  min-width: 0;
+}
+
+.agent-card h3,
+.agent-card p,
+.agent-card small {
+  overflow-wrap: anywhere;
+}
+
+.agent-card p {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+

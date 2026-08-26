@@ -1,12 +1,12 @@
 # Current State
 
 > **Classification: Current static and fresh non-live evidence.** This snapshot
-> was refreshed for TASK-0012 on 2026-08-25 from starting commit
-> <code>e6b7547f7ee6a2e586b91bce5ab817783e4b7e1b</code>
-> (<code>task11</code>) on branch <code>main</code>. At the TASK-0012 preflight,
+> was refreshed for TASK-0013 on 2026-08-26 from starting commit
+> <code>c937bd6c9d1ac3fb0db73a33e1ceb6901b2540ff</code>
+> (<code>task12</code>) on branch <code>main</code>. At the TASK-0013 preflight,
 > checked-out <code>main</code> and <code>origin/main</code> both resolved to that
 > commit, with zero ahead/behind and a clean working tree. Its actual scope
-> matched the retained TASK-0011 implementation evidence. Reverify later
+> matched the retained TASK-0012 implementation evidence. Reverify later
 > implementation facts when they may have drifted.
 
 This document owns statements about what is implemented now. Planned behavior
@@ -40,10 +40,16 @@ reviewers, bounded revisions and review retries, trusted human decisions, and
 deterministic restart recovery. TASK-0012 adds schema-v7 versioned Git/non-Git
 workspace-change evidence, bounded before/after capture around every execution,
 structured review binding, and authoritative task/run-ledger presentation.
+TASK-0013 adds a thin renderer entry point, a stateful app controller, an
+accessible app shell, feature-owned pages and styles, pure domain helpers, a
+typed desktop client, native-dialog and tab semantics, keyboard-operable agent
+cards, deterministic DOM accessibility checks, and narrow-screen provider
+controls. It changes no backend command, schema, migration, policy, provider,
+or durable-state authority.
 Fresh deterministic checks establish the non-live verification baseline
 described below; they do not establish live runtime readiness.
 
-TASK-0012 did **not** run a live Codex task, Ollama, or another model/provider.
+TASK-0013 did **not** run a live Codex task, Ollama, or another model/provider.
 It also did not capture microphone input; import or start the Python listener;
 authorize a KDE/XDG portal; execute install/remove scripts; build a desktop
 package; or perform a desktop/system-control action. The retained TASK-0008
@@ -71,7 +77,12 @@ remain historical unless this document identifies a fresh result.
 
 | Path | Current responsibility |
 | --- | --- |
-| <code>src/App.tsx</code> | Main renderer UI, browser-preview compatibility, routing/review presentation, approval display, and typed intent IPC callers |
+| <code>src/App.tsx</code> | Thin renderer compatibility entry and shared type re-exports |
+| <code>src/app/AppController.tsx</code> / <code>src/app/AppShell.tsx</code> | State hydration, persistence/event coordination, feature composition, navigation, page focus, provider status, and global-run presentation |
+| <code>src/features/</code> | Dashboard, Agents, Tasks, Approvals, Activity, Voice Control, Reminders, Models, and Settings page modules |
+| <code>src/components/</code> | Native dialog, APG tabs, live status, and keyboard-action presentation primitives |
+| <code>src/services/desktopClient.ts</code> / <code>src/services/authorization.ts</code> | Typed renderer command/event facade and shared approval-request presentation helpers; backend remains authoritative |
+| <code>src/domain/</code> | Pure normalization, safety, model-default, and error helpers |
 | <code>src/applicationState.ts</code> / <code>src/application-state-seed.json</code> | Shared renderer state types and the canonical fresh-state seed |
 | <code>src/providerRegistry.ts</code> | Typed renderer projection of backend provider status, catalog bindings, and fail-closed model eligibility |
 | <code>src/agentRegistry.ts</code> | Dynamic active-agent, category-group, ancestor, hierarchy-repair, stable-template, and compatible-manager projections |
@@ -80,7 +91,7 @@ remain historical unless this document identifies a fresh result.
 | <code>src/runCoordinator.ts</code> | Typed renderer projection of authoritative run snapshots/events, stale-event rejection, and global stop state |
 | <code>src/workspaceEvidence.ts</code> | Versioned renderer projection, defensive shape normalization, truthful labels, and safe final-state openability for workspace evidence |
 | <code>src/persistence.ts</code> | Typed desktop bootstrap, one-time legacy cleanup, serialized writes, backup import, and reset adapter |
-| <code>src/App.css</code> | Main application styling and responsive behavior |
+| <code>src/App.css</code> / <code>src/styles/</code> / feature CSS | Ordered style entry, tokens, shell/shared/workflow/evidence/responsive rules, and feature-owned Dashboard/Settings rules |
 | <code>src/voiceCommand.ts</code> | Renderer voice-command interpretation |
 | <code>src-tauri/src/lib.rs</code> | Tauri command/startup composition, provider tool-loop orchestration, workspace evidence, native desktop control, and voice process management |
 | <code>src-tauri/src/provider_runtime.rs</code> | Provider-neutral identity, capability, request, event, cancellation, result, error, adapter, registry, and fake-test contracts |
@@ -100,10 +111,9 @@ remain historical unless this document identifies a fresh result.
 | <code>voice-runtime/</code> | Python offline listener plus setup scripts |
 | <code>install-kde.sh</code> / <code>uninstall-kde.sh</code> | KDE-oriented local install and removal scripts |
 
-The implementation remains concentrated, particularly in
-<code>src/App.tsx</code> and <code>src-tauri/src/lib.rs</code>. TASK-0013 retains
-ownership of frontend modularization; these file boundaries are observations,
-not architectural requirements.
+The renderer is now split by domain, service, shell, shared component, and
+feature responsibility. <code>src-tauri/src/lib.rs</code> remains a separate
+backend concentration and TASK-0013 deliberately does not redesign it.
 
 ## Renderer behavior
 
@@ -119,9 +129,10 @@ The current renderer exposes nine pages:
 8. Models
 9. Settings
 
-It contains renderer-side logic for agents, tasks, workspaces, capabilities,
+Feature modules contain renderer-side logic for agents, tasks, workspaces, capabilities,
 approval policy, routing, review, reminders, activity, models, preferences,
-and retention. Shared persisted types now live in
+and retention. The app controller composes those features and the typed desktop
+client centralizes Tauri command/event calls. Shared persisted types live in
 <code>src/applicationState.ts</code>. It can export and import a version 2 JSON
 backup through the UI; TASK-0014 still owns the strict long-term backup format.
 
@@ -539,14 +550,15 @@ and WebSocket endpoints.
 
 ## Verification inventory
 
-Eight Vitest files contain 41 deterministic frontend tests for renderer, voice,
-legacy migration, serialization, revision, fail-closed writer behavior,
-authoritative run projection, provider binding, readiness, model eligibility,
-dynamic agent visibility, lifecycle separation, legacy hierarchy repair,
-stable template lookup, compatible managers, registry IPC serialization, queue
-projection, and execute-head gating.
+Seventeen Vitest files contain 59 deterministic frontend tests for renderer
+domain characterization, voice, persistence, revision/fail-closed writer
+behavior, authoritative run/provider/registry/queue/review projections, exact
+desktop command/event mappings, native-dialog focus and cancellation, APG tab
+keyboard behavior, keyboard agent-card activation, skip navigation, page-focus
+transfer, deterministic axe checks, and responsive provider/reduced-motion
+style contracts.
 
-The Rust library contains 120 passing tests. They add Codex compatibility,
+The Rust library contains 130 passing tests. They add Codex compatibility,
 command-isolation, bounded protocol, fake-process descendant cleanup, provider
 registry, fake-adapter dispatch, exact identity, typed failure, run-state,
 concurrent admission, idempotency, approval-boundary, cancellation, timeout,
@@ -586,6 +598,18 @@ checks, dependency trees, and both npm audits reporting zero vulnerabilities.
 Exact task evidence is recorded in
 [planning/TASK_STATUS.md](planning/TASK_STATUS.md).
 
+TASK-0013 focused checks passed on 2026-08-26 for each extraction and
+accessibility slice. Native WebKitGTK 2.52.6 browser-preview acceptance used no
+desktop IPC and verified keyboard skip/navigation/page focus, keyboard agent
+card and Arrow-key tab activation, named modal focus/inertness/Escape/return
+focus, visible provider controls at 1280/900/680/520 CSS pixels, and equivalent
+360/320-pixel reflow measured through WebKit page zoom when MiniBrowser/KWin
+enforced a 405-pixel native client minimum. A 508-pixel outer window contained
+the 462-by-650-pixel dialog. An isolated per-process GTK reduced-motion signal
+made the product media query true and reduced computed transition/animation
+durations to 0.000001 seconds. No desktop setting, provider, microphone, portal,
+installer, or application desktop-control path was invoked.
+
 <code>cargo-audit</code> is not installed in the inspected environment. The
 full route therefore reports the Rust advisory result as **indeterminate** and
 does not represent the skip as a pass. Mandatory installed/CI security tooling
@@ -598,7 +622,8 @@ belongs to TASK-0019.
 | Mandatory installed/CI Rust advisory tooling | TASK-0019 |
 | Live Codex compatibility, authentication, model, and packaged-platform acceptance | TASK-0020 |
 | Live Ollama connectivity, installed-model behavior, cancellation, and packaged-platform acceptance | TASK-0020 |
-| Frontend modularity, strict backup, and full data lifecycle | TASK-0013–TASK-0014 |
+| Strict backup and full data lifecycle | TASK-0014 |
+| Installed WebView, packaged accessibility, and live platform acceptance | TASK-0020 |
 | Voice/system policy and KDE/XDG integration | TASK-0015–TASK-0016 |
 | Bounded specialist capabilities and management handoffs | TASK-0017–TASK-0018 |
 | Packaging, CI, live acceptance, and production gate | TASK-0019–TASK-0020 |

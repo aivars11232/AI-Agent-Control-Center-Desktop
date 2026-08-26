@@ -29,8 +29,12 @@ The binding decision record is
     User
       |
       v
-    React renderer (src/App.tsx)
-      |-- typed state/IPC adapter (src/applicationState.ts, src/persistence.ts)
+    React renderer (src/App.tsx -> src/app/AppController.tsx)
+      |-- app shell/navigation/status (src/app/AppShell.tsx)
+      |-- feature pages (src/features/*)
+      |-- shared accessible controls (src/components/*)
+      |-- typed desktop client (src/services/desktopClient.ts)
+      |-- state/persistence adapter (src/applicationState.ts, src/persistence.ts)
       |-- provider availability/model projection (src/providerRegistry.ts)
       |-- dynamic agent/group/hierarchy projection (src/agentRegistry.ts)
       |-- task queue/routing evidence projection (src/taskOrchestration.ts)
@@ -61,10 +65,15 @@ The binding decision record is
 
 ### Renderer
 
-<code>src/App.tsx</code> currently combines page composition, import/export,
-routing requests/evidence presentation, review, approval presentation, run
-orchestration, and most
-presentation logic.
+<code>src/App.tsx</code> is a thin compatibility entry point.
+<code>src/app/AppController.tsx</code> owns state hydration, persistence
+coordination, event subscriptions, and feature composition, while
+<code>src/app/AppShell.tsx</code> owns window-level navigation, provider status,
+skip navigation, page-focus transfer, and the global-run banner. Page UI lives
+under <code>src/features/</code>; accessible dialog, tabs, live status, and
+keyboard action primitives live under <code>src/components/</code>. The typed
+<code>src/services/desktopClient.ts</code> facade preserves the existing Tauri
+command names, payloads, and event channels.
 Persisted renderer types and the canonical seed are separated into
 <code>src/applicationState.ts</code> and
 <code>src/application-state-seed.json</code>. The desktop renderer gates the UI
@@ -274,14 +283,19 @@ The target is a modular monolith with the Tauri backend as the authoritative
 state and policy boundary. Later tasks should extract real modules only when
 they carry behavior; TASK-0001 intentionally creates no empty placeholders.
 
-### Directional renderer boundaries
+### Renderer boundaries
 
-- **App shell and navigation** — window-level layout and page routing.
+- **App shell and navigation** — window-level layout, page routing, skip
+  navigation, focus transfer, provider status, and global-run presentation.
 - **Feature UI** — dashboard, agents, tasks, approvals, reminders, activity,
   models, voice, and settings.
 - **Typed IPC adapter** — one renderer boundary for backend commands/events.
 - **View state** — transient selection, form, display, and accessibility state.
-- **Presentation components** — reusable controls without policy authority.
+- **Presentation components** — reusable dialog, tabs, status, and keyboard
+  controls without policy authority.
+
+TASK-0013 implements these renderer boundaries without changing backend IPC,
+schema, migration, authorization, routing, provider, or run authority.
 
 The renderer may request actions and display decisions. It must not mint
 authorization, decide durable run truth, or become the sole owner of domain
@@ -393,8 +407,9 @@ hardens the Codex adapter and TASK-0008 hardens the Ollama adapter.
 TASK-0009 establishes the dynamic agent registry and valid hierarchy;
 TASK-0010 establishes deterministic routing and sequential queueing; TASK-0011
 establishes structured review/revision/recovery; TASK-0012 establishes complete
-bounded workspace evidence orchestration. TASK-0013
-and TASK-0014 modularize UI/data lifecycle. TASK-0015 and TASK-0016 own system actions and
+bounded workspace evidence orchestration; TASK-0013 establishes the modular,
+accessible, responsive renderer. TASK-0014 owns the remaining data lifecycle.
+TASK-0015 and TASK-0016 own system actions and
 KDE/voice integration. TASK-0017 through TASK-0020 complete bounded roles,
 packaging, acceptance, and release.
 

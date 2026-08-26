@@ -1,0 +1,270 @@
+import { describe, expect, it, vi } from "vitest";
+import type { InvokeFunction } from "../persistence";
+import {
+  createDesktopClient,
+  type DesktopListenFunction,
+  type VoiceTranscriptEvent,
+} from "./desktopClient";
+
+type InvokeCall = {
+  command: string;
+  args?: Record<string, unknown>;
+};
+
+function clientHarness() {
+  const calls: InvokeCall[] = [];
+  const listeners = new Map<string, (payload: unknown) => void>();
+  const stoppedEvents: string[] = [];
+  const invokeFn: InvokeFunction = async <T,>(
+    command: string,
+    args?: Record<string, unknown>,
+  ) => {
+    calls.push({ command, args });
+    return undefined as T;
+  };
+  const listenFn: DesktopListenFunction = async <T,>(
+    eventName: string,
+    handler: (payload: T) => void,
+  ) => {
+    listeners.set(eventName, handler as (payload: unknown) => void);
+    return () => stoppedEvents.push(eventName);
+  };
+
+  return {
+    calls,
+    listeners,
+    stoppedEvents,
+    client: createDesktopClient(invokeFn, listenFn),
+  };
+}
+
+describe("typed desktop client command contracts", () => {
+  it("maps authorization, run, review, workspace, and desktop actions exactly", async () => {
+    const { calls, client } = clientHarness();
+    const reviewContext = {
+      flowId: 31,
+      stageAttemptId: 32,
+      revisionRound: 2,
+      level: "senior" as const,
+      requestFingerprint: "review-fingerprint",
+    };
+
+    await client.requestAuthorization({
+      kind: "runTask",
+      agentId: 4,
+      taskOwnerAgentId: 5,
+      taskId: 6,
+      runMode: "review",
+      reviewContext,
+    });
+    await client.resolveApproval(7, "approve");
+    await client.startReviewStage({
+      expectedRevision: 8,
+      taskOwnerAgentId: 5,
+      taskId: 6,
+    });
+    await client.recordHumanReviewDecision({
+      expectedRevision: 9,
+      taskOwnerAgentId: 5,
+      taskId: 6,
+      flowId: 31,
+      verdict: "changesRequested",
+      feedback: "Revise the bounded change.",
+    });
+    await client.runAgentTask({
+      runId: "run-10",
+      runMode: "review",
+      agentId: 4,
+      taskOwnerAgentId: 5,
+      taskId: 6,
+      reviewContext,
+    });
+    await client.cancelAgentRun("run-10");
+    await client.openWorkspaceItem({
+      agentId: 4,
+      workspaceId: "workspace-11",
+      itemPath: "src/main.ts",
+    });
+    await client.enableDesktopControl(4);
+    await client.launchAllowedApplication(4, "firefox");
+    await client.closeAllowedApplication(4, "firefox");
+    await client.sendDesktopPointerAction(4, "left-click");
+    await client.sendDesktopKeyboardAction(4, "ctrl+l");
+    await client.controlNamedDesktopWindow(4, "firefox", "maximize");
+    await client.typeDesktopText(4, "bounded text");
+    await client.launchDesktopApplication(4, "org.kde.dolphin");
+    await client.openStandardFolder(4, "Documents");
+    await client.closeActiveDesktopApplication(4);
+
+    expect(calls).toEqual([
+      {
+        command: "request_authorization",
+        args: {
+          intent: {
+            kind: "runTask",
+            agentId: 4,
+            taskOwnerAgentId: 5,
+            taskId: 6,
+            runMode: "review",
+            reviewContext,
+          },
+        },
+      },
+      {
+        command: "resolve_approval",
+        args: { request: { approvalId: 7, resolution: "approve" } },
+      },
+      {
+        command: "start_review_stage",
+        args: {
+          request: {
+            expectedRevision: 8,
+            taskOwnerAgentId: 5,
+            taskId: 6,
+          },
+        },
+      },
+      {
+        command: "record_human_review_decision",
+        args: {
+          request: {
+            expectedRevision: 9,
+            taskOwnerAgentId: 5,
+            taskId: 6,
+            flowId: 31,
+            verdict: "changesRequested",
+            feedback: "Revise the bounded change.",
+          },
+        },
+      },
+      {
+        command: "run_agent_task",
+        args: {
+          request: {
+            runId: "run-10",
+            runMode: "review",
+            agentId: 4,
+            taskOwnerAgentId: 5,
+            taskId: 6,
+            reviewContext,
+          },
+        },
+      },
+      { command: "cancel_agent_run", args: { runId: "run-10" } },
+      {
+        command: "open_workspace_item",
+        args: {
+          request: {
+            agentId: 4,
+            workspaceId: "workspace-11",
+            itemPath: "src/main.ts",
+          },
+        },
+      },
+      { command: "enable_desktop_control", args: { agentId: 4 } },
+      {
+        command: "launch_allowed_application",
+        args: { agentId: 4, application: "firefox" },
+      },
+      {
+        command: "close_allowed_application",
+        args: { agentId: 4, application: "firefox" },
+      },
+      {
+        command: "send_desktop_pointer_action",
+        args: { agentId: 4, action: "left-click" },
+      },
+      {
+        command: "send_desktop_keyboard_action",
+        args: { agentId: 4, action: "ctrl+l" },
+      },
+      {
+        command: "control_named_desktop_window",
+        args: { agentId: 4, application: "firefox", action: "maximize" },
+      },
+      {
+        command: "type_desktop_text",
+        args: { agentId: 4, text: "bounded text" },
+      },
+      {
+        command: "launch_desktop_application",
+        args: { agentId: 4, application: "org.kde.dolphin" },
+      },
+      {
+        command: "open_standard_folder",
+        args: { agentId: 4, folder: "Documents" },
+      },
+      {
+        command: "close_active_desktop_application",
+        args: { agentId: 4 },
+      },
+    ]);
+  });
+
+  it("maps snapshots, voice lifecycle, and persistence commands without payload drift", async () => {
+    const { calls, client } = clientHarness();
+
+    await client.desktopControlStatus();
+    await client.reviewOrchestrationSnapshot();
+    await client.voiceRuntimeStatus();
+    await client.installVoiceRuntime(12);
+    await client.installHighAccuracyVoiceRuntime(12);
+    await client.startVoiceListener(12);
+    await client.stopVoiceListener();
+    await client.chooseWorkspaceFolder();
+    await client.agentRegistrySnapshot();
+    await client.taskOrchestrationSnapshot();
+    await client.loadApplicationState();
+    await client.runCoordinatorSnapshot();
+    await client.providerRegistryStatus();
+    await client.invokeApplicationState("save_application_state", {
+      expectedRevision: 13,
+    });
+
+    expect(calls).toEqual([
+      { command: "desktop_control_status", args: undefined },
+      { command: "review_orchestration_snapshot", args: undefined },
+      { command: "voice_runtime_status", args: undefined },
+      { command: "install_voice_runtime", args: { agentId: 12 } },
+      {
+        command: "install_high_accuracy_voice_runtime",
+        args: { agentId: 12 },
+      },
+      { command: "start_voice_listener", args: { agentId: 12 } },
+      { command: "stop_voice_listener", args: undefined },
+      { command: "choose_workspace_folder", args: undefined },
+      { command: "agent_registry_snapshot", args: undefined },
+      { command: "task_orchestration_snapshot", args: undefined },
+      { command: "load_application_state", args: undefined },
+      { command: "run_coordinator_snapshot", args: undefined },
+      { command: "provider_registry_status", args: undefined },
+      {
+        command: "save_application_state",
+        args: { expectedRevision: 13 },
+      },
+    ]);
+  });
+
+  it("uses stable event names, forwards payloads, and exposes listener cleanup", async () => {
+    const { client, listeners, stoppedEvents } = clientHarness();
+    const transcriptHandler = vi.fn<(event: VoiceTranscriptEvent) => void>();
+    const openHandler = vi.fn<() => void>();
+
+    const stopTranscript = await client.onVoiceTranscript(transcriptHandler);
+    const stopOpen = await client.onVoiceControlOpen(openHandler);
+    listeners.get("voice-transcript")?.({
+      kind: "command",
+      transcript: "inspect the build",
+    });
+    listeners.get("voice-control-open")?.(undefined);
+    stopTranscript();
+    stopOpen();
+
+    expect(transcriptHandler).toHaveBeenCalledWith({
+      kind: "command",
+      transcript: "inspect the build",
+    });
+    expect(openHandler).toHaveBeenCalledOnce();
+    expect(stoppedEvents).toEqual(["voice-transcript", "voice-control-open"]);
+  });
+});

@@ -1,0 +1,210 @@
+.team-agent-summary {
+  flex: 1 1 220px;
+  min-width: 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.team-agent-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: nowrap;
+}
+
+.team-agent-actions > * {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.task-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+}
+
+.task-card-content {
+  width: 100%;
+  min-width: 0;
+}
+
+.task-card-actions {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 8px;
+}
+
+.task-card-actions > button {
+  flex: 0 1 auto;
+}
+
+.agent-status {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  padding: 7px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.agent-status.working {
+  color: var(--success);
+  background: rgba(67, 202, 133, 0.13);
+}
+
+.agent-status.waiting {
+  color: var(--muted);
+  background: color-mix(in srgb, var(--muted) 12%, transparent);
+}
+
+.agent-status.paused {
+  color: var(--warning);
+  background: rgba(246, 200, 119, 0.12);
+}
+
+.form-grid,
+.settings-grid,
+.slider-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
+  min-width: 0;
+  gap: 14px;
+}
+
+.settings-grid,
+.slider-grid {
+  margin-top: 18px;
+}
+
+.task-composer {
+  display: grid;
+  grid-template-columns:
+    minmax(250px, 2fr) minmax(150px, 1fr) minmax(145px, 0.9fr)
+    minmax(135px, 0.8fr) minmax(135px, 0.8fr) auto;
+  align-items: end;
+  min-width: 0;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.model-composer {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(180px, 240px) auto;
+  align-items: end;
+  min-width: 0;
+  gap: 12px;
+}
+
+.form-field {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.form-field span,
+.range-setting-heading span {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.form-field input,
+.form-field textarea,
+.form-field select,
+.summary-card select {
+  width: 100%;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  outline: none;
+  background: var(--surface-input);
+  color: var(--text);
+}
+
+.form-field input,
+.form-field select,
+.summary-card select {
+  height: 44px;
+  padding: 0 12px;
+}
+
+.form-field textarea {
+  min-height: 120px;
+  padding: 12px 13px;
+  resize: vertical;
+}
+
+.form-field input:focus,
+.form-field textarea:focus,
+.form-field select:focus,
+.summary-card select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.form-field input::placeholder,
+.form-field textarea::placeholder {
+  color: var(--subtle);
+}
+
+.modal::backdrop {
+  background: var(--overlay);
+  backdrop-filter: blur(9px);
+}
+
+.modal {
+  width: min(580px, 100%);
+  max-height: calc(100dvh - 48px);
+  margin: auto;
+  padding: 22px;
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 17px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.35);
+}
+
+.modal-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-close {
+  display: grid;
+  flex: 0 0 38px;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface-raised);
+  color: var(--muted);
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.modal-close:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.modal-actions {
+  justify-content: flex-end;
+  margin-top: 22px;
+}
+

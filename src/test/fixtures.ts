@@ -1,4 +1,4 @@
-import type { Agent, AgentTask } from "../App";
+import type { Agent, AgentTask } from "../applicationState";
 
 type AgentFixtureOverrides = Omit<
   Partial<Agent>,

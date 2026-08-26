@@ -3,9 +3,9 @@ import {
   normalizeApprovalRequest,
   normalizePerformance,
   normalizePreferences,
-  taskSafetyAssessment,
-  type ApprovalRequest,
-} from "./App";
+} from "./domain/normalization";
+import { taskSafetyAssessment } from "./domain/taskSafety";
+import type { ApprovalRequest } from "./applicationState";
 import { agentFixture, taskFixture } from "./test/fixtures";
 
 describe("task safety characterization", () => {
