@@ -1,9 +1,9 @@
 # Current State
 
 > **Classification: Current static and fresh non-live evidence.** This snapshot
-> was refreshed for TASK-0013 on 2026-08-26 from starting commit
-> <code>c937bd6c9d1ac3fb0db73a33e1ceb6901b2540ff</code>
-> (<code>task12</code>) on branch <code>main</code>. At the TASK-0013 preflight,
+> was refreshed for TASK-0014 on 2026-08-26 from starting commit
+> <code>572be762a38490f6a83076514686973e9c674c23</code>
+> (<code>task13</code>) on branch <code>main</code>. At the TASK-0014 preflight,
 > checked-out <code>main</code> and <code>origin/main</code> both resolved to that
 > commit, with zero ahead/behind and a clean working tree. Its actual scope
 > matched the retained TASK-0012 implementation evidence. Reverify later
@@ -46,10 +46,15 @@ typed desktop client, native-dialog and tab semantics, keyboard-operable agent
 cards, deterministic DOM accessibility checks, and narrow-screen provider
 controls. It changes no backend command, schema, migration, policy, provider,
 or durable-state authority.
-Fresh deterministic checks establish the non-live verification baseline
-described below; they do not establish live runtime readiness.
+TASK-0014 adds schema-v8 normalized lifecycle timestamps and durable bounded
+maintenance evidence; strict sanitized portable backup v3 export, preview, and
+atomic import; startup/periodic/mutation-triggered retention; revision-bound
+backend monitoring pages; scoped local-activity deletion; truthful desktop
+versus browser-preview labels; and explicit reset-versus-physical-purge
+wording. Fresh deterministic checks establish these non-live behaviors; they
+do not establish packaged or live runtime readiness.
 
-TASK-0013 did **not** run a live Codex task, Ollama, or another model/provider.
+TASK-0014 did **not** run a live Codex task, Ollama, or another model/provider.
 It also did not capture microphone input; import or start the Python listener;
 authorize a KDE/XDG portal; execute install/remove scripts; build a desktop
 package; or perform a desktop/system-control action. The retained TASK-0008
@@ -90,7 +95,8 @@ remain historical unless this document identifies a fresh result.
 | <code>src/reviewOrchestration.ts</code> | Typed projection of backend review flows, levels, attempts, human fallback, and revision state |
 | <code>src/runCoordinator.ts</code> | Typed renderer projection of authoritative run snapshots/events, stale-event rejection, and global stop state |
 | <code>src/workspaceEvidence.ts</code> | Versioned renderer projection, defensive shape normalization, truthful labels, and safe final-state openability for workspace evidence |
-| <code>src/persistence.ts</code> | Typed desktop bootstrap, one-time legacy cleanup, serialized writes, backup import, and reset adapter |
+| <code>src/dataLifecycle.ts</code> | Typed portable-backup, retention-evidence, monitoring-revision, task-page, and activity-page projections plus explicit browser-preview monitoring |
+| <code>src/persistence.ts</code> | Typed desktop bootstrap, one-time legacy cleanup, serialized writes, strict backup preview/import, and reset adapter |
 | <code>src/App.css</code> / <code>src/styles/</code> / feature CSS | Ordered style entry, tokens, shell/shared/workflow/evidence/responsive rules, and feature-owned Dashboard/Settings rules |
 | <code>src/voiceCommand.ts</code> | Renderer voice-command interpretation |
 | <code>src-tauri/src/lib.rs</code> | Tauri command/startup composition, provider tool-loop orchestration, workspace evidence, native desktop control, and voice process management |
@@ -105,6 +111,7 @@ remain historical unless this document identifies a fresh result.
 | <code>src-tauri/src/review_orchestration.rs</code> | Versioned review schemas, exact reporting-chain selection, prompt/protocol validation, and review DTOs |
 | <code>src-tauri/src/policy.rs</code> / <code>src-tauri/src/authorization.rs</code> | Normalized action intents, capability evaluation, native confirmation, and approval IPC contracts |
 | <code>src-tauri/src/run_coordinator.rs</code> | Run states, legal transitions, ledger projections, and explicit evidence/retention bounds |
+| <code>src-tauri/src/data_lifecycle.rs</code> | Strict duplicate-free bounded backup parsing, portable-state sanitization, backup/monitoring DTOs, and lifecycle constants |
 | <code>src-tauri/src/persistence.rs</code> / <code>src-tauri/migrations/</code> | SQLite repository/service, schema migration, crash-safe transactions, and persistence tests |
 | <code>src-tauri/src/main.rs</code> | Desktop entry point |
 | <code>src-tauri/tauri.conf.json</code> | Tauri window, security, bundle, and resource configuration |
@@ -133,14 +140,15 @@ Feature modules contain renderer-side logic for agents, tasks, workspaces, capab
 approval policy, routing, review, reminders, activity, models, preferences,
 and retention. The app controller composes those features and the typed desktop
 client centralizes Tauri command/event calls. Shared persisted types live in
-<code>src/applicationState.ts</code>. It can export and import a version 2 JSON
-backup through the UI; TASK-0014 still owns the strict long-term backup format.
+<code>src/applicationState.ts</code>. In the desktop runtime, Settings exports,
+previews, and imports the backend-owned portable backup v3 format. Browser mode
+retains a clearly labelled non-authoritative legacy version 2 preview path.
 
 ### Persistence
 
 In the desktop runtime, core product state and the run ledger are stored in
 <code>application-state.sqlite3</code> below Tauri's operating-system-provided
-application data directory. Schema version 7 stores:
+application data directory. Schema version 8 stores:
 
 - agents, stable template identity, lifecycle/repair metadata, reporting
   structure, and their nested tasks, activity, memory, roles, and policies;
@@ -156,12 +164,15 @@ application data directory. Schema version 7 stores:
 - immutable terminal run attempts, bounded progress/evidence, versioned
   workspace changes on run attempts and task aggregates, approval reservations,
   and coordinator metadata.
+- normalized Unix-millisecond task/activity/reminder lifecycle columns,
+  retention indexes, maintenance revision/totals, and the latest 100 bounded
+  maintenance-run evidence records.
 
 The backend validates aggregate size, counts, identifiers, enums, numeric
 ranges, text bounds, and selected relationships before an atomic replacement.
 SQLite foreign keys, rollback-journal mode, full synchronous writes, integrity
 checks, transactional aggregate reads, a migration ledger,
-<code>PRAGMA user_version = 7</code>, and compare-and-swap revisions protect the
+<code>PRAGMA user_version = 8</code>, and compare-and-swap revisions protect the
 repository boundary. The database and its parent directory are restricted to
 the current user on Unix.
 
@@ -172,7 +183,8 @@ expired, non-authoritative history. Generic whole-state saves do not replace
 approval tables. A backend-issued approval must be pending, current, exact,
 natively confirmed, and unconsumed; consumption is atomic and one-use.
 Issuance fails closed at the state contract's 10,000-record approval-history
-limit; TASK-0014 retains ownership of automated retention and deletion policy.
+limit. Schema-v8 retention prunes only resolved/consumed approval history and
+protects active authority and reservations.
 
 Migration 0003 adds run attempts, progress events, approval reservations, and
 single-row coordinator metadata. Admission uses an immediate SQLite
@@ -214,6 +226,36 @@ record into the immutable run ledger and its backend-owned task projection in
 one transaction, counts it toward ledger payload retention, and maps legacy
 null rows to explicit unavailable evidence. Generic renderer saves preserve
 the backend-owned task field and cannot forge or erase it.
+
+Migration 0008 adds normalized retention timestamps, indexes, a lifecycle
+revision/totals row, and bounded maintenance-run evidence. Maintenance runs at
+desktop startup, every 15 minutes, after retention-setting changes, and after
+imports; a bounded backlog retries after one minute. Each pass deletes at most
+500 eligible rows per domain, protects active tasks/runs/reviews/approvals,
+increments affected authority revisions, and records clock rollback instead
+of performing age-based deletion. Task retention also governs terminal run and
+review history; activity retention governs local activity, resolved/consumed
+approval history, and resolved reminders. <code>never</code> disables the
+age-based policy but does not remove the existing hard aggregate/ledger caps.
+
+Portable backup v3 is capped at 16 MiB and 128 JSON levels, rejects duplicate
+keys, unknown fields, trailing content, unsupported versions, and future
+schemas, and sanitizes active tasks/approvals/runtime evidence before export or
+import. Import preview and apply use the same backend candidate, compare the
+application revision, require an idle run boundary and trusted native
+confirmation, clear mismatched run/review history, and commit atomically.
+Provider credentials, authorization intents, run/review ledgers, portal
+sessions, and voice-runtime sessions are not portable backup domains.
+
+Dashboard, Tasks, Activity, and Settings consume backend monitoring snapshots
+and pages bound to one application/task/run/review/lifecycle revision tuple.
+Task and activity pages are capped at 100 rows; stale tuples return
+<code>MONITORING_REVISION_CONFLICT</code>. Activity deletion changes only the
+local configuration timeline; clearing it requires native confirmation and
+cannot delete immutable run/review evidence. Browser projections state that
+they are non-authoritative. Desktop monitoring refreshes after serialized state
+commits and at a bounded one-minute interval; authoritative task/activity pages
+do not substitute renderer records while an exact-tuple query is pending.
 
 Privilege-increasing workspace-root, capability, approval-policy, review-role,
 safety-mode, approval-lifetime, and microphone changes require a trusted native
@@ -550,7 +592,7 @@ and WebSocket endpoints.
 
 ## Verification inventory
 
-Seventeen Vitest files contain 59 deterministic frontend tests for renderer
+Eighteen Vitest files contain 61 deterministic frontend tests for renderer
 domain characterization, voice, persistence, revision/fail-closed writer
 behavior, authoritative run/provider/registry/queue/review projections, exact
 desktop command/event mappings, native-dialog focus and cancellation, APG tab
@@ -558,7 +600,7 @@ keyboard behavior, keyboard agent-card activation, skip navigation, page-focus
 transfer, deterministic axe checks, and responsive provider/reduced-motion
 style contracts.
 
-The Rust library contains 130 passing tests. They add Codex compatibility,
+The Rust library contains 138 passing tests. They add Codex compatibility,
 command-isolation, bounded protocol, fake-process descendant cleanup, provider
 registry, fake-adapter dispatch, exact identity, typed failure, run-state,
 concurrent admission, idempotency, approval-boundary, cancellation, timeout,
@@ -610,6 +652,13 @@ made the product media query true and reduced computed transition/animation
 durations to 0.000001 seconds. No desktop setting, provider, microphone, portal,
 installer, or application desktop-control path was invoked.
 
+TASK-0014 focused checks passed on 2026-08-26: 4 strict portable-backup tests,
+3 bounded-retention/timestamp-stability/clock/active-work tests, 1 transactional
+monitoring and activity-scope test, 3 focused frontend files/14 persistence-
+writer/browser-preview/typed-client tests, TypeScript, and a 66-module
+production build. The complete fast and full gate results are recorded in
+[planning/TASK_STATUS.md](planning/TASK_STATUS.md).
+
 <code>cargo-audit</code> is not installed in the inspected environment. The
 full route therefore reports the Rust advisory result as **indeterminate** and
 does not represent the skip as a pass. Mandatory installed/CI security tooling
@@ -622,7 +671,7 @@ belongs to TASK-0019.
 | Mandatory installed/CI Rust advisory tooling | TASK-0019 |
 | Live Codex compatibility, authentication, model, and packaged-platform acceptance | TASK-0020 |
 | Live Ollama connectivity, installed-model behavior, cancellation, and packaged-platform acceptance | TASK-0020 |
-| Strict backup and full data lifecycle | TASK-0014 |
+| Physical database/file purge and installed removal evidence | TASK-0019 |
 | Installed WebView, packaged accessibility, and live platform acceptance | TASK-0020 |
 | Voice/system policy and KDE/XDG integration | TASK-0015–TASK-0016 |
 | Bounded specialist capabilities and management handoffs | TASK-0017–TASK-0018 |

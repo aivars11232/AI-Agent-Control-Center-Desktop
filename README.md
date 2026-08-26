@@ -35,6 +35,9 @@ The current checkout contains:
   cancellable HTTP requests, and conflict-safe Linux workspace tools;
 - a feature-modular React renderer with a typed desktop client, accessible
   navigation/dialog/tab/card primitives, and narrow-screen provider controls;
+- schema-v8 lifecycle timestamps and durable bounded retention evidence,
+  strict sanitized portable backup v3, and revision-bound backend monitoring
+  with explicitly non-authoritative browser previews;
 - local workspace, task, agent, approval, reminder, and model-management UI;
 - an included Python voice runtime and KDE-oriented install/remove scripts.
 
@@ -60,6 +63,10 @@ rows remain non-authoritative history.
 Browser preview storage is retained only as a non-authoritative preview path.
 Renderer modularization does not move authorization, routing, review, run, or
 provider authority out of the Rust backend.
+Desktop backup export/import, retention, monitoring counts/pages, and local
+activity deletion are also backend-owned. Activity-history controls do not
+delete the immutable run/review ledger, and reset restores portable state
+without claiming physical database/file erasure.
 
 The supported product direction is Arch Linux, KDE Plasma, and Wayland first.
 Other platforms are not current release targets.
@@ -96,9 +103,9 @@ Run the deterministic fast characterization gate from the repository root:
 npm run verify:fast
 ```
 
-It runs 59 frontend characterization, interaction, accessibility, persistence,
+It runs 61 frontend characterization, interaction, accessibility, persistence,
 coordinator, provider, registry, and orchestration tests, the TypeScript check,
-the Rust format check, and 130 locked/offline Rust tests.
+the Rust format check, and 138 locked/offline Rust tests.
 The full gate adds the
 frontend build, Clippy, shell/Python/JSON checks, dependency-tree checks, and
 production plus development npm audits:

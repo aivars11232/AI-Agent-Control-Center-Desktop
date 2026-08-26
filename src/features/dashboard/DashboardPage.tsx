@@ -6,6 +6,7 @@ import type { AgentGroup } from "../../agentRegistry";
 import { queueStateLabel } from "../../taskOrchestration";
 import type { TaskOrchestrationSnapshot } from "../../taskOrchestration";
 import { workspaceEvidenceStatusLabel, workspaceReviewabilityLabel } from "../../workspaceEvidence";
+import type { MonitoringSnapshot } from "../../dataLifecycle";
 
 
 export function DashboardPage({
@@ -13,6 +14,7 @@ export function DashboardPage({
   approvalRequests,
   taskOrchestration,
   runCoordinator,
+  monitoringSnapshot,
   onOpenAgents,
   onOpenTasks,
   onOpenApprovals,
@@ -21,22 +23,25 @@ export function DashboardPage({
   approvalRequests: ApprovalRequest[];
   taskOrchestration: TaskOrchestrationSnapshot;
   runCoordinator: RunCoordinatorUiState;
+  monitoringSnapshot?: MonitoringSnapshot | null;
   onOpenAgents: () => void;
   onOpenTasks: () => void;
   onOpenApprovals: () => void;
 }) {
   const [activeAgentGroup, setActiveAgentGroup] =
     useState<AgentGroup>("Development");
-  const activeAgentCount = agents.filter(
-    (agent) => agent.status === "Working",
-  ).length;
+  const activeAgentCount =
+    monitoringSnapshot?.counts.activeAgents ??
+    agents.filter((agent) => agent.status === "Working").length;
 
-  const runningTaskCount = agents.reduce(
-    (total, agent) =>
-      total +
-      agent.tasks.filter((task) => task.status === "Running").length,
-    0,
-  );
+  const runningTaskCount =
+    monitoringSnapshot?.counts.runningTasks ??
+    agents.reduce(
+      (total, agent) =>
+        total +
+        agent.tasks.filter((task) => task.status === "Running").length,
+      0,
+    );
 
   const waitingTaskCount = taskOrchestration.executeQueue.length;
 
@@ -79,7 +84,9 @@ export function DashboardPage({
           <span className="eyebrow">OVERVIEW</span>
           <h1>Dashboard</h1>
           <p className="page-message">
-            Live status across all configured agents.
+            {monitoringSnapshot?.authoritative
+              ? "Transactional backend status across configured agents."
+              : "Browser preview only; these counts are not authoritative backend evidence."}
           </p>
         </div>
 
@@ -92,7 +99,9 @@ export function DashboardPage({
         <article className="summary-card">
           <span>Active agents</span>
           <strong>{activeAgentCount}</strong>
-          <small>{agents.length} configured</small>
+          <small>
+            {monitoringSnapshot?.counts.configuredAgents ?? agents.length} configured
+          </small>
         </article>
 
         <article className="summary-card">
@@ -104,17 +113,21 @@ export function DashboardPage({
         <article className="summary-card">
           <span>Total tasks</span>
           <strong>
-            {agents.reduce(
-              (total, agent) => total + agent.tasks.length,
-              0,
-            )}
+            {monitoringSnapshot?.counts.totalTasks ??
+              agents.reduce(
+                (total, agent) => total + agent.tasks.length,
+                0,
+              )}
           </strong>
           <small>Across all agents</small>
         </article>
 
         <article className="summary-card">
           <span>Retained runs</span>
-          <strong>{runCoordinator.snapshot.retainedAttemptCount}</strong>
+          <strong>
+            {monitoringSnapshot?.counts.retainedRunAttempts ??
+              runCoordinator.snapshot.retainedAttemptCount}
+          </strong>
           <small>Immutable evidence ledger</small>
         </article>
       </section>

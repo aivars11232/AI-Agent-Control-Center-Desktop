@@ -149,7 +149,8 @@ describe("serialized application-state writes", () => {
       });
     };
     const failure = vi.fn();
-    const writer = new ApplicationStateWriter(invoke, 1, failure);
+    const commit = vi.fn();
+    const writer = new ApplicationStateWriter(invoke, 1, failure, commit);
     const first = createDefaultApplicationState();
     first.preferences.theme = "light";
     const latest = createDefaultApplicationState();
@@ -175,6 +176,9 @@ describe("serialized application-state writes", () => {
 
     await writer.flush();
     expect(failure).not.toHaveBeenCalled();
+    expect(commit.mock.calls.map(([receipt]) => receipt.revision)).toEqual([
+      2, 3,
+    ]);
   });
 
   it("fails closed after a save error and does not issue later writes", async () => {

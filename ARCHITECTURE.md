@@ -129,8 +129,8 @@ provider startup.
 ### Persistence and migration
 
 The desktop database is <code>application-state.sqlite3</code> below Tauri's
-platform application-data directory. Migrations 0001 through 0007 establish
-schema version 7 plus a migration ledger. Repository writes replace one
+platform application-data directory. Migrations 0001 through 0008 establish
+schema version 8 plus a migration ledger. Repository writes replace one
 validated aggregate inside an immediate transaction and use a monotonically
 increasing revision to reject stale writers. Startup refuses corrupt or
 unsupported newer databases and retains the typed error for the renderer
@@ -148,8 +148,11 @@ Only a fully parsed and validated candidate commits. Legacy pending/approved
 approvals are downgraded to expired non-authoritative history, and browser keys
 are deleted only after the transaction commits. Backend-issued records use a
 separate authoritative origin and cannot be manufactured by migration or a
-whole-state save. The current version 2 backup UI remains compatible through a bounded
-backend import; strict backup lifecycle design remains owned by TASK-0014.
+whole-state save. Portable backup v3 export, preview, and apply are backend
+owned, strict, bounded, sanitized, revision checked, idle-run guarded, natively
+confirmed, and atomic. Legacy version 2 imports pass through the same
+sanitization boundary; browser-only version 2 behavior is explicitly a
+non-authoritative preview.
 
 Schema v3 adds immutable-terminal run attempts, bounded progress events,
 approval reservations, and coordinator metadata. One active-attempt foreign
@@ -194,6 +197,28 @@ unavailable evidence when projected. Completion validates and persists the
 record transactionally, accounts it against run retention, and relies on the
 existing terminal-attempt trigger plus generic-save field preservation to keep
 the evidence backend-owned and immutable after completion.
+
+Schema v8 adds normalized Unix-millisecond lifecycle columns, retention
+indexes, durable lifecycle metadata, and a latest-100 maintenance evidence
+ledger. A synchronous bounded pass runs at startup and after retention-setting
+or import mutations; a non-AI timer runs every 15 minutes and retries bounded
+backlog after one minute. Each domain deletes at most 500 eligible rows per
+pass, active authority/work remains protected, and backward clock movement is
+recorded while age deletion is skipped. Maintenance advances the application,
+task, run, review, and lifecycle revisions that its exact deletions affect.
+Normalized timestamps survive unrelated aggregate-state saves, so an inferred
+legacy age cannot silently move forward on each renderer mutation.
+
+Monitoring reads the application, task-orchestration, run-coordinator,
+review-orchestration, and lifecycle revisions in one transaction. Task and
+activity page queries require that exact tuple, reject stale callers, and cap
+pages at 100 records. Local activity deletion advances application/lifecycle
+revisions but does not address run/review tables. Portable backup and
+monitoring DTOs live in the data-lifecycle domain; persistence remains the
+transaction authority and the typed desktop client remains only a renderer
+adapter. The renderer refreshes monitoring after state commits and at a bounded
+one-minute interval; authoritative pages remain blank while their exact-tuple
+query is loading rather than falling back to renderer estimates.
 
 ### Voice runtime
 
@@ -294,8 +319,9 @@ they carry behavior; TASK-0001 intentionally creates no empty placeholders.
 - **Presentation components** — reusable dialog, tabs, status, and keyboard
   controls without policy authority.
 
-TASK-0013 implements these renderer boundaries without changing backend IPC,
-schema, migration, authorization, routing, provider, or run authority.
+TASK-0013 implements the modular renderer boundaries. TASK-0014 connects its
+Dashboard, Tasks, Activity, and Settings projections to revision-bound backend
+monitoring and data-lifecycle commands without moving authority into the UI.
 
 The renderer may request actions and display decisions. It must not mint
 authorization, decide durable run truth, or become the sole owner of domain
@@ -408,7 +434,8 @@ TASK-0009 establishes the dynamic agent registry and valid hierarchy;
 TASK-0010 establishes deterministic routing and sequential queueing; TASK-0011
 establishes structured review/revision/recovery; TASK-0012 establishes complete
 bounded workspace evidence orchestration; TASK-0013 establishes the modular,
-accessible, responsive renderer. TASK-0014 owns the remaining data lifecycle.
+accessible, responsive renderer; TASK-0014 establishes strict portable backup,
+bounded continuous retention, and truthful revision-bound monitoring.
 TASK-0015 and TASK-0016 own system actions and
 KDE/voice integration. TASK-0017 through TASK-0020 complete bounded roles,
 packaging, acceptance, and release.

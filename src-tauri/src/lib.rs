@@ -2,6 +2,7 @@ mod agent_registry;
 mod app_state;
 mod authorization;
 mod codex_runtime;
+mod data_lifecycle;
 mod ollama_runtime;
 mod persistence;
 mod policy;
@@ -29,6 +30,11 @@ use authorization::{
     ResolveApprovalRequest,
 };
 use codex_runtime::CodexRunSpec;
+use data_lifecycle::{
+    import_confirmation_message, BackupExport, BackupImportPreview, MonitoringActivityPage,
+    MonitoringMutationResult, MonitoringRevision, MonitoringSnapshot, MonitoringTaskPage,
+    MAINTENANCE_BACKLOG_INTERVAL_SECONDS, MAINTENANCE_INTERVAL_SECONDS,
+};
 use keyring::Entry;
 use ollama_runtime::{
     inspect_ollama_runtime, OllamaError, OllamaErrorKind, OllamaRuntimeStatus, OllamaSession,
@@ -186,6 +192,47 @@ struct ResetApplicationStateRequest {
 struct ImportLegacyBackupRequest {
     expected_revision: i64,
     backup_json: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackupImportRequest {
+    expected_revision: i64,
+    backup_json: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MonitoringTaskQueryRequest {
+    expected_revision: MonitoringRevision,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+    offset: i64,
+    limit: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MonitoringActivityQueryRequest {
+    expected_revision: MonitoringRevision,
+    offset: i64,
+    limit: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeleteMonitoringActivityRequest {
+    expected_revision: MonitoringRevision,
+    owner_agent_id: i64,
+    entry_id: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClearMonitoringActivityRequest {
+    expected_revision: MonitoringRevision,
 }
 
 #[derive(Deserialize)]
@@ -2877,7 +2924,7 @@ async fn reset_application_state(
     let confirmed = tauri::async_runtime::spawn_blocking(|| {
         request_native_confirmation(
             "Confirm application reset",
-            "Reset all application state and approval history to factory defaults?",
+            "Replace portable application state and current run/review history with factory defaults? The database file and bounded maintenance evidence will remain for the later physical-purge task.",
         )
     })
     .await
@@ -2907,31 +2954,178 @@ async fn import_legacy_backup(
     state: State<'_, PersistenceService>,
     request: ImportLegacyBackupRequest,
 ) -> Result<StateEnvelope, PersistenceError> {
-    let confirmed = tauri::async_runtime::spawn_blocking(|| {
-        request_native_confirmation(
-            "Confirm legacy backup import",
-            "Replace current application state with this validated legacy backup? Imported approvals remain non-authoritative.",
-        )
-    })
+    confirm_and_apply_backup(
+        state.inner(),
+        request.expected_revision,
+        request.backup_json,
+        "Confirm legacy backup import",
+    )
     .await
-    .map_err(|_| {
-        PersistenceError::new(
-            "NATIVE_CONFIRMATION_UNAVAILABLE",
-            "The trusted desktop confirmation worker stopped unexpectedly.",
-            false,
-        )
-    })?
-    .map_err(|message| PersistenceError::new("NATIVE_CONFIRMATION_UNAVAILABLE", message, true))?;
+}
+
+#[tauri::command]
+async fn export_backup(
+    state: State<'_, PersistenceService>,
+) -> Result<BackupExport, PersistenceError> {
+    state.inner().export_backup().await
+}
+
+#[tauri::command]
+async fn preview_backup_import(
+    state: State<'_, PersistenceService>,
+    request: BackupImportRequest,
+) -> Result<BackupImportPreview, PersistenceError> {
+    state
+        .inner()
+        .preview_backup_import(request.expected_revision, request.backup_json)
+        .await
+}
+
+async fn confirm_and_apply_backup(
+    persistence: &PersistenceService,
+    expected_revision: i64,
+    backup_json: String,
+    title: &'static str,
+) -> Result<StateEnvelope, PersistenceError> {
+    let preview = persistence
+        .preview_backup_import(expected_revision, backup_json.clone())
+        .await?;
+    let message = import_confirmation_message(&preview);
+    let confirmed =
+        tauri::async_runtime::spawn_blocking(move || request_native_confirmation(title, &message))
+            .await
+            .map_err(|_| {
+                PersistenceError::new(
+                    "NATIVE_CONFIRMATION_UNAVAILABLE",
+                    "The trusted desktop confirmation worker stopped unexpectedly.",
+                    false,
+                )
+            })?
+            .map_err(|message| {
+                PersistenceError::new("NATIVE_CONFIRMATION_UNAVAILABLE", message, true)
+            })?;
     if !confirmed {
         return Err(PersistenceError::new(
             "NATIVE_CONFIRMATION_DENIED",
-            "The legacy backup import was not confirmed.",
+            "The backup import was not confirmed.",
             true,
         ));
     }
+    persistence
+        .apply_backup_import(expected_revision, backup_json)
+        .await
+}
+
+#[tauri::command]
+async fn apply_backup_import(
+    state: State<'_, PersistenceService>,
+    request: BackupImportRequest,
+) -> Result<StateEnvelope, PersistenceError> {
+    confirm_and_apply_backup(
+        state.inner(),
+        request.expected_revision,
+        request.backup_json,
+        "Confirm portable backup import",
+    )
+    .await
+}
+
+#[tauri::command]
+async fn monitoring_snapshot(
+    state: State<'_, PersistenceService>,
+) -> Result<MonitoringSnapshot, PersistenceError> {
+    state.inner().monitoring_snapshot().await
+}
+
+#[tauri::command]
+async fn query_monitoring_tasks(
+    state: State<'_, PersistenceService>,
+    request: MonitoringTaskQueryRequest,
+) -> Result<MonitoringTaskPage, PersistenceError> {
     state
         .inner()
-        .import_legacy_backup(request.expected_revision, request.backup_json)
+        .query_monitoring_tasks(
+            request.expected_revision,
+            request.status,
+            request.category,
+            request.offset,
+            request.limit,
+        )
+        .await
+}
+
+#[tauri::command]
+async fn query_monitoring_activity(
+    state: State<'_, PersistenceService>,
+    request: MonitoringActivityQueryRequest,
+) -> Result<MonitoringActivityPage, PersistenceError> {
+    state
+        .inner()
+        .query_monitoring_activity(request.expected_revision, request.offset, request.limit)
+        .await
+}
+
+#[tauri::command]
+async fn delete_monitoring_activity(
+    state: State<'_, PersistenceService>,
+    request: DeleteMonitoringActivityRequest,
+) -> Result<MonitoringMutationResult, PersistenceError> {
+    state
+        .inner()
+        .delete_monitoring_activity(
+            request.expected_revision,
+            request.owner_agent_id,
+            request.entry_id,
+        )
+        .await
+}
+
+#[tauri::command]
+async fn clear_monitoring_activity(
+    state: State<'_, PersistenceService>,
+    request: ClearMonitoringActivityRequest,
+) -> Result<MonitoringMutationResult, PersistenceError> {
+    let snapshot = state.inner().monitoring_snapshot().await?;
+    if snapshot.revision != request.expected_revision {
+        return Err(PersistenceError::new(
+            "MONITORING_REVISION_CONFLICT",
+            "Authoritative monitoring data changed before activity clearing could be confirmed. Refresh and try again.",
+            true,
+        ));
+    }
+    if snapshot.counts.activity_entries > 0 {
+        let count = snapshot.counts.activity_entries;
+        let confirmed = tauri::async_runtime::spawn_blocking(move || {
+            request_native_confirmation(
+                "Confirm local activity history deletion",
+                &format!(
+                    "Delete {count} local configuration activity entr{}? Authoritative run and review evidence will not be deleted.",
+                    if count == 1 { "y" } else { "ies" }
+                ),
+            )
+        })
+        .await
+        .map_err(|_| {
+            PersistenceError::new(
+                "NATIVE_CONFIRMATION_UNAVAILABLE",
+                "The trusted desktop confirmation worker stopped unexpectedly.",
+                false,
+            )
+        })?
+        .map_err(|message| {
+            PersistenceError::new("NATIVE_CONFIRMATION_UNAVAILABLE", message, true)
+        })?;
+        if !confirmed {
+            return Err(PersistenceError::new(
+                "NATIVE_CONFIRMATION_DENIED",
+                "Local activity history deletion was not confirmed.",
+                true,
+            ));
+        }
+    }
+    state
+        .inner()
+        .clear_monitoring_activity(request.expected_revision)
         .await
 }
 
@@ -3553,12 +3747,37 @@ pub fn run() {
                 .and_then(|directory| {
                     StateRepository::open(&directory.join("application-state.sqlite3"))
                 });
-            app.manage(PersistenceService::new(repository));
+            let persistence = PersistenceService::new(repository);
+            app.manage(persistence.clone());
+            tauri::async_runtime::spawn(async move {
+                let mut delay = Duration::from_secs(MAINTENANCE_INTERVAL_SECONDS);
+                loop {
+                    tokio::time::sleep(delay).await;
+                    delay = match persistence
+                        .run_data_lifecycle_maintenance("interval".to_string())
+                        .await
+                    {
+                        Ok(result) if result.backlog_remaining => {
+                            Duration::from_secs(MAINTENANCE_BACKLOG_INTERVAL_SECONDS)
+                        }
+                        Ok(_) => Duration::from_secs(MAINTENANCE_INTERVAL_SECONDS),
+                        Err(error) => {
+                            log::warn!(
+                                "periodic data lifecycle maintenance failed: {}",
+                                error.code
+                            );
+                            Duration::from_secs(MAINTENANCE_INTERVAL_SECONDS)
+                        }
+                    };
+                }
+            });
 
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
                         .level(log::LevelFilter::Info)
+                        .max_file_size(40_000)
+                        .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
                         .build(),
                 )?;
             }
@@ -3604,6 +3823,14 @@ pub fn run() {
             save_application_state,
             reset_application_state,
             import_legacy_backup,
+            export_backup,
+            preview_backup_import,
+            apply_backup_import,
+            monitoring_snapshot,
+            query_monitoring_tasks,
+            query_monitoring_activity,
+            delete_monitoring_activity,
+            clear_monitoring_activity,
             acknowledge_legacy_cleanup,
             agent_registry_snapshot,
             create_agent,

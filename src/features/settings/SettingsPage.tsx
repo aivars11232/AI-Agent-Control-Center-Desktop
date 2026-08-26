@@ -10,6 +10,11 @@ import { desktopClient, isDesktopRuntime } from "../../services/desktopClient";
 import { errorMessage } from "../../domain/errors";
 import { ollamaCodingModel, ollamaCodingModelName } from "../../domain/models";
 import { markApprovalConsumed, prepareBackendAuthorization } from "../../services/authorization";
+import type {
+  BackupExport,
+  BackupImportPreview,
+  MonitoringSnapshot,
+} from "../../dataLifecycle";
 
 function RangeSetting({
   label,
@@ -74,7 +79,10 @@ export function SettingsPage({
   registryMessage,
   onRefreshRegistry,
   onImportBackup,
+  onPreviewBackup,
+  onExportBackup,
   onResetApplication,
+  monitoringSnapshot,
 }: {
   models: ModelDefinition[];
   setModels: React.Dispatch<React.SetStateAction<ModelDefinition[]>>;
@@ -104,7 +112,10 @@ export function SettingsPage({
   registryMessage: string;
   onRefreshRegistry: () => Promise<void>;
   onImportBackup: (backupJson: string) => Promise<void>;
+  onPreviewBackup: (backupJson: string) => Promise<BackupImportPreview>;
+  onExportBackup: () => Promise<BackupExport>;
   onResetApplication: (confirmation: string) => Promise<void>;
+  monitoringSnapshot: MonitoringSnapshot | null;
 }) {
   const [managedAgentId, setManagedAgentId] = useState<number | null>(
     agents[0]?.id ?? null,
@@ -121,6 +132,12 @@ export function SettingsPage({
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspacePath, setWorkspacePath] = useState("");
   const [workspaceBusy, setWorkspaceBusy] = useState(false);
+  const [backupPreview, setBackupPreview] = useState<{
+    backupJson: string;
+    preview: BackupImportPreview;
+  } | null>(null);
+  const [backupMessage, setBackupMessage] = useState("");
+  const [backupBusy, setBackupBusy] = useState(false);
   const codexStatus = providerRuntimeStatus(providerRegistry, "codex");
   const codexReady = codexStatus?.availability === "ready";
   const codexMessage =
@@ -339,35 +356,57 @@ export function SettingsPage({
     }));
   }
 
-  function exportData() {
-    const backup = {
-      version: 2,
-      exportedAt: new Date().toISOString(),
-      agents: applicationAgents,
-      models,
-      approvalRequests,
-      reminders,
-      taskRetentionDays,
-      activityRetentionDays,
-      preferences,
-    };
-
-    const blob = new Blob(
-      [JSON.stringify(backup, null, 2)],
-      { type: "application/json" },
-    );
+  function downloadBackup(contents: string, fileName: string) {
+    const blob = new Blob([contents], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
 
     anchor.href = url;
-    anchor.download = `ai-agent-control-center-backup-${new Date()
-      .toISOString()
-      .slice(0, 10)}.json`;
+    anchor.download = fileName;
 
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();
     URL.revokeObjectURL(url);
+  }
+
+  async function exportData() {
+    setBackupBusy(true);
+    setBackupMessage("");
+    try {
+      if (isDesktopRuntime()) {
+        const backup = await onExportBackup();
+        downloadBackup(backup.backupJson, backup.fileName);
+        setBackupMessage(
+          `Exported ${backup.byteLength.toLocaleString()} bytes from the authoritative backend. Runtime authority and provider credentials were omitted.`,
+        );
+        return;
+      }
+      const backup = {
+        version: 2,
+        exportedAt: new Date().toISOString(),
+        agents: applicationAgents,
+        models,
+        approvalRequests,
+        reminders,
+        taskRetentionDays,
+        activityRetentionDays,
+        preferences,
+      };
+      downloadBackup(
+        JSON.stringify(backup, null, 2),
+        `ai-agent-control-center-browser-preview-${new Date()
+          .toISOString()
+          .slice(0, 10)}.json`,
+      );
+      setBackupMessage(
+        "Exported a non-authoritative browser preview in legacy version 2 format.",
+      );
+    } catch (error) {
+      setBackupMessage(persistenceErrorMessage(error));
+    } finally {
+      setBackupBusy(false);
+    }
   }
 
   function importData(file: File) {
@@ -376,17 +415,16 @@ export function SettingsPage({
     reader.onload = async () => {
       const backupJson = String(reader.result);
       if (isDesktopRuntime()) {
-        const shouldImport = window.confirm(
-          "Import this backup? Current application data will be replaced.",
-        );
-        if (!shouldImport) {
-          return;
-        }
+        setBackupBusy(true);
+        setBackupMessage("");
         try {
-          await onImportBackup(backupJson);
-          window.alert("Backup imported successfully.");
+          const preview = await onPreviewBackup(backupJson);
+          setBackupPreview({ backupJson, preview });
         } catch (error) {
-          window.alert(persistenceErrorMessage(error));
+          setBackupPreview(null);
+          setBackupMessage(persistenceErrorMessage(error));
+        } finally {
+          setBackupBusy(false);
         }
         return;
       }
@@ -564,9 +602,24 @@ export function SettingsPage({
     reader.readAsText(file);
   }
 
+  async function applyPreviewedBackup() {
+    if (!backupPreview) return;
+    setBackupBusy(true);
+    setBackupMessage("");
+    try {
+      await onImportBackup(backupPreview.backupJson);
+      setBackupPreview(null);
+      setBackupMessage("The validated portable backup was imported.");
+    } catch (error) {
+      setBackupMessage(persistenceErrorMessage(error));
+    } finally {
+      setBackupBusy(false);
+    }
+  }
+
   async function resetApplication() {
     const confirmation = window.prompt(
-      'Type RESET to delete all local agents, tasks, activity, models, approvals, and settings.',
+      "Type RESET to replace portable application state and run/review history with defaults. Maintenance evidence and database files are retained for the later physical-purge task.",
     );
 
     if (confirmation !== "RESET") {
@@ -1367,6 +1420,11 @@ export function SettingsPage({
           <div>
             <span className="eyebrow">HISTORY</span>
             <h2>Retention policy</h2>
+            <p className="page-message">
+              {monitoringSnapshot?.authoritative
+                ? "The backend applies these policies at startup, every 15 minutes, and after relevant mutations."
+                : "Browser preview only; continuous backend retention is available in the desktop app."}
+            </p>
           </div>
         </div>
 
@@ -1409,6 +1467,24 @@ export function SettingsPage({
             </select>
           </label>
         </div>
+
+        {monitoringSnapshot?.authoritative && (
+          <div className="runtime-message" role="status">
+            Maintenance runs: {monitoringSnapshot.lifecycle.totalRuns} · Last
+            successful check:{" "}
+            {monitoringSnapshot.lifecycle.lastSuccessAtUnixMs === null
+              ? "not yet recorded"
+              : new Date(
+                  monitoringSnapshot.lifecycle.lastSuccessAtUnixMs,
+                ).toLocaleString()}
+            {monitoringSnapshot.lifecycle.latestRun?.backlogRemaining
+              ? " · bounded backlog remains and will retry in one minute"
+              : ""}
+            {monitoringSnapshot.lifecycle.lastErrorCode
+              ? ` · ${monitoringSnapshot.lifecycle.lastErrorCode}: ${monitoringSnapshot.lifecycle.lastErrorMessage ?? "maintenance needs attention"}`
+              : ""}
+          </div>
+        )}
       </section>
 
       <section className="panel">
@@ -1417,13 +1493,19 @@ export function SettingsPage({
             <span className="eyebrow">BACKUP</span>
             <h2>Export and import</h2>
             <p className="page-message">
-              Save or restore agents, tasks, models, approvals, and settings.
+              {isDesktopRuntime()
+                ? "Version 3 portable backups are strictly validated and sanitized by the backend. Provider credentials, active authority, and run/review runtime history are excluded."
+                : "Browser preview only: export and import use the non-authoritative legacy version 2 shape."}
             </p>
           </div>
         </div>
 
         <div className="button-row">
-          <button className="primary-button" onClick={exportData}>
+          <button
+            className="primary-button"
+            disabled={backupBusy}
+            onClick={() => void exportData()}
+          >
             Export backup
           </button>
 
@@ -1431,6 +1513,7 @@ export function SettingsPage({
             Import backup
             <input
               type="file"
+              disabled={backupBusy}
               accept="application/json,.json"
               style={{ display: "none" }}
               onChange={(event) => {
@@ -1445,21 +1528,58 @@ export function SettingsPage({
             />
           </label>
         </div>
+
+        {backupPreview && (
+          <div className="runtime-message" role="status">
+            Validated backup v{backupPreview.preview.formatVersion}:{" "}
+            {backupPreview.preview.counts.tasks} tasks, {" "}
+            {backupPreview.preview.counts.activity} activity entries, and {" "}
+            {backupPreview.preview.counts.approvalHistory} approval-history
+            records. {backupPreview.preview.sanitizations.heldTasks} task(s)
+            will be held and {backupPreview.preview.sanitizations.expiredApprovals}{" "}
+            approval(s) expired. Current run/review history will be cleared.
+            <div className="button-row">
+              <button
+                className="danger-button"
+                disabled={backupBusy}
+                onClick={() => void applyPreviewedBackup()}
+              >
+                Import and replace portable state
+              </button>
+              <button
+                className="secondary-button"
+                disabled={backupBusy}
+                onClick={() => setBackupPreview(null)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {backupMessage && (
+          <div className="runtime-message" role="status">
+            {backupMessage}
+          </div>
+        )}
       </section>
 
       <section className="panel">
         <div className="panel-heading">
           <div>
             <span className="eyebrow">DANGER ZONE</span>
-            <h2>Reset local application</h2>
+            <h2>Reset portable application state</h2>
             <p className="page-message">
-              Permanently remove all locally saved application data.
+              Reset restores defaults and clears current run/review history. It
+              does not physically erase the SQLite database, bounded
+              maintenance evidence, or desktop files; physical purge belongs
+              to TASK-0019.
             </p>
           </div>
         </div>
 
         <button className="danger-button" onClick={resetApplication}>
-          Reset all local data
+          Reset portable state
         </button>
       </section>
     </>

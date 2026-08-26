@@ -5,6 +5,7 @@ import type {
   SaveReceipt,
   StateEnvelope,
 } from "./applicationState";
+import type { BackupImportPreview } from "./dataLifecycle";
 
 export const LEGACY_STORAGE_KEYS = {
   agents: "ai-agent-control-center-agents",
@@ -111,6 +112,7 @@ export class ApplicationStateWriter {
     private readonly invoke: InvokeFunction,
     initialRevision: number,
     private readonly onFailure: (error: unknown) => void,
+    private readonly onCommit: (receipt: SaveReceipt) => void = () => {},
   ) {
     this.revision = initialRevision;
   }
@@ -139,6 +141,28 @@ export class ApplicationStateWriter {
   async importLegacyBackup(backupJson: string): Promise<StateEnvelope> {
     await this.flush();
     const envelope = await this.invoke<StateEnvelope>("import_legacy_backup", {
+      request: {
+        expectedRevision: this.revision,
+        backupJson,
+      },
+    });
+    this.revision = envelope.revision;
+    return envelope;
+  }
+
+  async previewBackupImport(backupJson: string): Promise<BackupImportPreview> {
+    await this.flush();
+    return this.invoke<BackupImportPreview>("preview_backup_import", {
+      request: {
+        expectedRevision: this.revision,
+        backupJson,
+      },
+    });
+  }
+
+  async applyBackupImport(backupJson: string): Promise<StateEnvelope> {
+    await this.flush();
+    const envelope = await this.invoke<StateEnvelope>("apply_backup_import", {
       request: {
         expectedRevision: this.revision,
         backupJson,
@@ -214,6 +238,7 @@ export class ApplicationStateWriter {
           },
         );
         this.revision = receipt.revision;
+        this.onCommit(receipt);
       }
     } catch (error) {
       this.failed = true;

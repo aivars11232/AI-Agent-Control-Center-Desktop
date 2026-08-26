@@ -3,15 +3,22 @@ use crate::agent_registry::{
     DeleteAgentRequest, RestoreAgentTemplateRequest, UpdateAgentRequest,
 };
 use crate::app_state::{
-    application_state_from_legacy, application_state_from_legacy_backup, default_application_state,
-    validate_application_state, ActivityEntry, Agent, AgentApprovals, AgentCapabilities,
-    AgentPerformance, AgentTask, AppPreferences, ApplicationState, ApprovalRequest,
-    HistoryRetentionDays, LegacyRendererState, ModelDefinition, Reminder, StateValidationError,
-    WorkspaceDefinition, CURRENT_SCHEMA_VERSION, MAX_SAFE_INTEGER,
+    application_state_from_legacy, default_application_state, validate_application_state,
+    ActivityEntry, Agent, AgentApprovals, AgentCapabilities, AgentPerformance, AgentTask,
+    AppPreferences, ApplicationState, ApprovalRequest, HistoryRetentionDays, LegacyRendererState,
+    ModelDefinition, Reminder, StateValidationError, WorkspaceDefinition, CURRENT_SCHEMA_VERSION,
+    MAX_SAFE_INTEGER,
 };
 use crate::authorization::{
     build_approval_confirmation, dialog_literal, format_unix_ms, ApprovalConfirmation,
     ApprovalResolution, AuthorizationGrant, AuthorizationOutcome,
+};
+use crate::data_lifecycle::{
+    build_backup_export, parse_backup_candidate, preview_for_candidate, BackupExport,
+    BackupImportPreview, DataLifecycleSummary, MonitoringActivityPage, MonitoringActivityRecord,
+    MonitoringCounts, MonitoringMutationResult, MonitoringRevision, MonitoringSnapshot,
+    MonitoringTaskPage, MonitoringTaskRecord, RetentionMaintenanceResult, RetentionPruneCounts,
+    MAX_MAINTENANCE_EVIDENCE_ROWS, MAX_MAINTENANCE_ROWS_PER_DOMAIN, MONITORING_PAGE_LIMIT,
 };
 use crate::policy::{evaluate_policy, ActionIntent, PolicyDisposition, PolicyEvaluation};
 use crate::provider_runtime::ProviderRegistrySnapshot;
@@ -57,6 +64,7 @@ const REVIEW_ORCHESTRATION_MIGRATION: &str =
     include_str!("../migrations/0006_review_orchestration.sql");
 const WORKSPACE_EVIDENCE_MIGRATION: &str =
     include_str!("../migrations/0007_workspace_evidence.sql");
+const DATA_LIFECYCLE_MIGRATION: &str = include_str!("../migrations/0008_data_lifecycle.sql");
 const MAX_AUTHORIZATION_RECORDS: i64 = 10_000;
 
 #[derive(Debug, Clone)]
@@ -223,12 +231,27 @@ impl PersistenceService {
             .await
     }
 
-    pub async fn import_legacy_backup(
+    pub async fn export_backup(&self) -> PersistenceResult<BackupExport> {
+        self.run(StateRepository::export_backup).await
+    }
+
+    pub async fn preview_backup_import(
+        &self,
+        expected_revision: i64,
+        backup_json: String,
+    ) -> PersistenceResult<BackupImportPreview> {
+        self.run(move |repository| {
+            repository.preview_backup_import(expected_revision, &backup_json)
+        })
+        .await
+    }
+
+    pub async fn apply_backup_import(
         &self,
         expected_revision: i64,
         backup_json: String,
     ) -> PersistenceResult<StateEnvelope> {
-        self.run(move |repository| repository.import_legacy_backup(expected_revision, &backup_json))
+        self.run(move |repository| repository.apply_backup_import(expected_revision, &backup_json))
             .await
     }
 
@@ -358,6 +381,73 @@ impl PersistenceService {
             repository.resolve_approval(approval_id, resolution, native_confirmed)
         })
         .await
+    }
+
+    pub async fn run_data_lifecycle_maintenance(
+        &self,
+        trigger_kind: String,
+    ) -> PersistenceResult<RetentionMaintenanceResult> {
+        self.run(move |repository| {
+            let timestamp = now_unix_ms()?;
+            repository.run_data_lifecycle_maintenance(&trigger_kind, timestamp)
+        })
+        .await
+    }
+
+    pub async fn monitoring_snapshot(&self) -> PersistenceResult<MonitoringSnapshot> {
+        self.run(StateRepository::monitoring_snapshot).await
+    }
+
+    pub async fn query_monitoring_tasks(
+        &self,
+        expected_revision: MonitoringRevision,
+        status: Option<String>,
+        category: Option<String>,
+        offset: i64,
+        limit: i64,
+    ) -> PersistenceResult<MonitoringTaskPage> {
+        self.run(move |repository| {
+            repository.query_monitoring_tasks(
+                &expected_revision,
+                status.as_deref(),
+                category.as_deref(),
+                offset,
+                limit,
+            )
+        })
+        .await
+    }
+
+    pub async fn query_monitoring_activity(
+        &self,
+        expected_revision: MonitoringRevision,
+        offset: i64,
+        limit: i64,
+    ) -> PersistenceResult<MonitoringActivityPage> {
+        self.run(move |repository| {
+            repository.query_monitoring_activity(&expected_revision, offset, limit)
+        })
+        .await
+    }
+
+    pub async fn delete_monitoring_activity(
+        &self,
+        expected_revision: MonitoringRevision,
+        owner_agent_id: i64,
+        entry_id: i64,
+    ) -> PersistenceResult<MonitoringMutationResult> {
+        self.run(move |repository| {
+            repository.delete_monitoring_activity(&expected_revision, owner_agent_id, entry_id)
+        })
+        .await
+    }
+
+    pub async fn clear_monitoring_activity(
+        &self,
+        expected_revision: MonitoringRevision,
+    ) -> PersistenceResult<MonitoringMutationResult> {
+        self.run(move |repository| repository.clear_monitoring_activity(&expected_revision))
+            .await
     }
 
     pub async fn approval_confirmation(
@@ -500,6 +590,10 @@ impl StateRepository {
         repository.configure_write_durability(false)?;
         repository.apply_migrations()?;
         repository.reconcile_interrupted_runs()?;
+        let timestamp = now_unix_ms()?;
+        if let Err(error) = repository.run_data_lifecycle_maintenance("startup", timestamp) {
+            log::warn!("data lifecycle startup maintenance failed: {}", error.code);
+        }
         Ok(repository)
     }
 
@@ -1029,6 +1123,8 @@ impl StateRepository {
             request.task_owner_agent_id,
             position as usize,
             &task,
+            (Some(timestamp), None),
+            timestamp,
         )?;
         finish_task_orchestration_mutation(&transaction, meta.state_revision)?;
         transaction.commit().map_err(PersistenceError::database)?;
@@ -1905,7 +2001,570 @@ impl StateRepository {
         })
     }
 
-    pub fn import_legacy_backup(
+    pub fn export_backup(&mut self) -> PersistenceResult<BackupExport> {
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(PersistenceError::database)?;
+        let meta = application_meta_from(&transaction)?;
+        if !meta.initialized {
+            return Err(PersistenceError::new(
+                "APPLICATION_STATE_UNINITIALIZED",
+                "Application state must be initialized before exporting a backup.",
+                true,
+            ));
+        }
+        let state = read_application_state(&transaction)?;
+        let backup =
+            build_backup_export(&state, timestamp).map_err(PersistenceError::validation)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(backup)
+    }
+
+    pub fn run_data_lifecycle_maintenance(
+        &mut self,
+        trigger_kind: &str,
+        timestamp: i64,
+    ) -> PersistenceResult<RetentionMaintenanceResult> {
+        if !matches!(
+            trigger_kind,
+            "startup" | "interval" | "settings" | "import" | "test"
+        ) {
+            return Err(PersistenceError::new(
+                "DATA_LIFECYCLE_TRIGGER_INVALID",
+                "Data lifecycle maintenance received an unsupported trigger.",
+                false,
+            ));
+        }
+        if timestamp < 0 {
+            return Err(PersistenceError::new(
+                "CLOCK_UNAVAILABLE",
+                "Data lifecycle maintenance requires a non-negative backend timestamp.",
+                false,
+            ));
+        }
+
+        match self.run_data_lifecycle_maintenance_transaction(trigger_kind, timestamp) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let _ = self.record_data_lifecycle_failure(trigger_kind, timestamp, &error);
+                Err(error)
+            }
+        }
+    }
+
+    fn run_data_lifecycle_maintenance_transaction(
+        &mut self,
+        trigger_kind: &str,
+        timestamp: i64,
+    ) -> PersistenceResult<RetentionMaintenanceResult> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let application_meta = application_meta_from(&transaction)?;
+        let (lifecycle_revision, last_observed_at): (i64, Option<i64>) = transaction
+            .query_row(
+                "SELECT revision, last_observed_at_unix_ms
+                 FROM data_lifecycle_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(PersistenceError::database)?;
+        let next_lifecycle_revision = next_revision(lifecycle_revision)?;
+        let clock_rollback = last_observed_at.is_some_and(|last| timestamp < last);
+        let (task_cutoff, activity_cutoff) = if application_meta.initialized && !clock_rollback {
+            (
+                retention_cutoff(&transaction, "task_retention", timestamp)?,
+                retention_cutoff(&transaction, "activity_retention", timestamp)?,
+            )
+        } else {
+            (None, None)
+        };
+
+        let pruned = if clock_rollback {
+            RetentionPruneCounts::default()
+        } else {
+            prune_retention_rows(&transaction, task_cutoff, activity_cutoff)?
+        };
+        let skipped_protected = if clock_rollback {
+            0
+        } else {
+            count_retention_protected(&transaction, task_cutoff, activity_cutoff)?
+        };
+        let backlog_remaining = if clock_rollback {
+            false
+        } else {
+            retention_backlog_exists(&transaction, task_cutoff, activity_cutoff)?
+        };
+
+        let mut application_state_revision = application_meta.state_revision;
+        if pruned.application_rows() > 0 {
+            application_state_revision = next_revision(application_state_revision)?;
+            transaction
+                .execute(
+                    "UPDATE application_meta SET state_revision = ?1 WHERE singleton = 1",
+                    [application_state_revision],
+                )
+                .map_err(PersistenceError::database)?;
+        }
+        if pruned.tasks > 0 {
+            advance_task_orchestration_revision(&transaction)?;
+        }
+        if pruned.attempts > 0 {
+            update_run_retention_meta(&transaction, pruned.attempts, timestamp)?;
+        }
+        if pruned.review_flows > 0 {
+            advance_review_revision(&transaction)?;
+        }
+
+        let status = if clock_rollback {
+            "clock_rollback"
+        } else {
+            "succeeded"
+        };
+        let error_code = clock_rollback.then(|| "CLOCK_ROLLBACK".to_string());
+        let error_message = clock_rollback.then(|| {
+            "Backend time moved behind the last observed maintenance time; age-based pruning was skipped."
+                .to_string()
+        });
+        insert_data_lifecycle_run(
+            &transaction,
+            next_lifecycle_revision,
+            application_state_revision,
+            trigger_kind,
+            status,
+            timestamp,
+            timestamp,
+            task_cutoff,
+            activity_cutoff,
+            &pruned,
+            skipped_protected,
+            backlog_remaining,
+            error_code.as_deref(),
+            error_message.as_deref(),
+        )?;
+        trim_data_lifecycle_runs(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE data_lifecycle_meta
+                 SET revision = ?1,
+                     last_observed_at_unix_ms = CASE
+                         WHEN last_observed_at_unix_ms IS NULL
+                              OR last_observed_at_unix_ms < ?2 THEN ?2
+                         ELSE last_observed_at_unix_ms
+                     END,
+                     last_started_at_unix_ms = ?2,
+                     last_completed_at_unix_ms = ?2,
+                     last_success_at_unix_ms = CASE WHEN ?3 = 0 THEN ?2 ELSE last_success_at_unix_ms END,
+                     last_error_code = ?4,
+                     last_error_message = ?5,
+                     total_runs = total_runs + 1,
+                     total_pruned_tasks = total_pruned_tasks + ?6,
+                     total_pruned_attempts = total_pruned_attempts + ?7,
+                     total_pruned_review_flows = total_pruned_review_flows + ?8,
+                     total_pruned_activity = total_pruned_activity + ?9,
+                     total_pruned_approvals = total_pruned_approvals + ?10,
+                     total_pruned_reminders = total_pruned_reminders + ?11
+                 WHERE singleton = 1",
+                params![
+                    next_lifecycle_revision,
+                    timestamp,
+                    clock_rollback as i64,
+                    error_code,
+                    error_message,
+                    pruned.tasks,
+                    pruned.attempts,
+                    pruned.review_flows,
+                    pruned.activity,
+                    pruned.approvals,
+                    pruned.reminders
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+
+        Ok(RetentionMaintenanceResult {
+            lifecycle_revision: next_lifecycle_revision,
+            application_state_revision,
+            trigger_kind: trigger_kind.to_string(),
+            status: status.to_string(),
+            started_at_unix_ms: timestamp,
+            completed_at_unix_ms: timestamp,
+            task_cutoff_unix_ms: task_cutoff,
+            activity_cutoff_unix_ms: activity_cutoff,
+            pruned,
+            skipped_protected,
+            backlog_remaining,
+            error_code,
+            error_message,
+        })
+    }
+
+    fn record_data_lifecycle_failure(
+        &mut self,
+        trigger_kind: &str,
+        timestamp: i64,
+        error: &PersistenceError,
+    ) -> PersistenceResult<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let lifecycle_revision: i64 = transaction
+            .query_row(
+                "SELECT revision FROM data_lifecycle_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        let next_lifecycle_revision = next_revision(lifecycle_revision)?;
+        let application_state_revision = application_meta_from(&transaction)?.state_revision;
+        let message = bounded_lifecycle_message(&error.message);
+        insert_data_lifecycle_run(
+            &transaction,
+            next_lifecycle_revision,
+            application_state_revision,
+            trigger_kind,
+            "failed",
+            timestamp,
+            timestamp,
+            None,
+            None,
+            &RetentionPruneCounts::default(),
+            0,
+            false,
+            Some(&error.code),
+            Some(&message),
+        )?;
+        trim_data_lifecycle_runs(&transaction)?;
+        transaction
+            .execute(
+                "UPDATE data_lifecycle_meta
+                 SET revision = ?1,
+                     last_observed_at_unix_ms = CASE
+                         WHEN last_observed_at_unix_ms IS NULL
+                              OR last_observed_at_unix_ms < ?2 THEN ?2
+                         ELSE last_observed_at_unix_ms
+                     END,
+                     last_started_at_unix_ms = ?2,
+                     last_completed_at_unix_ms = ?2,
+                     last_error_code = ?3,
+                     last_error_message = ?4,
+                     total_runs = total_runs + 1
+                 WHERE singleton = 1",
+                params![next_lifecycle_revision, timestamp, error.code, message],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction.commit().map_err(PersistenceError::database)
+    }
+
+    pub fn monitoring_snapshot(&mut self) -> PersistenceResult<MonitoringSnapshot> {
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(PersistenceError::database)?;
+        let snapshot = read_monitoring_snapshot(&transaction, timestamp)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(snapshot)
+    }
+
+    pub fn query_monitoring_tasks(
+        &mut self,
+        expected_revision: &MonitoringRevision,
+        status: Option<&str>,
+        category: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> PersistenceResult<MonitoringTaskPage> {
+        validate_monitoring_page(offset, limit)?;
+        let offset_usize = usize::try_from(offset).map_err(|_| {
+            PersistenceError::new(
+                "MONITORING_PAGE_INVALID",
+                "Task monitoring offset exceeds this platform's supported range.",
+                true,
+            )
+        })?;
+        let limit_usize = usize::try_from(limit).map_err(|_| {
+            PersistenceError::new(
+                "MONITORING_PAGE_INVALID",
+                "Task monitoring limit exceeds this platform's supported range.",
+                true,
+            )
+        })?;
+        if status.is_some_and(|value| {
+            !matches!(
+                value,
+                "Pending" | "Running" | "Blocked" | "Under Review" | "Completed" | "Failed"
+            )
+        }) {
+            return Err(PersistenceError::new(
+                "MONITORING_FILTER_INVALID",
+                "Task monitoring received an unsupported status filter.",
+                true,
+            ));
+        }
+        if category.is_some_and(|value| {
+            !matches!(
+                value,
+                "Development"
+                    | "Research"
+                    | "Browsing"
+                    | "Finance"
+                    | "Business"
+                    | "Communication"
+                    | "System Control"
+                    | "General"
+            )
+        }) {
+            return Err(PersistenceError::new(
+                "MONITORING_FILTER_INVALID",
+                "Task monitoring received an unsupported category filter.",
+                true,
+            ));
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(PersistenceError::database)?;
+        let revision = monitoring_revision(&transaction)?;
+        ensure_monitoring_revision(&revision, expected_revision)?;
+        let state = read_application_state(&transaction)?;
+        let agent_names = state
+            .agents
+            .iter()
+            .map(|agent| (agent.id, agent.name.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut timestamp_statement = transaction
+            .prepare(
+                "SELECT owner_agent_id, id, created_at_unix_ms, completed_at_unix_ms
+                 FROM agent_tasks",
+            )
+            .map_err(PersistenceError::database)?;
+        let timestamp_rows = timestamp_statement
+            .query_map([], |row| {
+                Ok((
+                    (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?),
+                    (
+                        row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        row.get::<_, Option<i64>>(3)?,
+                    ),
+                ))
+            })
+            .map_err(PersistenceError::database)?;
+        let mut timestamps = HashMap::new();
+        for row in timestamp_rows {
+            let (key, value) = row.map_err(PersistenceError::database)?;
+            timestamps.insert(key, value);
+        }
+        drop(timestamp_statement);
+
+        let mut records = state
+            .agents
+            .iter()
+            .flat_map(|owner| {
+                owner.tasks.iter().filter_map(|task| {
+                    if status.is_some_and(|value| task.status != value)
+                        || category.is_some_and(|value| task.category != value)
+                    {
+                        return None;
+                    }
+                    let (created_at_unix_ms, completed_at_unix_ms) = timestamps
+                        .get(&(owner.id, task.id))
+                        .copied()
+                        .unwrap_or((0, None));
+                    Some(MonitoringTaskRecord {
+                        owner_agent_id: owner.id,
+                        owner_name: owner.name.clone(),
+                        owner_role: owner.role.clone(),
+                        executor_name: agent_names.get(&task.assigned_agent_id).cloned(),
+                        created_at_unix_ms,
+                        completed_at_unix_ms,
+                        task: task.clone(),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            monitoring_queue_rank(&left.task)
+                .cmp(&monitoring_queue_rank(&right.task))
+                .then_with(|| {
+                    left.task
+                        .enqueue_sequence
+                        .unwrap_or(MAX_SAFE_INTEGER)
+                        .cmp(&right.task.enqueue_sequence.unwrap_or(MAX_SAFE_INTEGER))
+                })
+                .then_with(|| right.created_at_unix_ms.cmp(&left.created_at_unix_ms))
+                .then_with(|| left.owner_agent_id.cmp(&right.owner_agent_id))
+                .then_with(|| left.task.id.cmp(&right.task.id))
+        });
+        let total = i64::try_from(records.len()).map_err(|_| {
+            PersistenceError::new(
+                "MONITORING_RESULT_TOO_LARGE",
+                "Task monitoring result count exceeded the supported numeric range.",
+                false,
+            )
+        })?;
+        let records = records
+            .into_iter()
+            .skip(offset_usize)
+            .take(limit_usize)
+            .collect();
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(MonitoringTaskPage {
+            authoritative: true,
+            revision,
+            offset,
+            limit,
+            total,
+            records,
+        })
+    }
+
+    pub fn query_monitoring_activity(
+        &mut self,
+        expected_revision: &MonitoringRevision,
+        offset: i64,
+        limit: i64,
+    ) -> PersistenceResult<MonitoringActivityPage> {
+        validate_monitoring_page(offset, limit)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(PersistenceError::database)?;
+        let revision = monitoring_revision(&transaction)?;
+        ensure_monitoring_revision(&revision, expected_revision)?;
+        let total: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM agent_activity", [], |row| row.get(0))
+            .map_err(PersistenceError::database)?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT activity.owner_agent_id, agent.name, agent.role, activity.id,
+                        activity.message, activity.created_at,
+                        COALESCE(activity.created_at_unix_ms, 0)
+                 FROM agent_activity AS activity
+                 JOIN agents AS agent ON agent.id = activity.owner_agent_id
+                 ORDER BY activity.created_at_unix_ms DESC,
+                          activity.owner_agent_id, activity.id DESC
+                 LIMIT ?1 OFFSET ?2",
+            )
+            .map_err(PersistenceError::database)?;
+        let rows = statement
+            .query_map(params![limit, offset], |row| {
+                Ok(MonitoringActivityRecord {
+                    owner_agent_id: row.get(0)?,
+                    owner_name: row.get(1)?,
+                    owner_role: row.get(2)?,
+                    entry_id: row.get(3)?,
+                    message: row.get(4)?,
+                    created_at: row.get(5)?,
+                    created_at_unix_ms: row.get(6)?,
+                })
+            })
+            .map_err(PersistenceError::database)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(PersistenceError::database)?);
+        }
+        drop(statement);
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(MonitoringActivityPage {
+            authoritative: true,
+            revision,
+            offset,
+            limit,
+            total,
+            records,
+        })
+    }
+
+    pub fn delete_monitoring_activity(
+        &mut self,
+        expected_revision: &MonitoringRevision,
+        owner_agent_id: i64,
+        entry_id: i64,
+    ) -> PersistenceResult<MonitoringMutationResult> {
+        if owner_agent_id <= 0 || entry_id <= 0 {
+            return Err(PersistenceError::new(
+                "MONITORING_ACTIVITY_ID_INVALID",
+                "Activity deletion requires positive owner and entry identifiers.",
+                true,
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let revision = monitoring_revision(&transaction)?;
+        ensure_monitoring_revision(&revision, expected_revision)?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM agent_activity WHERE owner_agent_id = ?1 AND id = ?2",
+                params![owner_agent_id, entry_id],
+            )
+            .map_err(PersistenceError::database)? as i64;
+        if deleted == 0 {
+            return Err(PersistenceError::new(
+                "MONITORING_ACTIVITY_NOT_FOUND",
+                "The selected local activity entry no longer exists.",
+                true,
+            ));
+        }
+        advance_monitoring_activity_revision(&transaction)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(MonitoringMutationResult {
+            deleted_count: deleted,
+            snapshot: self.monitoring_snapshot()?,
+        })
+    }
+
+    pub fn clear_monitoring_activity(
+        &mut self,
+        expected_revision: &MonitoringRevision,
+    ) -> PersistenceResult<MonitoringMutationResult> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let revision = monitoring_revision(&transaction)?;
+        ensure_monitoring_revision(&revision, expected_revision)?;
+        let deleted = transaction
+            .execute("DELETE FROM agent_activity", [])
+            .map_err(PersistenceError::database)? as i64;
+        if deleted > 0 {
+            advance_monitoring_activity_revision(&transaction)?;
+        }
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(MonitoringMutationResult {
+            deleted_count: deleted,
+            snapshot: self.monitoring_snapshot()?,
+        })
+    }
+
+    pub fn preview_backup_import(
+        &mut self,
+        expected_revision: i64,
+        backup_json: &str,
+    ) -> PersistenceResult<BackupImportPreview> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(PersistenceError::database)?;
+        let meta = application_meta_from(&transaction)?;
+        ensure_expected_revision(&meta, expected_revision)?;
+        let current = read_application_state(&transaction)?;
+        let candidate =
+            parse_backup_candidate(backup_json, &current).map_err(PersistenceError::validation)?;
+        let security_change_summary = protected_security_change_summary(&current, &candidate.state);
+        let preview = preview_for_candidate(&candidate, security_change_summary);
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(preview)
+    }
+
+    pub fn apply_backup_import(
         &mut self,
         expected_revision: i64,
         backup_json: &str,
@@ -1919,17 +2578,18 @@ impl StateRepository {
         ensure_expected_revision(&meta, expected_revision)?;
         ensure_run_mutation_idle(&transaction)?;
         let current = read_application_state(&transaction)?;
-        let state = application_state_from_legacy_backup(backup_json, &current)
-            .map_err(PersistenceError::validation)?;
-        clear_review_orchestration(&transaction)?;
-        let approval_origins = state
+        let candidate =
+            parse_backup_candidate(backup_json, &current).map_err(PersistenceError::validation)?;
+        clear_run_coordination(&transaction)?;
+        let approval_origins = candidate
+            .state
             .approval_requests
             .iter()
             .map(|request| (request.id, "legacy_backup".to_string()))
             .collect::<HashMap<_, _>>();
         write_application_state(
             &transaction,
-            &state,
+            &candidate.state,
             "legacy_backup",
             &approval_origins,
             true,
@@ -1938,14 +2598,25 @@ impl StateRepository {
         transaction
             .execute(
                 "UPDATE application_meta
-                 SET initialized = 1, state_revision = ?1, source_kind = 'legacy_backup',
-                     source_version = 2, migrated_at_unix_ms = ?2,
+                 SET initialized = 1, state_revision = ?1, source_kind = ?2,
+                     source_version = ?3, migrated_at_unix_ms = ?4,
                      legacy_cleanup_ack_at_unix_ms = NULL
                  WHERE singleton = 1",
-                params![revision, timestamp],
+                params![
+                    revision,
+                    candidate.source_kind,
+                    candidate.format_version,
+                    timestamp
+                ],
             )
             .map_err(PersistenceError::database)?;
         transaction.commit().map_err(PersistenceError::database)?;
+        if let Err(error) = self.run_data_lifecycle_maintenance("import", timestamp) {
+            log::warn!(
+                "post-import data lifecycle maintenance failed: {}",
+                error.code
+            );
+        }
         self.load()?.ok_or_else(|| {
             PersistenceError::new(
                 "BACKUP_IMPORT_FAILED",
@@ -1972,6 +2643,8 @@ impl StateRepository {
         let current = read_application_state(&transaction)?;
         ensure_agent_registry_structure_unchanged(&current, state)?;
         let protected_state = protect_run_owned_state(&transaction, &current, state, timestamp)?;
+        let retention_changed = current.task_retention_days != protected_state.task_retention_days
+            || current.activity_retention_days != protected_state.activity_retention_days;
         validate_application_state(&protected_state).map_err(PersistenceError::validation)?;
         if let Some(summary) = protected_security_change_summary(&current, &protected_state) {
             if !security_change_confirmed {
@@ -1999,6 +2672,20 @@ impl StateRepository {
             )
             .map_err(PersistenceError::database)?;
         transaction.commit().map_err(PersistenceError::database)?;
+        let revision = if retention_changed {
+            if let Err(error) = self.run_data_lifecycle_maintenance("settings", timestamp) {
+                log::warn!(
+                    "post-settings data lifecycle maintenance failed: {}",
+                    error.code
+                );
+            }
+            self.connection
+                .query_meta()
+                .map_err(PersistenceError::database)?
+                .state_revision
+        } else {
+            revision
+        };
         Ok(SaveReceipt {
             schema_version: CURRENT_SCHEMA_VERSION,
             revision,
@@ -3204,6 +3891,11 @@ impl StateRepository {
                     7,
                     "structured_workspace_evidence",
                     WORKSPACE_EVIDENCE_MIGRATION,
+                )?,
+                7 => self.apply_migration(
+                    8,
+                    "data_lifecycle_and_monitoring",
+                    DATA_LIFECYCLE_MIGRATION,
                 )?,
                 version => {
                     return Err(PersistenceError::new(
@@ -5818,14 +6510,733 @@ fn clear_run_coordination(transaction: &Transaction<'_>) -> PersistenceResult<()
         .map_err(PersistenceError::database)
 }
 
-fn clear_review_orchestration(transaction: &Transaction<'_>) -> PersistenceResult<()> {
+fn retention_cutoff(
+    transaction: &Transaction<'_>,
+    column: &str,
+    timestamp: i64,
+) -> PersistenceResult<Option<i64>> {
+    let query = match column {
+        "task_retention" => "SELECT task_retention FROM retention_settings WHERE singleton = 1",
+        "activity_retention" => {
+            "SELECT activity_retention FROM retention_settings WHERE singleton = 1"
+        }
+        _ => {
+            return Err(PersistenceError::new(
+                "RETENTION_CONFIGURATION_INVALID",
+                "Data lifecycle maintenance requested an unsupported retention domain.",
+                false,
+            ));
+        }
+    };
+    let value: String = transaction
+        .query_row(query, [], |row| row.get(0))
+        .map_err(PersistenceError::database)?;
+    let days = match HistoryRetentionDays::from_storage_value(&value)
+        .map_err(PersistenceError::validation)?
+    {
+        HistoryRetentionDays::Days7 => Some(7_i64),
+        HistoryRetentionDays::Days30 => Some(30_i64),
+        HistoryRetentionDays::Days90 => Some(90_i64),
+        HistoryRetentionDays::Never => None,
+    };
+    Ok(days.map(|days| {
+        days.checked_mul(86_400_000)
+            .and_then(|window| timestamp.checked_sub(window))
+            .unwrap_or(0)
+    }))
+}
+
+fn count_retention_protected(
+    transaction: &Transaction<'_>,
+    task_cutoff: Option<i64>,
+    activity_cutoff: Option<i64>,
+) -> PersistenceResult<i64> {
+    let mut skipped = 0_i64;
+    if let Some(cutoff) = task_cutoff {
+        let old_tasks: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM agent_tasks
+                 WHERE status IN ('Completed', 'Failed')
+                   AND completed_at_unix_ms IS NOT NULL
+                   AND completed_at_unix_ms < ?1",
+                [cutoff],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        let eligible_tasks: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM agent_tasks AS task
+                 WHERE task.status IN ('Completed', 'Failed')
+                   AND task.completed_at_unix_ms IS NOT NULL
+                   AND task.completed_at_unix_ms < ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM run_attempts AS attempt
+                       WHERE attempt.task_owner_agent_id = task.owner_agent_id
+                         AND attempt.task_id = task.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM review_flows AS flow
+                       WHERE flow.task_owner_agent_id = task.owner_agent_id
+                         AND flow.task_id = task.id
+                   )",
+                [cutoff],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        skipped = skipped.saturating_add(old_tasks.saturating_sub(eligible_tasks));
+
+        let old_attempts: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM run_attempts
+                 WHERE status IN ('succeeded', 'cancelled', 'timed_out', 'startup_failed',
+                                  'failed', 'interrupted')
+                   AND completed_at_unix_ms IS NOT NULL
+                   AND completed_at_unix_ms < ?1",
+                [cutoff],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        let eligible_attempts = count_eligible_attempts(transaction, cutoff)?;
+        skipped = skipped.saturating_add(old_attempts.saturating_sub(eligible_attempts));
+    }
+    if let Some(cutoff) = activity_cutoff {
+        let old_approvals: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM approval_requests
+                 WHERE COALESCE(consumed_at_unix_ms, resolved_at_unix_ms,
+                                expires_at_unix_ms, created_at_unix_ms) < ?1",
+                [cutoff],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        let eligible_approvals: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM approval_requests AS approval
+                 WHERE (approval.status IN ('Denied', 'Expired')
+                        OR approval.consumed_at_unix_ms IS NOT NULL)
+                   AND COALESCE(approval.consumed_at_unix_ms, approval.resolved_at_unix_ms,
+                                approval.expires_at_unix_ms, approval.created_at_unix_ms) < ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM run_approval_reservations AS reservation
+                       WHERE reservation.approval_id = approval.id
+                   )",
+                [cutoff],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        skipped = skipped.saturating_add(old_approvals.saturating_sub(eligible_approvals));
+    }
+    Ok(skipped)
+}
+
+fn count_eligible_attempts(transaction: &Transaction<'_>, cutoff: i64) -> PersistenceResult<i64> {
     transaction
-        .execute_batch(
-            "DELETE FROM review_stage_attempts;
-             DELETE FROM review_flows;
-             UPDATE review_orchestration_meta SET revision = 0 WHERE singleton = 1;",
+        .query_row(
+            "SELECT COUNT(*) FROM run_attempts AS attempt
+             WHERE attempt.status IN ('succeeded', 'cancelled', 'timed_out', 'startup_failed',
+                                      'failed', 'interrupted')
+               AND attempt.completed_at_unix_ms IS NOT NULL
+               AND attempt.completed_at_unix_ms < ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM run_coordinator_meta AS meta
+                   WHERE meta.active_attempt_id = attempt.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM run_approval_reservations AS reservation
+                   WHERE reservation.attempt_id = attempt.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM review_flows AS flow
+                   WHERE flow.latest_execution_attempt_id = attempt.id
+                      OR flow.id = attempt.review_flow_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM review_stage_attempts AS stage
+                   WHERE stage.run_attempt_id = attempt.id
+               )",
+            [cutoff],
+            |row| row.get(0),
         )
         .map_err(PersistenceError::database)
+}
+
+fn prune_retention_rows(
+    transaction: &Transaction<'_>,
+    task_cutoff: Option<i64>,
+    activity_cutoff: Option<i64>,
+) -> PersistenceResult<RetentionPruneCounts> {
+    let mut counts = RetentionPruneCounts::default();
+    if let Some(cutoff) = task_cutoff {
+        counts.review_flows = transaction
+            .execute(
+                "DELETE FROM review_flows WHERE id IN (
+                     SELECT flow.id FROM review_flows AS flow
+                     WHERE flow.state IN ('completed', 'failed', 'cancelled')
+                       AND flow.completed_at_unix_ms IS NOT NULL
+                       AND flow.completed_at_unix_ms < ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM review_stage_attempts AS stage
+                           WHERE stage.flow_id = flow.id
+                             AND stage.state IN ('pending', 'admitted', 'running')
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM run_attempts AS attempt
+                           WHERE attempt.review_flow_id = flow.id
+                             AND attempt.status NOT IN (
+                                 'succeeded', 'cancelled', 'timed_out', 'startup_failed',
+                                 'failed', 'interrupted'
+                             )
+                       )
+                     ORDER BY flow.completed_at_unix_ms, flow.id
+                     LIMIT ?2
+                 )",
+                params![cutoff, MAX_MAINTENANCE_ROWS_PER_DOMAIN],
+            )
+            .map_err(PersistenceError::database)? as i64;
+        counts.attempts = transaction
+            .execute(
+                "DELETE FROM run_attempts WHERE id IN (
+                     SELECT attempt.id FROM run_attempts AS attempt
+                     WHERE attempt.status IN (
+                               'succeeded', 'cancelled', 'timed_out', 'startup_failed',
+                               'failed', 'interrupted'
+                           )
+                       AND attempt.completed_at_unix_ms IS NOT NULL
+                       AND attempt.completed_at_unix_ms < ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM run_coordinator_meta AS meta
+                           WHERE meta.active_attempt_id = attempt.id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM run_approval_reservations AS reservation
+                           WHERE reservation.attempt_id = attempt.id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM review_flows AS flow
+                           WHERE flow.latest_execution_attempt_id = attempt.id
+                              OR flow.id = attempt.review_flow_id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM review_stage_attempts AS stage
+                           WHERE stage.run_attempt_id = attempt.id
+                       )
+                     ORDER BY attempt.completed_at_unix_ms, attempt.id
+                     LIMIT ?2
+                 )",
+                params![cutoff, MAX_MAINTENANCE_ROWS_PER_DOMAIN],
+            )
+            .map_err(PersistenceError::database)? as i64;
+        counts.tasks = transaction
+            .execute(
+                "DELETE FROM agent_tasks WHERE (owner_agent_id, id) IN (
+                     SELECT task.owner_agent_id, task.id FROM agent_tasks AS task
+                     WHERE task.status IN ('Completed', 'Failed')
+                       AND task.completed_at_unix_ms IS NOT NULL
+                       AND task.completed_at_unix_ms < ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM run_attempts AS attempt
+                           WHERE attempt.task_owner_agent_id = task.owner_agent_id
+                             AND attempt.task_id = task.id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM review_flows AS flow
+                           WHERE flow.task_owner_agent_id = task.owner_agent_id
+                             AND flow.task_id = task.id
+                       )
+                     ORDER BY task.completed_at_unix_ms, task.owner_agent_id, task.id
+                     LIMIT ?2
+                 )",
+                params![cutoff, MAX_MAINTENANCE_ROWS_PER_DOMAIN],
+            )
+            .map_err(PersistenceError::database)? as i64;
+    }
+    if let Some(cutoff) = activity_cutoff {
+        counts.activity = transaction
+            .execute(
+                "DELETE FROM agent_activity WHERE (owner_agent_id, id) IN (
+                     SELECT owner_agent_id, id FROM agent_activity
+                     WHERE created_at_unix_ms IS NOT NULL AND created_at_unix_ms < ?1
+                     ORDER BY created_at_unix_ms, owner_agent_id, id
+                     LIMIT ?2
+                 )",
+                params![cutoff, MAX_MAINTENANCE_ROWS_PER_DOMAIN],
+            )
+            .map_err(PersistenceError::database)? as i64;
+        counts.approvals = transaction
+            .execute(
+                "DELETE FROM approval_requests WHERE id IN (
+                     SELECT approval.id FROM approval_requests AS approval
+                     WHERE (approval.status IN ('Denied', 'Expired')
+                            OR approval.consumed_at_unix_ms IS NOT NULL)
+                       AND COALESCE(
+                               approval.consumed_at_unix_ms,
+                               approval.resolved_at_unix_ms,
+                               approval.expires_at_unix_ms,
+                               approval.created_at_unix_ms
+                           ) < ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM run_approval_reservations AS reservation
+                           WHERE reservation.approval_id = approval.id
+                       )
+                     ORDER BY COALESCE(
+                                  approval.consumed_at_unix_ms,
+                                  approval.resolved_at_unix_ms,
+                                  approval.expires_at_unix_ms,
+                                  approval.created_at_unix_ms
+                              ), approval.id
+                     LIMIT ?2
+                 )",
+                params![cutoff, MAX_MAINTENANCE_ROWS_PER_DOMAIN],
+            )
+            .map_err(PersistenceError::database)? as i64;
+        counts.reminders = transaction
+            .execute(
+                "DELETE FROM reminders WHERE id IN (
+                     SELECT id FROM reminders
+                     WHERE status IN ('Completed', 'Dismissed')
+                       AND resolved_at_unix_ms IS NOT NULL
+                       AND resolved_at_unix_ms < ?1
+                     ORDER BY resolved_at_unix_ms, id
+                     LIMIT ?2
+                 )",
+                params![cutoff, MAX_MAINTENANCE_ROWS_PER_DOMAIN],
+            )
+            .map_err(PersistenceError::database)? as i64;
+    }
+    Ok(counts)
+}
+
+fn retention_backlog_exists(
+    transaction: &Transaction<'_>,
+    task_cutoff: Option<i64>,
+    activity_cutoff: Option<i64>,
+) -> PersistenceResult<bool> {
+    if let Some(cutoff) = task_cutoff {
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM review_flows AS flow
+                     WHERE flow.state IN ('completed', 'failed', 'cancelled')
+                       AND flow.completed_at_unix_ms IS NOT NULL
+                       AND flow.completed_at_unix_ms < ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM review_stage_attempts AS stage
+                           WHERE stage.flow_id = flow.id
+                             AND stage.state IN ('pending', 'admitted', 'running')
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM run_attempts AS attempt
+                           WHERE attempt.review_flow_id = flow.id
+                             AND attempt.status NOT IN (
+                                 'succeeded', 'cancelled', 'timed_out', 'startup_failed',
+                                 'failed', 'interrupted'
+                             )
+                       )
+                     UNION ALL
+                     SELECT 1 FROM run_attempts AS attempt
+                     WHERE attempt.status IN (
+                               'succeeded', 'cancelled', 'timed_out', 'startup_failed',
+                               'failed', 'interrupted'
+                           )
+                       AND attempt.completed_at_unix_ms IS NOT NULL
+                       AND attempt.completed_at_unix_ms < ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM run_coordinator_meta AS meta
+                           WHERE meta.active_attempt_id = attempt.id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM review_flows AS flow
+                           WHERE flow.latest_execution_attempt_id = attempt.id
+                              OR flow.id = attempt.review_flow_id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM review_stage_attempts AS stage
+                           WHERE stage.run_attempt_id = attempt.id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM run_approval_reservations AS reservation
+                           WHERE reservation.attempt_id = attempt.id
+                       )
+                     UNION ALL
+                     SELECT 1 FROM agent_tasks AS task
+                     WHERE task.status IN ('Completed', 'Failed')
+                       AND task.completed_at_unix_ms IS NOT NULL
+                       AND task.completed_at_unix_ms < ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM run_attempts AS attempt
+                           WHERE attempt.task_owner_agent_id = task.owner_agent_id
+                             AND attempt.task_id = task.id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM review_flows AS flow
+                           WHERE flow.task_owner_agent_id = task.owner_agent_id
+                             AND flow.task_id = task.id
+                       )
+                 )",
+                [cutoff],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        if exists {
+            return Ok(true);
+        }
+    }
+    if let Some(cutoff) = activity_cutoff {
+        return transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM agent_activity
+                     WHERE created_at_unix_ms IS NOT NULL AND created_at_unix_ms < ?1
+                     UNION ALL
+                     SELECT 1 FROM approval_requests AS approval
+                     WHERE (approval.status IN ('Denied', 'Expired')
+                            OR approval.consumed_at_unix_ms IS NOT NULL)
+                       AND COALESCE(
+                               approval.consumed_at_unix_ms,
+                               approval.resolved_at_unix_ms,
+                               approval.expires_at_unix_ms,
+                               approval.created_at_unix_ms
+                           ) < ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM run_approval_reservations AS reservation
+                           WHERE reservation.approval_id = approval.id
+                       )
+                     UNION ALL
+                     SELECT 1 FROM reminders
+                     WHERE status IN ('Completed', 'Dismissed')
+                       AND resolved_at_unix_ms IS NOT NULL
+                       AND resolved_at_unix_ms < ?1
+                 )",
+                [cutoff],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database);
+    }
+    Ok(false)
+}
+
+fn update_run_retention_meta(
+    transaction: &Transaction<'_>,
+    pruned_attempts: i64,
+    timestamp: i64,
+) -> PersistenceResult<()> {
+    let revision: i64 = transaction
+        .query_row(
+            "SELECT revision FROM run_coordinator_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let revision = next_revision(revision)?;
+    transaction
+        .execute(
+            "UPDATE run_coordinator_meta
+             SET revision = ?1,
+                 retained_attempt_count = (SELECT COUNT(*) FROM run_attempts),
+                 retained_payload_bytes = COALESCE((SELECT SUM(payload_bytes) FROM run_attempts), 0),
+                 pruned_attempt_count = pruned_attempt_count + ?2,
+                 last_pruned_at_unix_ms = ?3
+             WHERE singleton = 1",
+            params![revision, pruned_attempts, timestamp],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_data_lifecycle_run(
+    transaction: &Transaction<'_>,
+    lifecycle_revision: i64,
+    application_state_revision: i64,
+    trigger_kind: &str,
+    status: &str,
+    started_at_unix_ms: i64,
+    completed_at_unix_ms: i64,
+    task_cutoff_unix_ms: Option<i64>,
+    activity_cutoff_unix_ms: Option<i64>,
+    pruned: &RetentionPruneCounts,
+    skipped_protected: i64,
+    backlog_remaining: bool,
+    error_code: Option<&str>,
+    error_message: Option<&str>,
+) -> PersistenceResult<()> {
+    transaction
+        .execute(
+            "INSERT INTO data_lifecycle_runs
+             (lifecycle_revision, application_state_revision, trigger_kind, status,
+              started_at_unix_ms, completed_at_unix_ms,
+              task_cutoff_unix_ms, activity_cutoff_unix_ms, pruned_tasks,
+              pruned_attempts, pruned_review_flows, pruned_activity, pruned_approvals,
+              pruned_reminders, skipped_protected, backlog_remaining, error_code,
+              error_message)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     ?13, ?14, ?15, ?16, ?17, ?18)",
+            params![
+                lifecycle_revision,
+                application_state_revision,
+                trigger_kind,
+                status,
+                started_at_unix_ms,
+                completed_at_unix_ms,
+                task_cutoff_unix_ms,
+                activity_cutoff_unix_ms,
+                pruned.tasks,
+                pruned.attempts,
+                pruned.review_flows,
+                pruned.activity,
+                pruned.approvals,
+                pruned.reminders,
+                skipped_protected,
+                backlog_remaining as i64,
+                error_code,
+                error_message
+            ],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+fn trim_data_lifecycle_runs(transaction: &Transaction<'_>) -> PersistenceResult<()> {
+    transaction
+        .execute(
+            "DELETE FROM data_lifecycle_runs WHERE id IN (
+                 SELECT id FROM data_lifecycle_runs
+                 ORDER BY id DESC LIMIT -1 OFFSET ?1
+             )",
+            [MAX_MAINTENANCE_EVIDENCE_ROWS],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+fn bounded_lifecycle_message(message: &str) -> String {
+    message.chars().take(1024).collect()
+}
+
+fn monitoring_revision(connection: &Connection) -> PersistenceResult<MonitoringRevision> {
+    connection
+        .query_row(
+            "SELECT
+                 (SELECT state_revision FROM application_meta WHERE singleton = 1),
+                 (SELECT revision FROM task_orchestration_meta WHERE singleton = 1),
+                 (SELECT revision FROM run_coordinator_meta WHERE singleton = 1),
+                 (SELECT revision FROM review_orchestration_meta WHERE singleton = 1),
+                 (SELECT revision FROM data_lifecycle_meta WHERE singleton = 1)",
+            [],
+            |row| {
+                Ok(MonitoringRevision {
+                    application_state: row.get(0)?,
+                    task_orchestration: row.get(1)?,
+                    run_coordinator: row.get(2)?,
+                    review_orchestration: row.get(3)?,
+                    data_lifecycle: row.get(4)?,
+                })
+            },
+        )
+        .map_err(PersistenceError::database)
+}
+
+fn ensure_monitoring_revision(
+    current: &MonitoringRevision,
+    expected: &MonitoringRevision,
+) -> PersistenceResult<()> {
+    if current != expected {
+        return Err(PersistenceError::new(
+            "MONITORING_REVISION_CONFLICT",
+            "Authoritative monitoring data changed before this query or mutation could complete. Refresh and try again.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_monitoring_page(offset: i64, limit: i64) -> PersistenceResult<()> {
+    if !(0..=MAX_SAFE_INTEGER).contains(&offset) || !(1..=MONITORING_PAGE_LIMIT).contains(&limit) {
+        return Err(PersistenceError::new(
+            "MONITORING_PAGE_INVALID",
+            format!(
+                "Monitoring pages require a non-negative offset and a limit from 1 through {MONITORING_PAGE_LIMIT}."
+            ),
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn monitoring_queue_rank(task: &AgentTask) -> i64 {
+    match task.queue_state.as_str() {
+        "running" => 0,
+        "admitted" => 1,
+        "queued" => 2,
+        "held" => 3,
+        _ => 4,
+    }
+}
+
+fn read_monitoring_snapshot(
+    connection: &Connection,
+    timestamp: i64,
+) -> PersistenceResult<MonitoringSnapshot> {
+    let revision = monitoring_revision(connection)?;
+    let counts = connection
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM agents WHERE registry_state = 'active'),
+                 (SELECT COUNT(*) FROM agents
+                  WHERE registry_state = 'active' AND status = 'Working'),
+                 (SELECT COUNT(*) FROM agent_tasks),
+                 (SELECT COUNT(*) FROM agent_tasks WHERE status = 'Running'),
+                 (SELECT COUNT(*) FROM agent_tasks WHERE status = 'Pending'),
+                 (SELECT COUNT(*) FROM agent_tasks WHERE status = 'Blocked'),
+                 (SELECT COUNT(*) FROM agent_tasks WHERE status = 'Completed'),
+                 (SELECT COUNT(*) FROM agent_tasks WHERE status = 'Failed'),
+                 (SELECT COUNT(*) FROM agent_activity),
+                 (SELECT COUNT(*) FROM approval_requests
+                  WHERE authoritative = 1 AND status = 'Pending'),
+                 (SELECT COUNT(*) FROM reminders WHERE status = 'Upcoming'),
+                 (SELECT COUNT(*) FROM run_attempts),
+                 (SELECT COUNT(*) FROM run_attempts
+                  WHERE status IN ('admitted', 'starting', 'dispatching', 'running',
+                                   'cancel_requested'))",
+            [],
+            |row| {
+                Ok(MonitoringCounts {
+                    configured_agents: row.get(0)?,
+                    active_agents: row.get(1)?,
+                    total_tasks: row.get(2)?,
+                    running_tasks: row.get(3)?,
+                    pending_tasks: row.get(4)?,
+                    blocked_tasks: row.get(5)?,
+                    completed_tasks: row.get(6)?,
+                    failed_tasks: row.get(7)?,
+                    activity_entries: row.get(8)?,
+                    pending_approvals: row.get(9)?,
+                    upcoming_reminders: row.get(10)?,
+                    retained_run_attempts: row.get(11)?,
+                    active_run_attempts: row.get(12)?,
+                })
+            },
+        )
+        .map_err(PersistenceError::database)?;
+    let retention = connection
+        .query_row(
+            "SELECT task_retention, activity_retention
+             FROM retention_settings WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(PersistenceError::database)?
+        .unwrap_or_else(|| ("30".to_string(), "30".to_string()));
+    let lifecycle = connection
+        .query_row(
+            "SELECT last_observed_at_unix_ms, last_success_at_unix_ms,
+                    last_error_code, last_error_message, total_runs,
+                    total_pruned_tasks, total_pruned_attempts,
+                    total_pruned_review_flows, total_pruned_activity,
+                    total_pruned_approvals, total_pruned_reminders,
+                    inferred_timestamp_count
+             FROM data_lifecycle_meta WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(DataLifecycleSummary {
+                    task_retention: retention.0.clone(),
+                    activity_retention: retention.1.clone(),
+                    last_observed_at_unix_ms: row.get(0)?,
+                    last_success_at_unix_ms: row.get(1)?,
+                    last_error_code: row.get(2)?,
+                    last_error_message: row.get(3)?,
+                    total_runs: row.get(4)?,
+                    total_pruned: RetentionPruneCounts {
+                        tasks: row.get(5)?,
+                        attempts: row.get(6)?,
+                        review_flows: row.get(7)?,
+                        activity: row.get(8)?,
+                        approvals: row.get(9)?,
+                        reminders: row.get(10)?,
+                    },
+                    inferred_timestamp_count: row.get(11)?,
+                    latest_run: None,
+                })
+            },
+        )
+        .map_err(PersistenceError::database)?;
+    let latest_run = connection
+        .query_row(
+            "SELECT lifecycle_revision, application_state_revision, trigger_kind, status,
+                    started_at_unix_ms, completed_at_unix_ms, task_cutoff_unix_ms,
+                    activity_cutoff_unix_ms, pruned_tasks, pruned_attempts,
+                    pruned_review_flows, pruned_activity, pruned_approvals,
+                    pruned_reminders, skipped_protected, backlog_remaining,
+                    error_code, error_message
+             FROM data_lifecycle_runs ORDER BY id DESC LIMIT 1",
+            [],
+            |row| {
+                Ok(RetentionMaintenanceResult {
+                    lifecycle_revision: row.get(0)?,
+                    application_state_revision: row.get(1)?,
+                    trigger_kind: row.get(2)?,
+                    status: row.get(3)?,
+                    started_at_unix_ms: row.get(4)?,
+                    completed_at_unix_ms: row.get(5)?,
+                    task_cutoff_unix_ms: row.get(6)?,
+                    activity_cutoff_unix_ms: row.get(7)?,
+                    pruned: RetentionPruneCounts {
+                        tasks: row.get(8)?,
+                        attempts: row.get(9)?,
+                        review_flows: row.get(10)?,
+                        activity: row.get(11)?,
+                        approvals: row.get(12)?,
+                        reminders: row.get(13)?,
+                    },
+                    skipped_protected: row.get(14)?,
+                    backlog_remaining: row.get::<_, i64>(15)? != 0,
+                    error_code: row.get(16)?,
+                    error_message: row.get(17)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(PersistenceError::database)?;
+    let mut lifecycle = lifecycle;
+    lifecycle.latest_run = latest_run;
+    Ok(MonitoringSnapshot {
+        authoritative: true,
+        generated_at_unix_ms: timestamp,
+        revision,
+        counts,
+        lifecycle,
+    })
+}
+
+fn advance_monitoring_activity_revision(transaction: &Transaction<'_>) -> PersistenceResult<()> {
+    let application_revision: i64 = transaction
+        .query_row(
+            "SELECT state_revision FROM application_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let lifecycle_revision: i64 = transaction
+        .query_row(
+            "SELECT revision FROM data_lifecycle_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    transaction
+        .execute(
+            "UPDATE application_meta SET state_revision = ?1 WHERE singleton = 1",
+            [next_revision(application_revision)?],
+        )
+        .map_err(PersistenceError::database)?;
+    transaction
+        .execute(
+            "UPDATE data_lifecycle_meta SET revision = ?1 WHERE singleton = 1",
+            [next_revision(lifecycle_revision)?],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
 }
 
 fn protect_run_owned_state(
@@ -7228,6 +8639,83 @@ fn clear_application_state(
         .map_err(PersistenceError::database)
 }
 
+type ExistingTaskTimestamps = HashMap<(i64, i64), (Option<i64>, Option<i64>)>;
+type ExistingActivityTimestamps = HashMap<(i64, i64), Option<i64>>;
+type ExistingReminderTimestamps = HashMap<i64, (String, Option<i64>, Option<i64>)>;
+
+fn read_existing_task_timestamps(
+    transaction: &Transaction<'_>,
+) -> PersistenceResult<ExistingTaskTimestamps> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT owner_agent_id, id, created_at_unix_ms, completed_at_unix_ms
+             FROM agent_tasks",
+        )
+        .map_err(PersistenceError::database)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?),
+                (row.get::<_, Option<i64>>(2)?, row.get::<_, Option<i64>>(3)?),
+            ))
+        })
+        .map_err(PersistenceError::database)?;
+    let mut timestamps = HashMap::new();
+    for row in rows {
+        let (key, value) = row.map_err(PersistenceError::database)?;
+        timestamps.insert(key, value);
+    }
+    Ok(timestamps)
+}
+
+fn read_existing_activity_timestamps(
+    transaction: &Transaction<'_>,
+) -> PersistenceResult<ExistingActivityTimestamps> {
+    let mut statement = transaction
+        .prepare("SELECT owner_agent_id, id, created_at_unix_ms FROM agent_activity")
+        .map_err(PersistenceError::database)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?),
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })
+        .map_err(PersistenceError::database)?;
+    let mut timestamps = HashMap::new();
+    for row in rows {
+        let (key, value) = row.map_err(PersistenceError::database)?;
+        timestamps.insert(key, value);
+    }
+    Ok(timestamps)
+}
+
+fn read_existing_reminder_timestamps(
+    transaction: &Transaction<'_>,
+) -> PersistenceResult<ExistingReminderTimestamps> {
+    let mut statement = transaction
+        .prepare("SELECT id, status, created_at_unix_ms, resolved_at_unix_ms FROM reminders")
+        .map_err(PersistenceError::database)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                (
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ),
+            ))
+        })
+        .map_err(PersistenceError::database)?;
+    let mut timestamps = HashMap::new();
+    for row in rows {
+        let (id, value) = row.map_err(PersistenceError::database)?;
+        timestamps.insert(id, value);
+    }
+    Ok(timestamps)
+}
+
 fn write_application_state(
     transaction: &Transaction<'_>,
     state: &ApplicationState,
@@ -7236,6 +8724,17 @@ fn write_application_state(
     replace_approvals: bool,
 ) -> PersistenceResult<()> {
     validate_application_state(state).map_err(PersistenceError::validation)?;
+    let lifecycle_timestamp = now_unix_ms()?;
+    let (existing_task_timestamps, existing_activity_timestamps, existing_reminder_timestamps) =
+        if replace_approvals {
+            (HashMap::new(), HashMap::new(), HashMap::new())
+        } else {
+            (
+                read_existing_task_timestamps(transaction)?,
+                read_existing_activity_timestamps(transaction)?,
+                read_existing_reminder_timestamps(transaction)?,
+            )
+        };
     clear_application_state(transaction, replace_approvals)?;
     write_preferences(transaction, &state.preferences)?;
     transaction
@@ -7250,7 +8749,14 @@ fn write_application_state(
         .map_err(PersistenceError::database)?;
 
     for (position, agent) in state.agents.iter().enumerate() {
-        write_agent(transaction, position, agent)?;
+        write_agent(
+            transaction,
+            position,
+            agent,
+            &existing_task_timestamps,
+            &existing_activity_timestamps,
+            lifecycle_timestamp,
+        )?;
     }
     for (position, model) in state.models.iter().enumerate() {
         transaction
@@ -7266,15 +8772,27 @@ fn write_application_state(
                 .get(&request.id)
                 .map(String::as_str)
                 .unwrap_or(default_approval_origin);
-            write_approval_request(transaction, position, request, origin)?;
+            write_approval_request(transaction, position, request, origin, lifecycle_timestamp)?;
         }
     }
     for (position, reminder) in state.reminders.iter().enumerate() {
+        let existing = existing_reminder_timestamps.get(&reminder.id);
+        let created_at_unix_ms = existing.and_then(|(_, timestamp, _)| *timestamp);
+        let resolved_at_unix_ms = if matches!(reminder.status.as_str(), "Completed" | "Dismissed") {
+            existing
+                .filter(|(status, _, _)| matches!(status.as_str(), "Completed" | "Dismissed"))
+                .and_then(|(_, _, timestamp)| *timestamp)
+                .or(Some(lifecycle_timestamp))
+        } else {
+            None
+        };
         transaction
             .execute(
                 "INSERT INTO reminders
-                 (id, position, title, notes, due_at, status, agent_id, task_id, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (id, position, title, notes, due_at, status, agent_id, task_id, created_at,
+                  created_at_unix_ms, resolved_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                         COALESCE(?10, CAST(strftime('%s', ?9) AS INTEGER) * 1000, ?11), ?12)",
                 params![
                     reminder.id,
                     position as i64,
@@ -7284,7 +8802,10 @@ fn write_application_state(
                     reminder.status,
                     reminder.agent_id,
                     reminder.task_id,
-                    reminder.created_at
+                    reminder.created_at,
+                    created_at_unix_ms,
+                    lifecycle_timestamp,
+                    resolved_at_unix_ms
                 ],
             )
             .map_err(PersistenceError::database)?;
@@ -7371,6 +8892,9 @@ fn write_agent(
     transaction: &Transaction<'_>,
     position: usize,
     agent: &Agent,
+    existing_task_timestamps: &ExistingTaskTimestamps,
+    existing_activity_timestamps: &ExistingActivityTimestamps,
+    lifecycle_timestamp: i64,
 ) -> PersistenceResult<()> {
     transaction
         .execute(
@@ -7423,20 +8947,36 @@ fn write_agent(
         .map_err(PersistenceError::database)?;
 
     for (task_position, task) in agent.tasks.iter().enumerate() {
-        write_task(transaction, agent.id, task_position, task)?;
+        write_task(
+            transaction,
+            agent.id,
+            task_position,
+            task,
+            existing_task_timestamps
+                .get(&(agent.id, task.id))
+                .copied()
+                .unwrap_or((None, None)),
+            lifecycle_timestamp,
+        )?;
     }
     for (activity_position, entry) in agent.activity.iter().enumerate() {
         transaction
             .execute(
                 "INSERT INTO agent_activity
-                 (owner_agent_id, id, position, message, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (owner_agent_id, id, position, message, created_at, created_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5,
+                         COALESCE(?6, CAST(strftime('%s', ?5) AS INTEGER) * 1000, ?7))",
                 params![
                     agent.id,
                     entry.id,
                     activity_position as i64,
                     entry.message,
-                    entry.created_at
+                    entry.created_at,
+                    existing_activity_timestamps
+                        .get(&(agent.id, entry.id))
+                        .copied()
+                        .flatten(),
+                    lifecycle_timestamp
                 ],
             )
             .map_err(PersistenceError::database)?;
@@ -7449,6 +8989,8 @@ fn write_task(
     owner_agent_id: i64,
     position: usize,
     task: &AgentTask,
+    existing_timestamps: (Option<i64>, Option<i64>),
+    lifecycle_timestamp: i64,
 ) -> PersistenceResult<()> {
     let routing_evidence_json = task
         .routing_evidence
@@ -7482,10 +9024,15 @@ fn write_task(
               total_tokens, workspace_id, diff, duration_seconds, routing_mode,
               routed_from_agent_id, routing_reason, review_agent_id, review_status,
               review_result, review_model, review_duration_seconds, reviewed_at,
-              queue_state, enqueue_sequence, routing_evidence_json, workspace_evidence_json)
+              queue_state, enqueue_sequence, routing_evidence_json, workspace_evidence_json,
+              created_at_unix_ms, completed_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                      ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                     ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
+                     ?25, ?26, ?27, ?28, ?29, ?30, ?31,
+                     COALESCE(?32, CAST(strftime('%s', ?10) AS INTEGER) * 1000, ?34),
+                     CASE WHEN ?11 IS NULL THEN NULL
+                          ELSE COALESCE(?33, CAST(strftime('%s', ?11) AS INTEGER) * 1000, ?34)
+                     END)",
             params![
                 owner_agent_id,
                 task.id,
@@ -7517,7 +9064,10 @@ fn write_task(
                 task.queue_state,
                 task.enqueue_sequence,
                 routing_evidence_json,
-                workspace_evidence_json
+                workspace_evidence_json,
+                existing_timestamps.0,
+                existing_timestamps.1,
+                lifecycle_timestamp
             ],
         )
         .map_err(PersistenceError::database)?;
@@ -7543,15 +9093,26 @@ fn write_approval_request(
     position: usize,
     request: &ApprovalRequest,
     origin: &str,
+    lifecycle_timestamp: i64,
 ) -> PersistenceResult<()> {
     transaction
         .execute(
             "INSERT INTO approval_requests
              (id, position, agent_id, task_id, title, reason, status, created_at,
               resolved_at, risk_level, workspace_id, task_snapshot, expires_at,
-              consumed_at, origin, authoritative)
+              consumed_at, origin, authoritative, created_at_unix_ms,
+              resolved_at_unix_ms, expires_at_unix_ms, consumed_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, 0)",
+                     ?14, ?15, 0,
+                     COALESCE(CAST(strftime('%s', ?8) AS INTEGER) * 1000, ?16),
+                     CASE WHEN ?7 IN ('Denied', 'Expired') OR ?14 IS NOT NULL
+                          THEN COALESCE(
+                              CAST(strftime('%s', ?9) AS INTEGER) * 1000,
+                              CAST(strftime('%s', ?14) AS INTEGER) * 1000,
+                              ?16
+                          ) ELSE NULL END,
+                     COALESCE(CAST(strftime('%s', ?13) AS INTEGER) * 1000, ?16),
+                     CAST(strftime('%s', ?14) AS INTEGER) * 1000)",
             params![
                 request.id,
                 position as i64,
@@ -7567,7 +9128,8 @@ fn write_approval_request(
                 request.task_snapshot,
                 request.expires_at,
                 request.consumed_at,
-                origin
+                origin,
+                lifecycle_timestamp
             ],
         )
         .map_err(PersistenceError::database)?;
@@ -8144,7 +9706,8 @@ mod tests {
                     (4, "dynamic_agent_registry".to_string()),
                     (5, "authoritative_task_orchestration".to_string()),
                     (6, "structured_review_orchestration".to_string()),
-                    (7, "structured_workspace_evidence".to_string())
+                    (7, "structured_workspace_evidence".to_string()),
+                    (8, "data_lifecycle_and_monitoring".to_string())
                 ]
             );
             let journal_mode: String = repository
@@ -8232,6 +9795,15 @@ mod tests {
                 [],
             )
             .unwrap();
+        for statement in [
+            "ALTER TABLE agent_tasks ADD COLUMN created_at_unix_ms INTEGER",
+            "ALTER TABLE agent_tasks ADD COLUMN completed_at_unix_ms INTEGER",
+            "ALTER TABLE agent_activity ADD COLUMN created_at_unix_ms INTEGER",
+            "ALTER TABLE reminders ADD COLUMN created_at_unix_ms INTEGER",
+            "ALTER TABLE reminders ADD COLUMN resolved_at_unix_ms INTEGER",
+        ] {
+            connection.execute(statement, []).unwrap();
+        }
         let transaction = connection.transaction().unwrap();
         write_application_state(
             &transaction,
@@ -8257,6 +9829,15 @@ mod tests {
                 [],
             )
             .unwrap();
+        for statement in [
+            "ALTER TABLE agent_tasks DROP COLUMN created_at_unix_ms",
+            "ALTER TABLE agent_tasks DROP COLUMN completed_at_unix_ms",
+            "ALTER TABLE agent_activity DROP COLUMN created_at_unix_ms",
+            "ALTER TABLE reminders DROP COLUMN created_at_unix_ms",
+            "ALTER TABLE reminders DROP COLUMN resolved_at_unix_ms",
+        ] {
+            connection.execute(statement, []).unwrap();
+        }
         drop(connection);
 
         let mut repository = StateRepository::open(&path).unwrap();
@@ -9230,7 +10811,7 @@ mod tests {
         .to_string();
 
         let envelope = repository
-            .import_legacy_backup(initialized.revision, &backup)
+            .apply_backup_import(initialized.revision, &backup)
             .unwrap();
         assert_eq!(envelope.revision, 2);
         assert_eq!(envelope.state.preferences.theme, "light");
@@ -9254,7 +10835,7 @@ mod tests {
 
         assert_eq!(
             repository
-                .import_legacy_backup(envelope.revision, "{\"version\":2}")
+                .apply_backup_import(envelope.revision, "{\"version\":2}")
                 .unwrap_err()
                 .code,
             "STATE_VALIDATION_FAILED"
@@ -9262,6 +10843,509 @@ mod tests {
         let after_invalid = repository.load().unwrap().unwrap();
         assert_eq!(after_invalid.revision, envelope.revision);
         assert_eq!(after_invalid.state, before_invalid);
+    }
+
+    #[test]
+    fn task_0014_backup_repository_preview_apply_is_atomic_and_revision_guarded() {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        let initialized = repository.initialize_fresh().unwrap();
+        let exported = repository.export_backup().unwrap();
+        let mut backup: serde_json::Value = serde_json::from_str(&exported.backup_json).unwrap();
+        backup["data"]["preferences"]["theme"] = serde_json::json!("light");
+        let backup_json = serde_json::to_string(&backup).unwrap();
+
+        let preview = repository
+            .preview_backup_import(initialized.revision, &backup_json)
+            .unwrap();
+        assert_eq!(preview.format_version, 3);
+        assert_eq!(preview.source_schema_version, Some(CURRENT_SCHEMA_VERSION));
+        assert!(preview.replaces_current_state);
+        assert!(preview.clears_run_and_review_history);
+
+        let imported = repository
+            .apply_backup_import(initialized.revision, &backup_json)
+            .unwrap();
+        assert_eq!(imported.revision, initialized.revision + 1);
+        assert_eq!(imported.state.preferences.theme, "light");
+        assert_eq!(imported.migration.source_kind.as_deref(), Some("backup_v3"));
+        assert_eq!(imported.migration.source_version, Some(3));
+
+        assert_eq!(
+            repository
+                .apply_backup_import(initialized.revision, &backup_json)
+                .unwrap_err()
+                .code,
+            "REVISION_CONFLICT"
+        );
+        assert_eq!(
+            repository
+                .apply_backup_import(imported.revision, "{\"version\":3}")
+                .unwrap_err()
+                .code,
+            "STATE_VALIDATION_FAILED"
+        );
+        let after_failure = repository.load().unwrap().unwrap();
+        assert_eq!(after_failure.revision, imported.revision);
+        assert_eq!(after_failure.state, imported.state);
+    }
+
+    #[test]
+    fn task_0014_normalized_timestamps_survive_unrelated_state_saves() {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        let initialized = repository.initialize_fresh().unwrap();
+        let mut state = authorization_state();
+        state.agents[1].tasks[0].created_at = "legacy-task-time".to_string();
+        state.agents[1].activity = vec![ActivityEntry {
+            id: 7,
+            message: "Legacy activity".to_string(),
+            created_at: "legacy-activity-time".to_string(),
+        }];
+        state.reminders = vec![Reminder {
+            id: 9,
+            title: "Legacy reminder".to_string(),
+            notes: String::new(),
+            due_at: "legacy-due-time".to_string(),
+            status: "Completed".to_string(),
+            agent_id: Some(2),
+            task_id: Some(41),
+            created_at: "legacy-reminder-time".to_string(),
+        }];
+        let transaction = repository
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        write_application_state(
+            &transaction,
+            &state,
+            "renderer_prototype",
+            &HashMap::new(),
+            false,
+        )
+        .unwrap();
+        let revision = next_revision(initialized.revision).unwrap();
+        transaction
+            .execute(
+                "UPDATE application_meta SET state_revision = ?1 WHERE singleton = 1",
+                [revision],
+            )
+            .unwrap();
+        advance_task_orchestration_revision(&transaction).unwrap();
+        transaction.commit().unwrap();
+        repository
+            .connection
+            .execute(
+                "UPDATE agent_tasks SET created_at_unix_ms = 101 WHERE owner_agent_id = 2 AND id = 41",
+                [],
+            )
+            .unwrap();
+        repository
+            .connection
+            .execute(
+                "UPDATE agent_activity SET created_at_unix_ms = 102 WHERE owner_agent_id = 2 AND id = 7",
+                [],
+            )
+            .unwrap();
+        repository
+            .connection
+            .execute(
+                "UPDATE reminders SET created_at_unix_ms = 103, resolved_at_unix_ms = 104 WHERE id = 9",
+                [],
+            )
+            .unwrap();
+
+        let mut unchanged = repository.load().unwrap().unwrap().state;
+        unchanged.preferences.theme = "light".to_string();
+        repository.save(revision, &unchanged, false).unwrap();
+
+        let task_created: i64 = repository
+            .connection
+            .query_row(
+                "SELECT created_at_unix_ms FROM agent_tasks WHERE owner_agent_id = 2 AND id = 41",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let activity_created: i64 = repository
+            .connection
+            .query_row(
+                "SELECT created_at_unix_ms FROM agent_activity WHERE owner_agent_id = 2 AND id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let reminder_timestamps: (i64, i64) = repository
+            .connection
+            .query_row(
+                "SELECT created_at_unix_ms, resolved_at_unix_ms FROM reminders WHERE id = 9",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(task_created, 101);
+        assert_eq!(activity_created, 102);
+        assert_eq!(reminder_timestamps, (103, 104));
+    }
+
+    #[test]
+    fn task_0014_retention_prunes_terminal_history_and_protects_active_work() {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        let initialized = repository.initialize_fresh().unwrap();
+        let maintenance_time = 2_000_000_000_000_i64;
+        let old_time = maintenance_time - 10 * 86_400_000;
+        let old_timestamp = format_unix_ms(old_time);
+        let mut state = initialized.state;
+        let owner_id = state.agents[0].id;
+        let terminal_task = AgentTask {
+            id: 101,
+            title: "Old terminal task".to_string(),
+            category: "Development".to_string(),
+            priority: "Normal".to_string(),
+            assigned_agent_id: owner_id,
+            status: "Completed".to_string(),
+            phase: "Finished".to_string(),
+            created_at: old_timestamp.clone(),
+            completed_at: Some(old_timestamp.clone()),
+            result: Some("done".to_string()),
+            response_id: None,
+            runtime_model: None,
+            total_tokens: None,
+            workspace_id: None,
+            changed_files: Vec::new(),
+            diff: None,
+            workspace_changes: None,
+            duration_seconds: None,
+            routing_mode: "selected".to_string(),
+            routed_from_agent_id: None,
+            routing_reason: None,
+            queue_state: "notQueued".to_string(),
+            enqueue_sequence: None,
+            routing_evidence: None,
+            review_agent_id: None,
+            review_status: "Not Requested".to_string(),
+            review_result: None,
+            review_model: None,
+            review_duration_seconds: None,
+            reviewed_at: None,
+        };
+        let mut protected_terminal_task = terminal_task.clone();
+        protected_terminal_task.id = 102;
+        protected_terminal_task.title = "Protected terminal task".to_string();
+        let mut active_task = terminal_task.clone();
+        active_task.id = 103;
+        active_task.title = "Active queued task".to_string();
+        active_task.status = "Pending".to_string();
+        active_task.phase = "Assigned".to_string();
+        active_task.completed_at = None;
+        active_task.result = None;
+        active_task.queue_state = "queued".to_string();
+        active_task.enqueue_sequence = Some(1);
+        state.agents[0].tasks = vec![terminal_task, protected_terminal_task, active_task];
+        state.agents[0].activity.push(ActivityEntry {
+            id: 201,
+            message: "Old activity".to_string(),
+            created_at: old_timestamp.clone(),
+        });
+        state.reminders.push(Reminder {
+            id: 301,
+            title: "Resolved reminder".to_string(),
+            notes: "Old resolved reminder".to_string(),
+            due_at: old_timestamp.clone(),
+            status: "Completed".to_string(),
+            agent_id: Some(owner_id),
+            task_id: None,
+            created_at: old_timestamp.clone(),
+        });
+        let transaction = repository
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let meta = application_meta_from(&transaction).unwrap();
+        ensure_expected_revision(&meta, initialized.revision).unwrap();
+        write_application_state(
+            &transaction,
+            &state,
+            "renderer_prototype",
+            &HashMap::new(),
+            false,
+        )
+        .unwrap();
+        let saved_revision = next_revision(meta.state_revision).unwrap();
+        transaction
+            .execute(
+                "UPDATE application_meta SET state_revision = ?1 WHERE singleton = 1",
+                [saved_revision],
+            )
+            .unwrap();
+        advance_task_orchestration_revision(&transaction).unwrap();
+        transaction.commit().unwrap();
+
+        let expired_approval = ApprovalRequest {
+            id: 401,
+            agent_id: owner_id,
+            task_id: None,
+            title: "Expired history".to_string(),
+            reason: "Retention fixture".to_string(),
+            status: "Expired".to_string(),
+            created_at: old_timestamp.clone(),
+            resolved_at: Some(old_timestamp.clone()),
+            risk_level: "Low".to_string(),
+            scopes: vec!["files".to_string()],
+            workspace_id: None,
+            task_snapshot: "fixture".to_string(),
+            expires_at: old_timestamp.clone(),
+            consumed_at: None,
+        };
+        let mut active_approval = expired_approval.clone();
+        active_approval.id = 402;
+        active_approval.title = "Protected pending approval".to_string();
+        active_approval.status = "Pending".to_string();
+        active_approval.resolved_at = None;
+        let transaction = repository
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        write_approval_request(
+            &transaction,
+            0,
+            &expired_approval,
+            "legacy_backup",
+            old_time,
+        )
+        .unwrap();
+        write_approval_request(&transaction, 1, &active_approval, "legacy_backup", old_time)
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO run_attempts
+                 (request_id, intent_json, intent_fingerprint, policy_fingerprint,
+                  workspace_fingerprint, agent_id, task_owner_agent_id, task_id,
+                  task_title, run_mode, status, task_status_before, task_phase_before,
+                  review_status_before, admitted_at_unix_ms)
+                 VALUES ('task-0014-active', '{}', 'active', 'active', 'active',
+                         ?1, ?1, 102, 'Protected terminal task', 'execute', 'running',
+                         'Pending', 'Assigned', 'Not Requested', ?2)",
+                params![owner_id, old_time],
+            )
+            .unwrap();
+        let active_attempt_id = transaction.last_insert_rowid();
+        transaction
+            .execute(
+                "UPDATE run_coordinator_meta
+                 SET active_attempt_id = ?1, retained_attempt_count = 1
+                 WHERE singleton = 1",
+                [active_attempt_id],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE retention_settings
+                 SET task_retention = '7', activity_retention = '7'
+                 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let result = repository
+            .run_data_lifecycle_maintenance("test", maintenance_time)
+            .unwrap();
+        assert_eq!(result.status, "succeeded");
+        assert_eq!(result.pruned.tasks, 1);
+        assert_eq!(result.pruned.activity, 1);
+        assert_eq!(result.pruned.approvals, 1);
+        assert_eq!(result.pruned.reminders, 1);
+        assert!(result.skipped_protected >= 2);
+        assert_eq!(result.application_state_revision, saved_revision + 1);
+        let after = repository.load().unwrap().unwrap();
+        let task_ids = after.state.agents[0]
+            .tasks
+            .iter()
+            .map(|task| task.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(task_ids, HashSet::from([102, 103]));
+        assert!(after.state.agents[0].activity.is_empty());
+        assert_eq!(after.state.approval_requests.len(), 1);
+        assert_eq!(after.state.approval_requests[0].id, 402);
+        assert!(after.state.reminders.is_empty());
+
+        let rollback = repository
+            .run_data_lifecycle_maintenance("test", maintenance_time - 1)
+            .unwrap();
+        assert_eq!(rollback.status, "clock_rollback");
+        assert_eq!(rollback.pruned, RetentionPruneCounts::default());
+        assert_eq!(rollback.error_code.as_deref(), Some("CLOCK_ROLLBACK"));
+    }
+
+    #[test]
+    fn task_0014_retention_is_bounded_and_reports_backlog() {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        let initialized = repository.initialize_fresh().unwrap();
+        let maintenance_time = 2_000_000_000_000_i64;
+        let old_timestamp = format_unix_ms(maintenance_time - 10 * 86_400_000);
+        let mut state = initialized.state;
+        state.agents[0].activity = (1..=501)
+            .map(|id| ActivityEntry {
+                id,
+                message: format!("Old activity {id}"),
+                created_at: old_timestamp.clone(),
+            })
+            .collect();
+        repository
+            .save(initialized.revision, &state, false)
+            .unwrap();
+        repository
+            .connection
+            .execute(
+                "UPDATE retention_settings SET activity_retention = '7' WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+
+        let first = repository
+            .run_data_lifecycle_maintenance("test", maintenance_time)
+            .unwrap();
+        assert_eq!(first.pruned.activity, MAX_MAINTENANCE_ROWS_PER_DOMAIN);
+        assert!(first.backlog_remaining);
+        let second = repository
+            .run_data_lifecycle_maintenance("test", maintenance_time)
+            .unwrap();
+        assert_eq!(second.pruned.activity, 1);
+        assert!(!second.backlog_remaining);
+        let remaining: i64 = repository
+            .connection
+            .query_row("SELECT COUNT(*) FROM agent_activity", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn task_0014_monitoring_is_transactional_paged_and_activity_scoped() {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        let initialized = repository.initialize_fresh().unwrap();
+        let mut state = authorization_state();
+        state.agents[1].activity = vec![
+            ActivityEntry {
+                id: 1,
+                message: "Older local activity".to_string(),
+                created_at: "2026-08-25T10:00:00.000Z".to_string(),
+            },
+            ActivityEntry {
+                id: 2,
+                message: "Newer local activity".to_string(),
+                created_at: "2026-08-26T10:00:00.000Z".to_string(),
+            },
+        ];
+        let transaction = repository
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let meta = application_meta_from(&transaction).unwrap();
+        write_application_state(
+            &transaction,
+            &state,
+            "renderer_prototype",
+            &HashMap::new(),
+            false,
+        )
+        .unwrap();
+        let revision = next_revision(meta.state_revision).unwrap();
+        transaction
+            .execute(
+                "UPDATE application_meta SET state_revision = ?1 WHERE singleton = 1",
+                [revision],
+            )
+            .unwrap();
+        advance_task_orchestration_revision(&transaction).unwrap();
+        transaction
+            .execute(
+                "INSERT INTO run_attempts
+                 (request_id, intent_json, intent_fingerprint, policy_fingerprint,
+                  workspace_fingerprint, agent_id, task_owner_agent_id, task_id,
+                  task_title, run_mode, status, task_status_before, task_phase_before,
+                  review_status_before, admitted_at_unix_ms, completed_at_unix_ms)
+                 VALUES ('task-0014-monitoring-run', '{}', 'history', 'history', 'history',
+                         2, 2, 41, 'Monitoring task', 'execute', 'failed', 'Pending',
+                         'Assigned', 'Not Requested', 1800000000000, 1800000000001)",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let snapshot = repository.monitoring_snapshot().unwrap();
+        assert!(snapshot.authoritative);
+        assert_eq!(
+            snapshot.revision.application_state,
+            initialized.revision + 1
+        );
+        assert_eq!(snapshot.counts.total_tasks, 1);
+        assert_eq!(snapshot.counts.pending_tasks, 1);
+        assert_eq!(snapshot.counts.activity_entries, 2);
+        assert_eq!(snapshot.counts.retained_run_attempts, 1);
+
+        let tasks = repository
+            .query_monitoring_tasks(
+                &snapshot.revision,
+                Some("Pending"),
+                Some("Development"),
+                0,
+                MONITORING_PAGE_LIMIT,
+            )
+            .unwrap();
+        assert_eq!(tasks.total, 1);
+        assert_eq!(tasks.records[0].task.id, 41);
+        assert_eq!(tasks.records[0].owner_name, "Coding Agent");
+        assert_eq!(
+            repository
+                .query_monitoring_tasks(
+                    &snapshot.revision,
+                    None,
+                    None,
+                    0,
+                    MONITORING_PAGE_LIMIT + 1,
+                )
+                .unwrap_err()
+                .code,
+            "MONITORING_PAGE_INVALID"
+        );
+
+        let activity = repository
+            .query_monitoring_activity(&snapshot.revision, 0, 1)
+            .unwrap();
+        assert_eq!(activity.total, 2);
+        assert_eq!(activity.records.len(), 1);
+        assert_eq!(activity.records[0].entry_id, 2);
+
+        let observed_time: i64 = repository
+            .connection
+            .query_row(
+                "SELECT MAX(created_at_unix_ms) FROM agent_activity",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        repository
+            .run_data_lifecycle_maintenance("test", observed_time + 1)
+            .unwrap();
+        assert_eq!(
+            repository
+                .query_monitoring_activity(&snapshot.revision, 0, 1)
+                .unwrap_err()
+                .code,
+            "MONITORING_REVISION_CONFLICT"
+        );
+        let refreshed = repository.monitoring_snapshot().unwrap();
+        let deleted = repository
+            .delete_monitoring_activity(&refreshed.revision, 2, 2)
+            .unwrap();
+        assert_eq!(deleted.deleted_count, 1);
+        assert_eq!(deleted.snapshot.counts.activity_entries, 1);
+        assert_eq!(deleted.snapshot.counts.retained_run_attempts, 1);
+        let cleared = repository
+            .clear_monitoring_activity(&deleted.snapshot.revision)
+            .unwrap();
+        assert_eq!(cleared.deleted_count, 1);
+        assert_eq!(cleared.snapshot.counts.activity_entries, 0);
+        assert_eq!(cleared.snapshot.counts.retained_run_attempts, 1);
     }
 
     #[test]

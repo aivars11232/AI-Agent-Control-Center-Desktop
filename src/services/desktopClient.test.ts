@@ -267,4 +267,87 @@ describe("typed desktop client command contracts", () => {
     expect(openHandler).toHaveBeenCalledOnce();
     expect(stoppedEvents).toEqual(["voice-transcript", "voice-control-open"]);
   });
+
+  it("maps lifecycle backup and revision-bound monitoring commands exactly", async () => {
+    const { calls, client } = clientHarness();
+    const revision = {
+      applicationState: 1,
+      taskOrchestration: 2,
+      runCoordinator: 3,
+      reviewOrchestration: 4,
+      dataLifecycle: 5,
+    };
+
+    await client.monitoringSnapshot();
+    await client.queryMonitoringTasks({
+      expectedRevision: revision,
+      status: "Completed",
+      category: null,
+      offset: 0,
+      limit: 100,
+    });
+    await client.queryMonitoringActivity({
+      expectedRevision: revision,
+      offset: 0,
+      limit: 100,
+    });
+    await client.deleteMonitoringActivity({
+      expectedRevision: revision,
+      ownerAgentId: 7,
+      entryId: 8,
+    });
+    await client.clearMonitoringActivity(revision);
+    await client.exportBackup();
+    await client.previewBackupImport(9, "{\"version\":3}");
+    await client.applyBackupImport(9, "{\"version\":3}");
+
+    expect(calls).toEqual([
+      { command: "monitoring_snapshot", args: undefined },
+      {
+        command: "query_monitoring_tasks",
+        args: {
+          request: {
+            expectedRevision: revision,
+            status: "Completed",
+            category: null,
+            offset: 0,
+            limit: 100,
+          },
+        },
+      },
+      {
+        command: "query_monitoring_activity",
+        args: {
+          request: { expectedRevision: revision, offset: 0, limit: 100 },
+        },
+      },
+      {
+        command: "delete_monitoring_activity",
+        args: {
+          request: {
+            expectedRevision: revision,
+            ownerAgentId: 7,
+            entryId: 8,
+          },
+        },
+      },
+      {
+        command: "clear_monitoring_activity",
+        args: { request: { expectedRevision: revision } },
+      },
+      { command: "export_backup", args: undefined },
+      {
+        command: "preview_backup_import",
+        args: {
+          request: { expectedRevision: 9, backupJson: "{\"version\":3}" },
+        },
+      },
+      {
+        command: "apply_backup_import",
+        args: {
+          request: { expectedRevision: 9, backupJson: "{\"version\":3}" },
+        },
+      },
+    ]);
+  });
 });

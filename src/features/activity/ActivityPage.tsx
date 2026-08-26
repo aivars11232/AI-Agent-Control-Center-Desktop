@@ -1,6 +1,10 @@
+import { useEffect, useState } from "react";
 import type { Agent, HistoryRetentionDays } from "../../applicationState";
 import type { RunCoordinatorUiState } from "../../runCoordinator";
 import { workspaceEvidenceStatusLabel, workspaceReviewabilityLabel } from "../../workspaceEvidence";
+import type { MonitoringActivityPage, MonitoringSnapshot } from "../../dataLifecycle";
+import { desktopClient } from "../../services/desktopClient";
+import { persistenceErrorMessage } from "../../persistence";
 
 
 export function ActivityPage({
@@ -9,6 +13,10 @@ export function ActivityPage({
   runCoordinator,
   retentionDays,
   setRetentionDays,
+  monitoringSnapshot,
+  onMonitoringStale,
+  onDeleteActivity,
+  onClearActivity,
 }: {
   agents: Agent[];
   setAgents: React.Dispatch<React.SetStateAction<Agent[]>>;
@@ -17,8 +25,52 @@ export function ActivityPage({
   setRetentionDays: React.Dispatch<
     React.SetStateAction<HistoryRetentionDays>
   >;
+  monitoringSnapshot: MonitoringSnapshot | null;
+  onMonitoringStale: () => Promise<unknown>;
+  onDeleteActivity: (ownerAgentId: number, entryId: number) => Promise<void>;
+  onClearActivity: () => Promise<void>;
 }) {
-  const allActivity = agents
+  const [monitoringPage, setMonitoringPage] =
+    useState<MonitoringActivityPage | null>(null);
+  const [activityMessage, setActivityMessage] = useState("");
+  const [activityBusy, setActivityBusy] = useState(false);
+  const monitoringRevisionKey = monitoringSnapshot
+    ? Object.values(monitoringSnapshot.revision).join(":")
+    : "preview";
+
+  useEffect(() => {
+    if (!monitoringSnapshot?.authoritative) {
+      setMonitoringPage(null);
+      return;
+    }
+    let active = true;
+    void desktopClient
+      .queryMonitoringActivity({
+        expectedRevision: monitoringSnapshot.revision,
+        offset: 0,
+        limit: 100,
+      })
+      .then((page) => {
+        if (active) setMonitoringPage(page);
+      })
+      .catch((error) => {
+        if (!active) return;
+        setActivityMessage(persistenceErrorMessage(error));
+        if (
+          typeof error === "object" &&
+          error !== null &&
+          "code" in error &&
+          error.code === "MONITORING_REVISION_CONFLICT"
+        ) {
+          void onMonitoringStale();
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [monitoringRevisionKey, monitoringSnapshot?.authoritative, onMonitoringStale]);
+
+  const localActivity = agents
     .flatMap((agent) =>
       agent.activity.map((entry) => ({
         ...entry,
@@ -32,6 +84,16 @@ export function ActivityPage({
         new Date(b.createdAt).getTime() -
         new Date(a.createdAt).getTime(),
     );
+  const allActivity = monitoringSnapshot?.authoritative
+    ? (monitoringPage?.records ?? []).map((entry) => ({
+        id: entry.entryId,
+        message: entry.message,
+        createdAt: entry.createdAt,
+        agentId: entry.ownerAgentId,
+        agentName: entry.ownerName,
+        agentRole: entry.ownerRole,
+      }))
+    : localActivity;
 
   const activeAgents = agents.filter((agent) =>
     agent.tasks.some(
@@ -64,7 +126,19 @@ export function ActivityPage({
     agent.tasks.some((task) => task.status === "Pending"),
   );
 
-  function deleteActivityEntry(agentId: number, entryId: number) {
+  async function deleteActivityEntry(agentId: number, entryId: number) {
+    if (monitoringSnapshot?.authoritative) {
+      setActivityBusy(true);
+      setActivityMessage("");
+      try {
+        await onDeleteActivity(agentId, entryId);
+      } catch (error) {
+        setActivityMessage(persistenceErrorMessage(error));
+      } finally {
+        setActivityBusy(false);
+      }
+      return;
+    }
     setAgents((currentAgents) =>
       currentAgents.map((agent) =>
         agent.id === agentId
@@ -79,9 +153,21 @@ export function ActivityPage({
     );
   }
 
-  function clearAllActivity() {
+  async function clearAllActivity() {
+    if (monitoringSnapshot?.authoritative) {
+      setActivityBusy(true);
+      setActivityMessage("");
+      try {
+        await onClearActivity();
+      } catch (error) {
+        setActivityMessage(persistenceErrorMessage(error));
+      } finally {
+        setActivityBusy(false);
+      }
+      return;
+    }
     const shouldClear = window.confirm(
-      "Delete all recorded activity from every agent?",
+      "Delete all browser-preview activity from every agent?",
     );
 
     if (!shouldClear) {
@@ -103,11 +189,17 @@ export function ActivityPage({
           <span className="eyebrow">SYSTEM ACTIVITY</span>
           <h1>Activity</h1>
           <p className="page-message">
-            Monitor active agents, workflow progress, and recent events.
+            {monitoringSnapshot?.authoritative
+              ? "Revision-consistent backend monitoring and local configuration events."
+              : "Browser preview only; this timeline is not authoritative backend evidence."}
           </p>
         </div>
 
-        <button className="danger-button" onClick={clearAllActivity}>
+        <button
+          className="danger-button"
+          disabled={activityBusy}
+          onClick={() => void clearAllActivity()}
+        >
           Clear activity history
         </button>
       </header>
@@ -140,28 +232,47 @@ export function ActivityPage({
         </div>
       </section>
 
+      {activityMessage && (
+        <div className="runtime-message" role="status">
+          {activityMessage}
+        </div>
+      )}
+
       <section className="summary-grid">
         <article className="summary-card">
           <span>Active agents</span>
-          <strong>{activeAgents.length}</strong>
+          <strong>
+            {monitoringSnapshot?.counts.activeAgents ?? activeAgents.length}
+          </strong>
           <small>Working or reviewing</small>
         </article>
 
         <article className="summary-card">
           <span>Waiting next</span>
-          <strong>{nextAgents.length}</strong>
-          <small>Agents with pending work</small>
+          <strong>
+            {monitoringSnapshot?.counts.pendingTasks ?? nextAgents.length}
+          </strong>
+          <small>
+            {monitoringSnapshot?.authoritative
+              ? "Backend pending task records"
+              : "Agents with pending work"}
+          </small>
         </article>
 
         <article className="summary-card">
           <span>Blocked agents</span>
-          <strong>{blockedAgents.length}</strong>
+          <strong>
+            {monitoringSnapshot?.counts.blockedTasks ?? blockedAgents.length}
+          </strong>
           <small>Needs intervention</small>
         </article>
 
         <article className="summary-card">
           <span>Retained runs</span>
-          <strong>{runCoordinator.snapshot.retainedAttemptCount}</strong>
+          <strong>
+            {monitoringSnapshot?.counts.retainedRunAttempts ??
+              runCoordinator.snapshot.retainedAttemptCount}
+          </strong>
           <small>Backend-owned evidence</small>
         </article>
       </section>
@@ -349,12 +460,21 @@ export function ActivityPage({
           </div>
         </div>
 
-        {allActivity.length === 0 ? (
+        {monitoringSnapshot?.authoritative && !monitoringPage && !activityMessage ? (
+          <p className="page-message">Loading authoritative activity records…</p>
+        ) : allActivity.length === 0 ? (
           <p className="page-message">
             No activity has been recorded yet.
           </p>
         ) : (
-          <div className="agent-list">
+          <>
+            {monitoringPage && (
+              <p className="page-message">
+                Showing {monitoringPage.records.length} of {monitoringPage.total}{" "}
+                backend activity entries. Pages are capped at 100.
+              </p>
+            )}
+            <div className="agent-list">
             {allActivity.map((entry) => (
               <article
                 className="agent-card"
@@ -372,15 +492,17 @@ export function ActivityPage({
 
                 <button
                   className="danger-button"
+                  disabled={activityBusy}
                   onClick={() =>
-                    deleteActivityEntry(entry.agentId, entry.id)
+                    void deleteActivityEntry(entry.agentId, entry.id)
                   }
                 >
                   Delete
                 </button>
               </article>
             ))}
-          </div>
+            </div>
+          </>
         )}
       </section>
     </>

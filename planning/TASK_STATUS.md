@@ -34,8 +34,8 @@ ready merely because its predecessor's code was edited.
 | TASK-0010 | TASK-0009 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Deterministic routing, queueing, workload, and sequential scheduling |
 | TASK-0011 | TASK-0010 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Structured multi-level review, revisions, and recovery |
 | TASK-0012 | TASK-0011 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Complete workspace change evidence and Git/non-Git inspection |
-| TASK-0013 | TASK-0012 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Frontend modularization, accessibility, and responsive operation |
-| TASK-0014 | TASK-0013 | NOT STARTED | NO | NOT STARTED | — | — | Data lifecycle, strict backup, retention, and truthful monitoring |
+| TASK-0013 | TASK-0012 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Frontend modularization, accessibility, and responsive operation |
+| TASK-0014 | TASK-0013 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Data lifecycle, strict backup, retention, and truthful monitoring |
 | TASK-0015 | TASK-0014 | NOT STARTED | NO | NOT STARTED | — | — | Unified voice intent and system-action policy gateway |
 | TASK-0016 | TASK-0015 | NOT STARTED | NO | NOT STARTED | — | — | Offline voice runtime, KDE portal control, and XDG integration |
 | TASK-0017 | TASK-0016 | NOT STARTED | NO | NOT STARTED | — | — | Bounded Coding, Debugging, Browser, and Financial agent capabilities |
@@ -889,8 +889,98 @@ ready merely because its predecessor's code was edited.
   assertion were added before rerunning the gates
 - Remaining limits: browser-preview WebKitGTK evidence does not establish
   installed Tauri/WebView or packaged-platform behavior; TASK-0020 owns that
-  acceptance. TASK-0014 owns strict backup, retention, and full data lifecycle.
-  No TASK-0014 work was started
+  acceptance. TASK-0014 owns strict backup, retention, and full data lifecycle
+- Git closure: implementation commit
+  <code>572be762a38490f6a83076514686973e9c674c23</code>
+  (<code>task13</code>) was identified from actual Git history and was the
+  checked-out <code>main</code> HEAD at the TASK-0014 preflight. It was reachable
+  from <code>origin/main</code>; checked-out <code>main</code> and
+  <code>origin/main</code> resolved to that commit with zero ahead/behind and a
+  clean working tree. Its actual 54-file scope matched the retained TASK-0013
+  report with no unexplained intervening state, so all seven successor-preflight
+  closure conditions passed
+
+## TASK-0014 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>572be762a38490f6a83076514686973e9c674c23</code>
+  (<code>task13</code>)
+- Starting status: clean; <code>main</code> matched <code>origin/main</code> with
+  zero ahead/behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0013 as
+  recorded above; its exact implementation commit, origin reachability, branch
+  alignment, clean tree, and 54-file actual scope were freshly verified
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0014 AS PLANNED.</code>
+- Added schema-v8 normalized task/activity/reminder lifecycle timestamps,
+  retention indexes, durable lifecycle totals/revision, and latest-100 bounded
+  maintenance-run evidence. Existing malformed or absent legacy timestamp
+  projections are conservatively inferred during migration without deleting
+  source rows
+- Added strict 16-MiB, depth-128 portable backup v3 export/preview/apply.
+  Duplicate keys, trailing content, unknown fields, unsupported formats,
+  future schemas, and invalid aggregate state fail before mutation. Active
+  tasks import held; pending/approved portable approvals import expired and
+  non-authoritative; task/runtime authority evidence is cleared; provider
+  credentials/intents, run/review ledgers, portal sessions, and voice runtime
+  sessions are not backup domains. Legacy v2 passes through the same sanitizer
+- Backup apply uses the previewed backend candidate, application revision and
+  idle-run guards, a detailed trusted native confirmation, complete run/review
+  history clearing, one atomic state transaction, and post-import retention.
+  Invalid/stale input leaves current state and revision unchanged
+- Added startup and 15-minute periodic maintenance, immediate settings/import
+  passes, one-minute bounded-backlog retries, 500-row per-domain limits,
+  affected authority revision increments, active run/review/task/approval
+  protection, and clock-rollback evidence with age deletion skipped. Task
+  policy covers terminal tasks/attempts/review flows; activity policy covers
+  local activity, resolved/consumed approvals, and resolved reminders.
+  Existing aggregate and run-ledger hard caps remain when age retention is
+  <code>never</code>
+- Added transactional monitoring snapshots and 100-row task/activity pages
+  bound to one application/task/run/review/lifecycle revision tuple. Stale
+  tuples return <code>MONITORING_REVISION_CONFLICT</code>. Activity deletion is
+  scoped to the local configuration timeline; clear-all requires native
+  confirmation and tests prove retained run evidence is unchanged
+- Dashboard, Tasks, Activity, and Settings now present backend counts/pages,
+  retention status/errors/backlog, portable-backup preview/sanitization, and
+  accurate reset-versus-physical-purge wording. Browser mode is labelled as a
+  non-authoritative preview. Debug-only Tauri logs explicitly retain one
+  40,000-byte file using the installed plugin's native rotation contract
+- No package, Cargo manifest/lock, dependency, provider/model protocol,
+  authorization-policy, voice, KDE/portal, installer, or release-version change
+  was required
+- Focused verification passed on 2026-08-26: 4 backup tests; 3 retention,
+  normalized-timestamp stability, active-work, clock, bound, and backlog tests;
+  1 monitoring consistency and activity-scope test; 3 frontend files/14
+  persistence-writer, preview, and typed-command tests; TypeScript; and a
+  66-module production build
+- Complete fast gate: <code>npm run verify:fast</code> passed on 2026-08-26
+  with 18 frontend files/61 tests, TypeScript, rustfmt, and 138 locked/offline
+  Rust tests
+- Full non-live gate: <code>npm run verify:full</code> passed on 2026-08-26 with
+  the same fast checks, a 66-module production build, Clippy with warnings
+  denied, shell/Python/strict-JSON checks, npm/Cargo dependency trees, and
+  production plus full npm audits reporting zero vulnerabilities
+- Rust advisory result: **indeterminate** because <code>cargo-audit</code> is
+  unavailable; the full route records the skip explicitly and this
+  environmental limitation is not a pass
+- Live Codex/Ollama generation, provider authentication, microphone/listener,
+  portal authorization, native KDialog interaction, install/remove, desktop
+  package, and application desktop-control actions: not run
+- Security/privacy/failure/recovery effects: backups omit runtime authority and
+  remain sensitive user data; renderer, imported, task, activity, path, and
+  timestamp input remains untrusted; active authority/work is retained;
+  maintenance and monitoring fail closed on stale/corrupt input; no credential,
+  provider output, workspace content, or microphone data was added to fixtures
+  or documentation; reset is not presented as physical erasure
+- Remaining limits: physical database/file purge and installed removal evidence
+  belong to TASK-0019; packaged/live upgrade, native dialog, provider, and
+  platform acceptance remain TASK-0020 work. <code>cargo-audit</code> remains
+  unavailable and therefore indeterminate
 - Git closure: **PENDING USER** review, commit, push, and clean-tree evidence
 
 ## Successor-preflight closure rule

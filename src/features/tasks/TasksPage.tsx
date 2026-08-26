@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Agent, AgentTask, ApprovalRequest, TaskCategory, TaskStatus } from "../../applicationState";
 import { persistenceErrorMessage } from "../../persistence";
 import { queueEntryForTask, queueStateLabel } from "../../taskOrchestration";
@@ -6,6 +6,8 @@ import type { TaskOrchestrationSnapshot } from "../../taskOrchestration";
 import { errorMessage } from "../../domain/errors";
 import type { TaskOrchestrationMutation } from "../contracts";
 import { prepareBackendAuthorization, type AuthorizationReadiness } from "../../services/authorization";
+import { desktopClient } from "../../services/desktopClient";
+import type { MonitoringSnapshot, MonitoringTaskPage } from "../../dataLifecycle";
 
 export function TasksPage({
   agents,
@@ -13,11 +15,15 @@ export function TasksPage({
   onTaskMutation,
   runActive,
   setApprovalRequests,
+  monitoringSnapshot,
+  onMonitoringStale,
 }: {
   agents: Agent[];
   taskOrchestration: TaskOrchestrationSnapshot;
   onTaskMutation: TaskOrchestrationMutation;
   runActive: boolean;
+  monitoringSnapshot: MonitoringSnapshot | null;
+  onMonitoringStale: () => Promise<unknown>;
   setApprovalRequests: React.Dispatch<
     React.SetStateAction<ApprovalRequest[]>
   >;
@@ -28,16 +34,77 @@ export function TasksPage({
     useState<TaskCategory | "All">("All");
   const [taskMutationKey, setTaskMutationKey] = useState("");
   const [taskMessage, setTaskMessage] = useState("");
+  const [monitoringPage, setMonitoringPage] =
+    useState<MonitoringTaskPage | null>(null);
 
-  const allTasks = agents.flatMap((owner) =>
+  const monitoringRevisionKey = monitoringSnapshot
+    ? Object.values(monitoringSnapshot.revision).join(":")
+    : "preview";
+
+  useEffect(() => {
+    if (!monitoringSnapshot?.authoritative) {
+      setMonitoringPage(null);
+      return;
+    }
+    let active = true;
+    setMonitoringPage(null);
+    void desktopClient
+      .queryMonitoringTasks({
+        expectedRevision: monitoringSnapshot.revision,
+        status: statusFilter === "All" ? null : statusFilter,
+        category: categoryFilter === "All" ? null : categoryFilter,
+        offset: 0,
+        limit: 100,
+      })
+      .then((page) => {
+        if (active) setMonitoringPage(page);
+      })
+      .catch((error) => {
+        if (!active) return;
+        setTaskMessage(persistenceErrorMessage(error));
+        if (
+          typeof error === "object" &&
+          error !== null &&
+          "code" in error &&
+          error.code === "MONITORING_REVISION_CONFLICT"
+        ) {
+          void onMonitoringStale();
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [
+    monitoringRevisionKey,
+    monitoringSnapshot?.authoritative,
+    statusFilter,
+    categoryFilter,
+    onMonitoringStale,
+  ]);
+
+  const localTasks = agents.flatMap((owner) =>
     owner.tasks.map((task) => ({
       task,
-      owner,
-      executor:
-        agents.find((agent) => agent.id === task.assignedAgentId) ?? null,
+      ownerId: owner.id,
+      ownerName: owner.name,
+      executorName:
+        agents.find((agent) => agent.id === task.assignedAgentId)?.name ?? null,
       entry: queueEntryForTask(taskOrchestration, owner.id, task.id),
     })),
   );
+  const allTasks = monitoringSnapshot?.authoritative
+    ? (monitoringPage?.records ?? []).map((record) => ({
+        task: record.task,
+        ownerId: record.ownerAgentId,
+        ownerName: record.ownerName,
+        executorName: record.executorName,
+        entry: queueEntryForTask(
+          taskOrchestration,
+          record.ownerAgentId,
+          record.task.id,
+        ),
+      }))
+    : localTasks;
 
   const authoritativeEntries = [
     ...(taskOrchestration.activeExecute
@@ -53,7 +120,7 @@ export function TasksPage({
     ]),
   );
 
-  const filteredTasks = allTasks
+  const filteredTasks = (monitoringSnapshot?.authoritative ? allTasks : allTasks
     .filter(({ task }) => {
       const matchesStatus =
         statusFilter === "All" || task.status === statusFilter;
@@ -63,23 +130,29 @@ export function TasksPage({
     })
     .sort((left, right) => {
       const leftOrder =
-        authoritativeOrder.get(`${left.owner.id}:${left.task.id}`) ??
+        authoritativeOrder.get(`${left.ownerId}:${left.task.id}`) ??
         Number.MAX_SAFE_INTEGER;
       const rightOrder =
-        authoritativeOrder.get(`${right.owner.id}:${right.task.id}`) ??
+        authoritativeOrder.get(`${right.ownerId}:${right.task.id}`) ??
         Number.MAX_SAFE_INTEGER;
       return (
         leftOrder - rightOrder ||
         right.task.createdAt.localeCompare(left.task.createdAt) ||
         left.task.id - right.task.id
       );
-    });
+    }));
 
   const summary = {
-    total: allTasks.length,
-    active: taskOrchestration.activeExecute ? 1 : 0,
-    pending: taskOrchestration.executeQueue.length,
-    blocked: taskOrchestration.heldTasks.length,
+    total: monitoringSnapshot?.counts.totalTasks ?? allTasks.length,
+    active:
+      monitoringSnapshot?.counts.activeRunAttempts ??
+      (taskOrchestration.activeExecute ? 1 : 0),
+    pending:
+      monitoringSnapshot?.counts.pendingTasks ??
+      taskOrchestration.executeQueue.length,
+    blocked:
+      monitoringSnapshot?.counts.blockedTasks ??
+      taskOrchestration.heldTasks.length,
   };
 
   async function setQueueDisposition(
@@ -103,7 +176,7 @@ export function TasksPage({
     }
   }
 
-  async function requestTaskApproval(owner: Agent, task: AgentTask) {
+  async function requestTaskApproval(ownerAgentId: number, task: AgentTask) {
     const executor =
       agents.find((agent) => agent.id === task.assignedAgentId) ?? null;
     if (!executor) {
@@ -117,7 +190,7 @@ export function TasksPage({
         {
           kind: "runTask",
           agentId: executor.id,
-          taskOwnerAgentId: owner.id,
+          taskOwnerAgentId: ownerAgentId,
           taskId: task.id,
           runMode: "execute",
         },
@@ -147,7 +220,9 @@ export function TasksPage({
           <span className="eyebrow">GLOBAL WORKFLOW</span>
           <h1>Tasks</h1>
           <p className="page-message">
-            Inspect backend-owned routing, queue position, and lifecycle state.
+            {monitoringSnapshot?.authoritative
+              ? "Inspect a revision-consistent backend task page, routing, and queue state."
+              : "Browser preview only; task counts and ordering are not authoritative backend evidence."}
           </p>
         </div>
       </header>
@@ -244,16 +319,27 @@ export function TasksPage({
           </div>
         )}
 
+        {monitoringPage && (
+          <p className="page-message">
+            Showing {monitoringPage.records.length} of {monitoringPage.total}{" "}
+            revision-consistent backend task records. Pages are capped at 100.
+          </p>
+        )}
+
+        {monitoringSnapshot?.authoritative && !monitoringPage && !taskMessage && (
+          <p className="page-message">Loading authoritative task records…</p>
+        )}
+
         {filteredTasks.length === 0 ? (
           <p className="page-message">
             No tasks match the selected filters.
           </p>
         ) : (
           <div className="agent-list">
-                    {filteredTasks.map(({ task, owner, executor, entry }) => (
+                    {filteredTasks.map(({ task, ownerId, ownerName, executorName, entry }) => (
                       <article
                         className="agent-card task-card"
-                        key={`${owner.id}-${task.id}`}
+                        key={`${ownerId}-${task.id}`}
                       >
                         <div className="task-card-content">
                           <div
@@ -288,8 +374,8 @@ export function TasksPage({
                             {task.category} · {task.priority} priority
                           </p>
                           <small>
-                            Owner: {owner.name} · Executor:{" "}
-                            {executor?.name ?? "Unavailable"}
+                            Owner: {ownerName} · Executor:{" "}
+                            {executorName ?? "Unavailable"}
                             {task.routingMode === "automatic"
                               ? " · Automatically routed"
                               : ""}
@@ -317,11 +403,11 @@ export function TasksPage({
                                 className="secondary-button"
                                 disabled={
                                   runActive ||
-                                  taskMutationKey === `${owner.id}:${task.id}`
+                                  taskMutationKey === `${ownerId}:${task.id}`
                                 }
                                 onClick={() =>
                                   void setQueueDisposition(
-                                    owner.id,
+                                    ownerId,
                                     task,
                                     "hold",
                                   )
@@ -336,11 +422,11 @@ export function TasksPage({
                                 className="secondary-button"
                                 disabled={
                                   runActive ||
-                                  taskMutationKey === `${owner.id}:${task.id}`
+                                  taskMutationKey === `${ownerId}:${task.id}`
                                 }
                                 onClick={() =>
                                   void setQueueDisposition(
-                                    owner.id,
+                                    ownerId,
                                     task,
                                     "resume",
                                   )
@@ -357,11 +443,11 @@ export function TasksPage({
                               className="secondary-button"
                               disabled={
                                 runActive ||
-                                taskMutationKey === `${owner.id}:${task.id}`
+                                taskMutationKey === `${ownerId}:${task.id}`
                               }
                               onClick={() =>
                                 void setQueueDisposition(
-                                  owner.id,
+                                  ownerId,
                                   task,
                                   "resetTerminal",
                                 )
@@ -377,7 +463,7 @@ export function TasksPage({
                                 className="secondary-button"
                                 disabled={runActive}
                                 onClick={() =>
-                                  void requestTaskApproval(owner, task)
+                                  void requestTaskApproval(ownerId, task)
                                 }
                               >
                                 Request approval

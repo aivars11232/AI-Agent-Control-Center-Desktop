@@ -202,8 +202,8 @@ These controls establish the TASK-0004 authorization boundary, TASK-0005
 run-coordination boundary, TASK-0006 provider-identity boundary, TASK-0007
 Codex process/protocol boundary, TASK-0008 Ollama transport/workspace-tool
 boundary, TASK-0009 agent-registry boundary, and TASK-0010 routing/queue
-boundary, the TASK-0011 structured-review boundary, and the TASK-0012 workspace
-evidence boundary. They do not establish
+boundary, the TASK-0011 structured-review boundary, the TASK-0012 workspace
+evidence boundary, and the TASK-0014 backup/retention/monitoring boundary. They do not establish
 production readiness or the later live provider/platform guarantees.
 
 ## Known current gaps
@@ -213,16 +213,31 @@ production readiness or the later live provider/platform guarantees.
 Desktop core domain state and agent registry now use a backend-owned SQLite
 transaction boundary, schema/migration ledger, integrity check, and
 compare-and-swap revision. The renderer cannot fall back to WebView storage
-after desktop persistence starts
-or fails. Remaining lifecycle gaps include strict backup/export contracts,
-broader domain retention, recovery UX, and integrated live upgrade evidence.
-TASK-0014 owns those controls. The browser preview remains non-authoritative.
+after desktop persistence starts or fails. Portable backup v3 rejects
+oversized, deeply nested, duplicate-key, unknown-field, trailing, unsupported,
+and future-schema input before mutation. Export/import strips active approval
+authority and run/review/provider/portal/voice-runtime authority; apply is
+revision checked, idle-run guarded, natively confirmed, and atomic. Legacy v2
+imports cross the same sanitizer. The browser preview remains explicitly
+non-authoritative.
+
+Schema-v8 retention uses backend time, normalized timestamps, active-record
+protection, 500-row per-domain passes, latest-100 evidence, a 15-minute timer,
+and a one-minute backlog retry. Backward clock movement skips age deletion and
+is recorded. Monitoring queries bind application/task/run/review/lifecycle
+revisions transactionally and stale tuples fail closed. Local activity clear
+requires native confirmation and cannot clear the authoritative run/review
+ledger. Remaining lifecycle ownership is physical database/file purge,
+installed removal evidence, mandatory advisory tooling, and live upgrade or
+packaged recovery acceptance under TASK-0019–TASK-0020.
 
 Exact approval binding stores normalized intent JSON in the local database.
 For text-input actions, that record includes the exact text to be typed and may
 therefore contain sensitive user content. Unix database permissions restrict
-the file to the current user, while TASK-0014 retains ownership of explicit
-retention, deletion, export, and recovery UX.
+the file to the current user. Resolved/consumed approval history follows the
+activity-retention policy, while pending/current/reserved authority is
+protected. Export omits authorization intents entirely. Pattern redaction and
+retention reduce exposure but do not prove all sensitive content absent.
 
 ### Residual IPC and web content work
 
@@ -394,9 +409,12 @@ least-privilege workarounds before any code change.
   that all sensitive content can be recognized; retention remains required.
 - Do not include secrets, complete private prompts, workspace contents, or raw
   microphone audio in routine logs.
-- Make retention and deletion behavior explicit and testable.
+- Keep age retention bounded and revision visible; protect active authority and
+  record maintenance errors or clock rollback instead of claiming deletion.
 - Keep Ollama local by default and make any network boundary visible.
-- Treat backup export as sensitive user data and validate imports before use.
+- Treat backup export as sensitive user data; sanitize portable authority,
+  bound/strictly validate imports, preview the exact candidate, and require
+  trusted confirmation before atomic replacement.
 - Preserve deletion tombstones and explicit restore intent in lifecycle data;
   do not resurrect absent defaults during normalization.
 

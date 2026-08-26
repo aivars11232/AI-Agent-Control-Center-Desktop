@@ -136,8 +136,9 @@ complete and internally consistent.
 ### M4 — Make the application maintainable
 
 TASK-0013 modularizes the renderer and completes its checked-in accessibility
-and responsive contracts. TASK-0014 establishes strict backup/import,
-retention, monitoring, and data lifecycle behavior. Installed and packaged
+and responsive contracts. TASK-0014 establishes strict portable backup/import,
+bounded continuous retention with durable evidence, revision-bound monitoring,
+and truthful reset/data-lifecycle behavior. Installed and packaged
 platform acceptance remains part of TASK-0020.
 
 ### M5 — Make voice and KDE safe

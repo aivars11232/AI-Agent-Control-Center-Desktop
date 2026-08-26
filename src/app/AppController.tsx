@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   Agent,
   AgentTask,
@@ -75,6 +75,13 @@ import { TasksPage } from "../features/tasks/TasksPage";
 import { VoiceControlPage } from "../features/voice/VoiceControlPage";
 import { AppShell } from "./AppShell";
 import type { Page } from "./navigation";
+import {
+  previewMonitoringSnapshot,
+  type BackupExport,
+  type BackupImportPreview,
+  type MonitoringMutationResult,
+  type MonitoringSnapshot,
+} from "../dataLifecycle";
 import "../App.css";
 
 function PlaceholderPage({ page }: { page: Page }) {
@@ -124,6 +131,8 @@ export function AppController() {
   const suppressNextPersistenceWrite = useRef(false);
   const [agentRegistrySnapshot, setAgentRegistrySnapshot] =
     useState<AgentRegistrySnapshot | null>(null);
+  const [monitoringSnapshot, setMonitoringSnapshot] =
+    useState<MonitoringSnapshot | null>(null);
 
   const [taskRetentionDays, setTaskRetentionDays] =
     useState<HistoryRetentionDays>(() => {
@@ -561,6 +570,21 @@ export function AppController() {
     }
   });
   const operationalAgents = activeRegistryAgents(agents);
+  const displayedMonitoringSnapshot = desktopRuntime
+    ? monitoringSnapshot
+    : previewMonitoringSnapshot(
+        {
+          agents,
+          models,
+          approvalRequests,
+          reminders,
+          taskRetentionDays,
+          activityRetentionDays,
+          preferences,
+        },
+        runCoordinator.snapshot.retainedAttemptCount,
+        runCoordinator.snapshot.activeAttempt ? 1 : 0,
+      );
 
   async function refreshAgentRegistrySnapshot() {
     if (!desktopRuntime) return;
@@ -579,6 +603,13 @@ export function AppController() {
     const snapshot = await desktopClient.reviewOrchestrationSnapshot();
     setReviewOrchestration(snapshot);
   }
+
+  const refreshMonitoringSnapshot = useCallback(async () => {
+    if (!desktopRuntime) return null;
+    const snapshot = await desktopClient.monitoringSnapshot();
+    setMonitoringSnapshot(snapshot);
+    return snapshot;
+  }, [desktopRuntime]);
 
   async function adoptReviewOrchestrationSnapshot(
     snapshot: ReviewOrchestrationSnapshot,
@@ -607,6 +638,7 @@ export function AppController() {
     try {
       await refreshTaskOrchestrationSnapshot();
       await refreshReviewOrchestrationSnapshot();
+      await refreshMonitoringSnapshot();
     } catch (error) {
       setPersistenceMessage(
         `Application state was updated, but the task queue could not be refreshed: ${persistenceErrorMessage(error)}`,
@@ -652,6 +684,11 @@ export function AppController() {
               setPersistencePhase("error");
             }
           },
+          () => {
+            void refreshMonitoringSnapshot().catch((error: unknown) => {
+              if (active) setPersistenceMessage(persistenceErrorMessage(error));
+            });
+          },
         );
         setPersistenceMessage(cleanupWarning ?? "");
         hydrateApplicationState(envelope.state);
@@ -662,6 +699,9 @@ export function AppController() {
           if (active) setPersistenceMessage(persistenceErrorMessage(error));
         });
         void refreshReviewOrchestrationSnapshot().catch((error: unknown) => {
+          if (active) setPersistenceMessage(persistenceErrorMessage(error));
+        });
+        void refreshMonitoringSnapshot().catch((error: unknown) => {
           if (active) setPersistenceMessage(persistenceErrorMessage(error));
         });
       })
@@ -681,6 +721,16 @@ export function AppController() {
       setPersistencePhase("ready");
     }
   }, [persistencePhase]);
+
+  useEffect(() => {
+    if (!desktopRuntime || persistencePhase !== "ready") return;
+    const interval = window.setInterval(() => {
+      void refreshMonitoringSnapshot().catch((error: unknown) => {
+        setPersistenceMessage(persistenceErrorMessage(error));
+      });
+    }, 60_000);
+    return () => window.clearInterval(interval);
+  }, [desktopRuntime, persistencePhase, refreshMonitoringSnapshot]);
 
   useEffect(() => {
     if (!desktopRuntime || persistencePhase !== "ready") {
@@ -705,6 +755,7 @@ export function AppController() {
           applyAuthoritativeApplicationState(envelope.state);
           await refreshTaskOrchestrationSnapshot();
           await refreshReviewOrchestrationSnapshot();
+          await refreshMonitoringSnapshot();
         }
       } catch (error) {
         if (active) {
@@ -774,7 +825,7 @@ export function AppController() {
     setPersistenceMessage("");
     setPersistencePhase("mutating");
     try {
-      const envelope = await writer.importLegacyBackup(backupJson);
+      const envelope = await writer.applyBackupImport(backupJson);
       hydrateApplicationState(envelope.state);
       await refreshAgentRegistrySnapshotAfterCommit();
       await refreshTaskOrchestrationAfterCommit();
@@ -788,6 +839,69 @@ export function AppController() {
       }
       throw error;
     }
+  }
+
+  async function previewApplicationBackup(
+    backupJson: string,
+  ): Promise<BackupImportPreview> {
+    const writer = persistenceWriter.current;
+    if (!desktopRuntime || !writer) {
+      throw new Error("Application persistence is not ready.");
+    }
+    return writer.previewBackupImport(backupJson);
+  }
+
+  async function exportApplicationBackup(): Promise<BackupExport> {
+    const writer = persistenceWriter.current;
+    if (!desktopRuntime || !writer) {
+      throw new Error("Application persistence is not ready.");
+    }
+    await writer.flush();
+    return desktopClient.exportBackup();
+  }
+
+  async function adoptMonitoringMutation(
+    result: MonitoringMutationResult,
+  ): Promise<void> {
+    setMonitoringSnapshot(result.snapshot);
+    const envelope = await desktopClient.loadApplicationState();
+    if (envelope) {
+      persistenceWriter.current?.adoptRevision(envelope.revision);
+      applyAuthoritativeApplicationState(envelope.state);
+    }
+  }
+
+  async function deleteActivityEntry(
+    ownerAgentId: number,
+    entryId: number,
+  ): Promise<void> {
+    const writer = persistenceWriter.current;
+    if (!desktopRuntime || !writer) {
+      throw new Error("Authoritative activity controls require the desktop app.");
+    }
+    await writer.flush();
+    const snapshot = await refreshMonitoringSnapshot();
+    if (!snapshot) return;
+    const result = await desktopClient.deleteMonitoringActivity({
+      expectedRevision: snapshot.revision,
+      ownerAgentId,
+      entryId,
+    });
+    await adoptMonitoringMutation(result);
+  }
+
+  async function clearActivityHistory(): Promise<void> {
+    const writer = persistenceWriter.current;
+    if (!desktopRuntime || !writer) {
+      throw new Error("Authoritative activity controls require the desktop app.");
+    }
+    await writer.flush();
+    const snapshot = await refreshMonitoringSnapshot();
+    if (!snapshot) return;
+    const result = await desktopClient.clearMonitoringActivity(
+      snapshot.revision,
+    );
+    await adoptMonitoringMutation(result);
   }
 
   async function resetPersistedApplication(confirmation: string) {
@@ -1168,6 +1282,7 @@ export function AppController() {
             approvalRequests={approvalRequests}
             taskOrchestration={taskOrchestration}
             runCoordinator={runCoordinator}
+            monitoringSnapshot={displayedMonitoringSnapshot}
             onOpenAgents={() => setActivePage("Agents")}
             onOpenTasks={() => setActivePage("Tasks")}
             onOpenApprovals={() => setActivePage("Approvals")}
@@ -1209,6 +1324,8 @@ export function AppController() {
             onTaskMutation={mutateTaskOrchestration}
             runActive={Boolean(globalActiveRun)}
             setApprovalRequests={setBackendApprovalRequests}
+            monitoringSnapshot={displayedMonitoringSnapshot}
+            onMonitoringStale={refreshMonitoringSnapshot}
           />
         ) : activePage === "Approvals" ? (
           <ApprovalsPage
@@ -1231,6 +1348,10 @@ export function AppController() {
             runCoordinator={runCoordinator}
             retentionDays={activityRetentionDays}
             setRetentionDays={setActivityRetentionDays}
+            monitoringSnapshot={displayedMonitoringSnapshot}
+            onMonitoringStale={refreshMonitoringSnapshot}
+            onDeleteActivity={deleteActivityEntry}
+            onClearActivity={clearActivityHistory}
           />
         ) : activePage === "Models" ? (
           <ModelsPage
@@ -1264,7 +1385,10 @@ export function AppController() {
             registryMessage={aiProviderMessage}
             onRefreshRegistry={refreshProviderRegistry}
             onImportBackup={importApplicationBackup}
+            onPreviewBackup={previewApplicationBackup}
+            onExportBackup={exportApplicationBackup}
             onResetApplication={resetPersistedApplication}
+            monitoringSnapshot={displayedMonitoringSnapshot}
           />
         ) : (
           <PlaceholderPage page={activePage} />

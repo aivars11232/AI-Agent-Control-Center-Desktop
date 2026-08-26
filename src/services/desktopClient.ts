@@ -20,6 +20,15 @@ import type {
 } from "../runCoordinator";
 import type { TaskOrchestrationSnapshot } from "../taskOrchestration";
 import type { WorkspaceChangeEvidence } from "../workspaceEvidence";
+import type {
+  BackupExport,
+  BackupImportPreview,
+  MonitoringActivityPage,
+  MonitoringMutationResult,
+  MonitoringRevision,
+  MonitoringSnapshot,
+  MonitoringTaskPage,
+} from "../dataLifecycle";
 
 export type AgentRunResult = {
   providerId: RuntimeProviderId | null;
@@ -310,6 +319,68 @@ export function createDesktopClient(
 
     runCoordinatorSnapshot() {
       return invokeFn<RunCoordinatorSnapshot>("run_coordinator_snapshot");
+    },
+
+    monitoringSnapshot() {
+      return invokeFn<MonitoringSnapshot>("monitoring_snapshot");
+    },
+
+    queryMonitoringTasks(request: {
+      expectedRevision: MonitoringRevision;
+      status: string | null;
+      category: string | null;
+      offset: number;
+      limit: number;
+    }) {
+      return invokeFn<MonitoringTaskPage>("query_monitoring_tasks", {
+        request,
+      });
+    },
+
+    queryMonitoringActivity(request: {
+      expectedRevision: MonitoringRevision;
+      offset: number;
+      limit: number;
+    }) {
+      return invokeFn<MonitoringActivityPage>("query_monitoring_activity", {
+        request,
+      });
+    },
+
+    deleteMonitoringActivity(request: {
+      expectedRevision: MonitoringRevision;
+      ownerAgentId: number;
+      entryId: number;
+    }) {
+      return invokeFn<MonitoringMutationResult>(
+        "delete_monitoring_activity",
+        { request },
+      );
+    },
+
+    clearMonitoringActivity(expectedRevision: MonitoringRevision) {
+      return invokeFn<MonitoringMutationResult>("clear_monitoring_activity", {
+        request: { expectedRevision },
+      });
+    },
+
+    exportBackup() {
+      return invokeFn<BackupExport>("export_backup");
+    },
+
+    previewBackupImport(
+      expectedRevision: number,
+      backupJson: string,
+    ) {
+      return invokeFn<BackupImportPreview>("preview_backup_import", {
+        request: { expectedRevision, backupJson },
+      });
+    },
+
+    applyBackupImport(expectedRevision: number, backupJson: string) {
+      return invokeFn<StateEnvelope>("apply_backup_import", {
+        request: { expectedRevision, backupJson },
+      });
     },
 
     onRunCoordinatorEvent(handler: (event: RunCoordinatorEvent) => void) {
