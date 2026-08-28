@@ -2,6 +2,10 @@ use crate::app_state::{
     application_state_from_legacy_backup, validate_application_state, AgentTask, ApplicationState,
     StateValidationError, CURRENT_SCHEMA_VERSION, MAX_STATE_BYTES,
 };
+use crate::reminder_scheduler::{
+    validate_scheduled_item, DeliveryMode, ScheduledItemV1, MAX_SCHEDULED_ITEMS,
+};
+use crate::structured_memory::{validate_memory_record, MemoryRecordV1, MAX_MEMORY_RECORDS};
 use serde::{
     de::{Error as DeError, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer, Serialize,
@@ -10,7 +14,7 @@ use serde_json::{Map, Number, Value};
 use std::{fmt, fmt::Write as _};
 
 pub const BACKUP_FORMAT: &str = "ai-agent-control-center-portable-backup";
-pub const BACKUP_VERSION: i64 = 3;
+pub const BACKUP_VERSION: i64 = 4;
 pub const MAX_BACKUP_BYTES: usize = MAX_STATE_BYTES;
 pub const MAX_BACKUP_JSON_DEPTH: usize = 128;
 pub const MAX_MAINTENANCE_ROWS_PER_DOMAIN: i64 = 500;
@@ -19,13 +23,16 @@ pub const MAINTENANCE_INTERVAL_SECONDS: u64 = 15 * 60;
 pub const MAINTENANCE_BACKLOG_INTERVAL_SECONDS: u64 = 60;
 pub const MONITORING_PAGE_LIMIT: i64 = 100;
 
-const OMITTED_DOMAINS: [&str; 8] = [
+const OMITTED_DOMAINS: [&str; 11] = [
     "providerCredentials",
     "authorizationIntents",
     "runReservations",
     "runAttempts",
     "reviewFlows",
     "portalSessions",
+    "portalNotificationGrants",
+    "notificationDeliveryEvidence",
+    "managementHandoffs",
     "voiceRuntimeSessions",
     "systemActionAudit",
 ];
@@ -40,6 +47,18 @@ struct BackupEnvelopeV3 {
     data: ApplicationState,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackupEnvelopeV4 {
+    format: String,
+    version: i64,
+    exported_at_unix_ms: i64,
+    source_schema_version: i64,
+    data: ApplicationState,
+    scheduled_items: Vec<ScheduledItemV1>,
+    memory_records: Vec<MemoryRecordV1>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupRecordCounts {
@@ -50,6 +69,7 @@ pub struct BackupRecordCounts {
     pub approval_history: usize,
     pub reminders: usize,
     pub workspaces: usize,
+    pub memory_records: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -59,6 +79,7 @@ pub struct BackupSanitizationCounts {
     pub expired_approvals: usize,
     pub cleared_task_evidence: usize,
     pub disabled_voice_runtime: bool,
+    pub portal_deliveries_disabled: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -96,6 +117,9 @@ pub struct RetentionPruneCounts {
     pub approvals: i64,
     pub reminders: i64,
     pub system_action_audits: i64,
+    pub memory_records: i64,
+    pub reminder_occurrences: i64,
+    pub management_handoffs: i64,
 }
 
 impl RetentionPruneCounts {
@@ -104,6 +128,9 @@ impl RetentionPruneCounts {
             .saturating_add(self.activity)
             .saturating_add(self.approvals)
             .saturating_add(self.reminders)
+            .saturating_add(self.memory_records)
+            .saturating_add(self.reminder_occurrences)
+            .saturating_add(self.management_handoffs)
     }
 }
 
@@ -239,10 +266,22 @@ pub(crate) struct BackupCandidate {
     pub source_kind: &'static str,
     pub byte_length: usize,
     pub sanitizations: BackupSanitizationCounts,
+    pub scheduled_items: Vec<ScheduledItemV1>,
+    pub memory_records: Vec<MemoryRecordV1>,
 }
 
+#[cfg(test)]
 pub fn build_backup_export(
     state: &ApplicationState,
+    exported_at_unix_ms: i64,
+) -> Result<BackupExport, StateValidationError> {
+    build_backup_export_with_domains(state, &[], &[], exported_at_unix_ms)
+}
+
+pub(crate) fn build_backup_export_with_domains(
+    state: &ApplicationState,
+    scheduled_items: &[ScheduledItemV1],
+    memory_records: &[MemoryRecordV1],
     exported_at_unix_ms: i64,
 ) -> Result<BackupExport, StateValidationError> {
     if exported_at_unix_ms < 0 {
@@ -251,14 +290,53 @@ pub fn build_backup_export(
             "export time must be non-negative",
         ));
     }
-    let (portable_state, sanitizations) = sanitize_portable_state(state.clone())?;
-    let counts = record_counts(&portable_state);
-    let envelope = BackupEnvelopeV3 {
+    if scheduled_items.len() > MAX_SCHEDULED_ITEMS || memory_records.len() > MAX_MEMORY_RECORDS {
+        return Err(StateValidationError::new(
+            "backup",
+            "portable reminder or memory count exceeds the supported limit",
+        ));
+    }
+    let (mut portable_state, mut sanitizations) = sanitize_portable_state(state.clone())?;
+    portable_state.reminders.clear();
+    for agent in &mut portable_state.agents {
+        agent.memory.clear();
+    }
+    let mut portable_scheduled_items = scheduled_items.to_vec();
+    for item in &mut portable_scheduled_items {
+        validate_scheduled_item(item)
+            .map_err(|error| StateValidationError::new("backup.scheduledItems", error.message))?;
+        if item.delivery_mode == DeliveryMode::Portal {
+            sanitizations.portal_deliveries_disabled += 1;
+        }
+        item.delivery_mode = DeliveryMode::InApp;
+        item.schedule_fingerprint = None;
+    }
+    let portable_memory_records = memory_records
+        .iter()
+        .filter(|record| {
+            record
+                .expires_at_unix_ms
+                .map_or(true, |expires| expires > exported_at_unix_ms)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for record in &portable_memory_records {
+        validate_memory_record(record)
+            .map_err(|error| StateValidationError::new("backup.memoryRecords", error.message))?;
+    }
+    let counts = record_counts(
+        &portable_state,
+        portable_scheduled_items.len(),
+        portable_memory_records.len(),
+    );
+    let envelope = BackupEnvelopeV4 {
         format: BACKUP_FORMAT.to_string(),
         version: BACKUP_VERSION,
         exported_at_unix_ms,
         source_schema_version: CURRENT_SCHEMA_VERSION,
         data: portable_state,
+        scheduled_items: portable_scheduled_items,
+        memory_records: portable_memory_records,
     };
     let backup_json = serde_json::to_string(&envelope).map_err(|error| {
         StateValidationError::new("backup", format!("backup could not be encoded: {error}"))
@@ -295,65 +373,145 @@ pub(crate) fn parse_backup_candidate(
     }
     let value = parse_json_without_duplicate_keys(backup_json)?;
     let version = value.get("version").and_then(Value::as_i64).unwrap_or(2);
-    let (state, source_schema_version, source_kind) = match version {
-        BACKUP_VERSION => {
-            let envelope: BackupEnvelopeV3 = serde_json::from_value(value).map_err(|error| {
-                StateValidationError::new(
-                    "backup",
-                    format!("backup version 3 does not match its strict schema: {error}"),
+    let (state, source_schema_version, source_kind, mut scheduled_items, memory_records) =
+        match version {
+            BACKUP_VERSION => {
+                let envelope: BackupEnvelopeV4 =
+                    serde_json::from_value(value).map_err(|error| {
+                        StateValidationError::new(
+                            "backup",
+                            format!("backup version 4 does not match its strict schema: {error}"),
+                        )
+                    })?;
+                if envelope.format != BACKUP_FORMAT {
+                    return Err(StateValidationError::new(
+                        "backup.format",
+                        "backup format discriminator is unsupported",
+                    ));
+                }
+                if envelope.version != BACKUP_VERSION {
+                    return Err(StateValidationError::new(
+                        "backup.version",
+                        "backup version is unsupported",
+                    ));
+                }
+                if envelope.exported_at_unix_ms < 0 {
+                    return Err(StateValidationError::new(
+                        "backup.exportedAtUnixMs",
+                        "export time must be non-negative",
+                    ));
+                }
+                if !(1..=CURRENT_SCHEMA_VERSION).contains(&envelope.source_schema_version) {
+                    return Err(StateValidationError::new(
+                        "backup.sourceSchemaVersion",
+                        "backup source schema is unsupported",
+                    ));
+                }
+                (
+                    envelope.data,
+                    Some(envelope.source_schema_version),
+                    "backup_v4",
+                    envelope.scheduled_items,
+                    envelope.memory_records,
                 )
-            })?;
-            if envelope.format != BACKUP_FORMAT {
-                return Err(StateValidationError::new(
-                    "backup.format",
-                    "backup format discriminator is unsupported",
-                ));
             }
-            if envelope.version != BACKUP_VERSION {
+            3 => {
+                let envelope: BackupEnvelopeV3 =
+                    serde_json::from_value(value).map_err(|error| {
+                        StateValidationError::new(
+                            "backup",
+                            format!("backup version 3 does not match its strict schema: {error}"),
+                        )
+                    })?;
+                if envelope.format != BACKUP_FORMAT || envelope.version != 3 {
+                    return Err(StateValidationError::new(
+                        "backup.format",
+                        "backup version 3 discriminator is unsupported",
+                    ));
+                }
+                if envelope.exported_at_unix_ms < 0
+                    || !(1..=CURRENT_SCHEMA_VERSION).contains(&envelope.source_schema_version)
+                {
+                    return Err(StateValidationError::new(
+                        "backup",
+                        "backup version 3 metadata is unsupported",
+                    ));
+                }
+                (
+                    envelope.data,
+                    Some(envelope.source_schema_version),
+                    "backup_v3",
+                    Vec::new(),
+                    Vec::new(),
+                )
+            }
+            2 => {
+                let normalized_json = serde_json::to_string(&value).map_err(|error| {
+                    StateValidationError::new(
+                        "backup",
+                        format!("legacy backup could not be normalized: {error}"),
+                    )
+                })?;
+                (
+                    application_state_from_legacy_backup(&normalized_json, current)?,
+                    Some(2),
+                    "legacy_backup",
+                    Vec::new(),
+                    Vec::new(),
+                )
+            }
+            _ => {
                 return Err(StateValidationError::new(
                     "backup.version",
-                    "backup version is unsupported",
+                    "only portable backup versions 4 and 3 and legacy version 2 are supported",
                 ));
             }
-            if envelope.exported_at_unix_ms < 0 {
-                return Err(StateValidationError::new(
-                    "backup.exportedAtUnixMs",
-                    "export time must be non-negative",
-                ));
-            }
-            if !(1..=CURRENT_SCHEMA_VERSION).contains(&envelope.source_schema_version) {
-                return Err(StateValidationError::new(
-                    "backup.sourceSchemaVersion",
-                    "backup source schema is unsupported",
-                ));
-            }
-            (
-                envelope.data,
-                Some(envelope.source_schema_version),
-                "backup_v3",
-            )
-        }
-        2 => {
-            let normalized_json = serde_json::to_string(&value).map_err(|error| {
-                StateValidationError::new(
-                    "backup",
-                    format!("legacy backup could not be normalized: {error}"),
-                )
-            })?;
-            (
-                application_state_from_legacy_backup(&normalized_json, current)?,
-                Some(2),
-                "legacy_backup",
-            )
-        }
-        _ => {
+        };
+    if version == BACKUP_VERSION
+        && (!state.reminders.is_empty()
+            || state.agents.iter().any(|agent| !agent.memory.is_empty()))
+    {
+        return Err(StateValidationError::new(
+            "backup.data",
+            "backup version 4 must store reminders and memory only in their structured domains",
+        ));
+    }
+    if scheduled_items.len() > MAX_SCHEDULED_ITEMS || memory_records.len() > MAX_MEMORY_RECORDS {
+        return Err(StateValidationError::new(
+            "backup",
+            "portable reminder or memory count exceeds the supported limit",
+        ));
+    }
+    let portal_deliveries_disabled = scheduled_items
+        .iter()
+        .filter(|item| item.delivery_mode == DeliveryMode::Portal)
+        .count();
+    let mut item_ids = std::collections::HashSet::new();
+    for item in &mut scheduled_items {
+        if !item_ids.insert(item.id) {
             return Err(StateValidationError::new(
-                "backup.version",
-                "only portable backup version 3 and legacy version 2 are supported",
+                "backup.scheduledItems",
+                "a portable scheduled item identifier is duplicated",
             ));
         }
-    };
-    let (state, sanitizations) = sanitize_portable_state(state)?;
+        validate_scheduled_item(item)
+            .map_err(|error| StateValidationError::new("backup.scheduledItems", error.message))?;
+        item.delivery_mode = DeliveryMode::InApp;
+        item.schedule_fingerprint = None;
+    }
+    let mut memory_ids = std::collections::HashSet::new();
+    for record in &memory_records {
+        if !memory_ids.insert(record.id) {
+            return Err(StateValidationError::new(
+                "backup.memoryRecords",
+                "a portable memory record identifier is duplicated",
+            ));
+        }
+        validate_memory_record(record)
+            .map_err(|error| StateValidationError::new("backup.memoryRecords", error.message))?;
+    }
+    let (state, mut sanitizations) = sanitize_portable_state(state)?;
+    sanitizations.portal_deliveries_disabled = portal_deliveries_disabled;
     Ok(BackupCandidate {
         state,
         format_version: version,
@@ -361,6 +519,8 @@ pub(crate) fn parse_backup_candidate(
         source_kind,
         byte_length: backup_json.len(),
         sanitizations,
+        scheduled_items,
+        memory_records,
     })
 }
 
@@ -372,7 +532,11 @@ pub(crate) fn preview_for_candidate(
         format_version: candidate.format_version,
         source_schema_version: candidate.source_schema_version,
         byte_length: candidate.byte_length,
-        counts: record_counts(&candidate.state),
+        counts: record_counts(
+            &candidate.state,
+            candidate.scheduled_items.len(),
+            candidate.memory_records.len(),
+        ),
         sanitizations: candidate.sanitizations.clone(),
         omitted_domains: omitted_domains(),
         replaces_current_state: true,
@@ -387,13 +551,14 @@ pub(crate) fn import_confirmation_message(preview: &BackupImportPreview) -> Stri
         .as_deref()
         .unwrap_or("No protected security configuration increase was detected.");
     format!(
-        "Replace current portable application data with backup version {}?\n\nAgents: {}\nTasks: {}\nActivity entries: {}\nApproval history: {}\nReminders: {}\n\n{} task(s) will be held, {} approval record(s) will be expired, and current run/review history will be cleared.\n\nSecurity: {}",
+        "Replace current portable application data with backup version {}?\n\nAgents: {}\nTasks: {}\nActivity entries: {}\nApproval history: {}\nReminders/events: {}\nMemory records: {}\n\n{} task(s) will be held, {} approval record(s) will be expired, and current run/review/handoff and notification-delivery history will be cleared.\n\nSecurity: {}",
         preview.format_version,
         preview.counts.agents,
         preview.counts.tasks,
         preview.counts.activity,
         preview.counts.approval_history,
         preview.counts.reminders,
+        preview.counts.memory_records,
         preview.sanitizations.held_tasks,
         preview.sanitizations.expired_approvals,
         security,
@@ -497,15 +662,24 @@ fn sanitize_portable_state(
     Ok((state, sanitizations))
 }
 
-fn record_counts(state: &ApplicationState) -> BackupRecordCounts {
+fn record_counts(
+    state: &ApplicationState,
+    scheduled_item_count: usize,
+    memory_record_count: usize,
+) -> BackupRecordCounts {
     BackupRecordCounts {
         agents: state.agents.len(),
         tasks: state.agents.iter().map(|agent| agent.tasks.len()).sum(),
         activity: state.agents.iter().map(|agent| agent.activity.len()).sum(),
         models: state.models.len(),
         approval_history: state.approval_requests.len(),
-        reminders: state.reminders.len(),
+        reminders: if scheduled_item_count == 0 {
+            state.reminders.len()
+        } else {
+            scheduled_item_count
+        },
         workspaces: state.preferences.workspaces.len(),
+        memory_records: memory_record_count,
     }
 }
 

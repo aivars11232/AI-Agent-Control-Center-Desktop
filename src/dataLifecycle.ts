@@ -16,6 +16,9 @@ export type RetentionPruneCounts = {
   approvals: number;
   reminders: number;
   systemActionAudits: number;
+  memoryRecords: number;
+  reminderOccurrences: number;
+  managementHandoffs: number;
 };
 
 export type RetentionMaintenanceResult = {
@@ -120,6 +123,7 @@ export type BackupRecordCounts = {
   approvalHistory: number;
   reminders: number;
   workspaces: number;
+  memoryRecords: number;
 };
 
 export type BackupSanitizationCounts = {
@@ -127,6 +131,7 @@ export type BackupSanitizationCounts = {
   expiredApprovals: number;
   clearedTaskEvidence: number;
   disabledVoiceRuntime: boolean;
+  portalDeliveriesDisabled: number;
 };
 
 export type BackupExport = {
@@ -158,6 +163,9 @@ const zeroPruned: RetentionPruneCounts = {
   approvals: 0,
   reminders: 0,
   systemActionAudits: 0,
+  memoryRecords: 0,
+  reminderOccurrences: 0,
+  managementHandoffs: 0,
 };
 
 export function previewMonitoringSnapshot(

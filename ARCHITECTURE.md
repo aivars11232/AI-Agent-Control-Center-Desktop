@@ -42,6 +42,7 @@ The binding decision record is
       |-- run snapshot/event projection (src/runCoordinator.ts)
       |-- specialist request/result presentation (src/specialistCapabilities.ts)
       |-- structured workspace-evidence projection (src/workspaceEvidence.ts)
+      |-- passive schedule, scoped memory, and handoff projections
       |-- canonical voice-intent interpretation (src/voiceCommand.ts)
       |-- browser-preview localStorage (non-authoritative compatibility only)
       |-- renderer presentation: review controls and task view state
@@ -54,6 +55,9 @@ The binding decision record is
       |-- authoritative task routing/queue contract (task_orchestration.rs)
       |-- authoritative review protocol/pipeline (review_orchestration.rs)
       |-- strict specialist request/result/tool contracts (specialist_capabilities.rs)
+      |-- passive reminder/event contracts (reminder_scheduler.rs)
+      |-- scoped memory contracts (structured_memory.rs)
+      |-- sequential handoff contracts (management_handoffs.rs)
       |-- capability policy + authoritative one-use approvals
       |-- authoritative single-run coordinator + durable bounded ledger
       |-- provider registry/common contract (provider_runtime.rs)
@@ -105,6 +109,12 @@ file-open action for an existing final regular file or directory.
 requests, describes effective ceilings, and projects backend-validated results.
 Its Debugging-to-Coding action only pre-populates a visible Coding draft; it
 does not create, approve, queue, or dispatch work by itself.
+<code>src/reminderScheduler.ts</code>, <code>src/structuredMemory.ts</code>, and
+<code>src/managementHandoffs.ts</code> defensively project backend-owned
+schedules, scoped records, and sequential evidence. Their forms request
+revision-bound mutations and their views expose failures and provenance; they
+do not resolve civil time, authorize notification delivery, select run memory,
+or create management transitions.
 
 ### Rust backend
 
@@ -120,6 +130,8 @@ also composes <code>app_state.rs</code>, <code>policy.rs</code>,
 <code>ollama_runtime.rs</code>, <code>workspace_tools.rs</code>,
 <code>workspace_evidence.rs</code>, <code>data_lifecycle.rs</code>,
 <code>specialist_capabilities.rs</code>,
+<code>reminder_scheduler.rs</code>, <code>structured_memory.rs</code>,
+<code>management_handoffs.rs</code>,
 <code>system_actions.rs</code>, <code>linux_paths.rs</code>,
 <code>linux_desktop.rs</code>, <code>voice_runtime.rs</code>,
 <code>desktop_control.rs</code>, and
@@ -132,6 +144,8 @@ transport/discovery, descriptor-confined conflict-safe workspace edits and
 before/after evidence capture, hardened Git inspection,
 validated agent identity/lifecycle/hierarchy operations, deterministic routing
 and queue evidence, structured reporting-chain review and verdict validation,
+passive schedule/time-zone resolution, scoped-memory selection and exact run
+bundles, sequential management-handoff validation,
 canonical voice/system-action contracts, exact Linux desktop target
 resolution, bounded redacted action audit, SQLite schema/repository, legacy
 migration, and typed state IPC. The provider registry
@@ -144,8 +158,8 @@ provider startup.
 ### Persistence and migration
 
 The desktop database is <code>application-state.sqlite3</code> below Tauri's
-platform application-data directory. Migrations 0001 through 0010 establish
-schema version 10 plus a migration ledger. Repository writes replace one
+platform application-data directory. Migrations 0001 through 0011 establish
+schema version 11 plus a migration ledger. Repository writes replace one
 validated aggregate inside an immediate transaction and use a monotonically
 increasing revision to reject stale writers. Startup refuses corrupt or
 unsupported newer databases and retains the typed error for the renderer
@@ -163,9 +177,9 @@ Only a fully parsed and validated candidate commits. Legacy pending/approved
 approvals are downgraded to expired non-authoritative history, and browser keys
 are deleted only after the transaction commits. Backend-issued records use a
 separate authoritative origin and cannot be manufactured by migration or a
-whole-state save. Portable backup v3 export, preview, and apply are backend
+whole-state save. Portable backup v4 export, preview, and apply are backend
 owned, strict, bounded, sanitized, revision checked, idle-run guarded, natively
-confirmed, and atomic. Legacy version 2 imports pass through the same
+confirmed, and atomic. Legacy version 2 and 3 imports pass through the same
 sanitization boundary; browser-only version 2 behavior is explicitly a
 non-authoritative preview.
 
@@ -228,7 +242,7 @@ Schema v9 adds an immutable-binding system-action audit capped at 10,000 rows,
 plus lifecycle totals/run counts for terminal audit retention. Request IDs bind
 canonical intent fingerprints to exact targets and authorization evidence.
 Restart reconciliation changes a pre-crash <code>dispatched</code> action to
-<code>uncertain</code> and never repeats it. Portable backup v3 intentionally
+<code>uncertain</code> and never repeats it. Portable backup v4 intentionally
 omits this local authority/evidence domain.
 
 Schema v10 adds bounded JSON-checked specialist requests to tasks and immutable
@@ -238,8 +252,36 @@ matching, and generic-save preservation keep those records backend-owned.
 Untouched legacy seed profiles are narrowed to truthful defaults; customized
 profile rows are preserved. Older tasks without a typed request remain visible
 but cannot acquire core-specialist authority until the user creates a new typed
-task. Portable backup v3 carries portable task requests but excludes immutable
+task. Portable backup v4 carries portable task requests but excludes immutable
 run contracts/results with the rest of the run ledger.
+
+Schema v11 replaces renderer-owned reminder behavior with normalized scheduled
+items, occurrence/delivery evidence, scheduler authority metadata, and a
+dedicated revision. Local civil time is resolved through IANA zones with an
+earlier-offset fold policy and forward-shift gap policy; daily, weekly, and
+monthly recurrence stays anchored to the original civil time. A non-AI desktop
+timer scans after startup and every 30 seconds, records missed or uncertain
+occurrences idempotently, and optionally sends a privacy-bounded XDG
+notification. Invalid legacy schedules and recurrence limits become explicit
+needs-attention evidence rather than repeated dispatch.
+
+Schema v11 also introduces exactly scoped agent/project/task/team memory,
+revision/provenance/retention events, and immutable per-attempt prompt bundles.
+Run admission selects only records visible to the exact agent, reporting team,
+workspace, and task; caps the canonical bundle at 128 records/64 KiB; stores
+its JSON and SHA-256 before dispatch; and passes that exact bundle to the
+provider prompt. Legacy agent free text migrates once as inspectable agent
+memory and generic aggregate saves cannot recreate memory authority.
+
+Management handoffs in schema v11 are append-only, idempotent, bounded records
+for plans, assignments, execution/failure evidence, review decisions,
+revisions, human overrides, and recovery. The task, run, review, and trusted
+human transactions create them in required sequence and bind their source,
+owner role, identities, revision round, and evidence IDs. They are an
+inspectable workspace projection, not a provider-dispatched message channel.
+Portable backup v4 accepts prior v2/v3 input, carries schedules and unexpired
+structured memory, converts portal delivery to in-app behavior, and omits
+portal grants/delivery evidence, handoffs, and run/review authority.
 
 Monitoring reads the application, task-orchestration, run-coordinator,
 review-orchestration, and lifecycle revisions in one transaction. Task and
@@ -318,6 +360,9 @@ packaged acceptance.
 - Workspaces are user-selected filesystem roots.
 - KDE/Wayland integration crosses application, window, input, portal, desktop
   entry, and XDG data/config boundaries.
+- Reminder notification delivery crosses the XDG notification portal; no
+  notification grant or restore token is treated as portable application
+  authority.
 - Git evidence is read through direct hardened Git commands in a selected
   workspace; descriptor-confined filesystem evidence is the explicit fallback
   for non-Git roots or unusable Git state.
@@ -351,7 +396,10 @@ packaged acceptance.
    dispatches exactly that registry adapter. Unsupported, missing, ambiguous,
    inactive, or unavailable identities fail closed without fallback.
    For core work it also hashes the typed request and persists an immutable
-   role/tool/provider/model/approval contract before dispatch.
+   role/tool/provider/model/approval contract before dispatch. It selects the
+   exact visible structured-memory records, persists their canonical bounded
+   bundle and SHA-256 on the attempt, and renders that same bundle into the
+   provider prompt.
 7. Codex dispatch revalidates its executable, streams the prompt on standard
    input, runs in an outer lifecycle-only Bubblewrap namespace plus an explicit
    inner Codex sandbox, parses bounded JSONL incrementally, and refuses a
@@ -372,6 +420,9 @@ packaged acceptance.
    and domain-bounded; requested checks must be reported exactly; Financial
    assumptions and calculation values must exactly match the request and
    backend fixed-point results.
+   The same completion transaction appends bounded execution or failure
+   handoff evidence linked to the full immutable run record rather than
+   duplicating unbounded workspace details.
 10. The next stage is derived from the executor role and walks the exact active
     reporting chain sequentially: Senior, Team Leader, and Supervisor as
     applicable. Missing, repeated, inactive, or provider-unready identities
@@ -419,6 +470,9 @@ authority into the UI.
 TASK-0017 connects the Agents task composer and run ledger to typed specialist
 requests, visible effective ceilings, immutable run contracts, and validated
 structured results without making renderer fields an authorization boundary.
+TASK-0018 connects Reminders and Agents to revision-bound schedule, structured-
+memory, and management-handoff commands/events without moving time-zone,
+delivery, memory-selection, or transition authority into the renderer.
 
 The renderer may request actions and display decisions. It must not mint
 authorization, decide durable run truth, or become the sole owner of domain
@@ -426,8 +480,8 @@ state.
 
 ### Directional backend boundaries
 
-- **Domain/state** — versioned agents, tasks, approvals, reminders, settings,
-  runs, and audit records.
+- **Domain/state** — versioned agents, tasks, approvals, reminders/events,
+  structured memory, management handoffs, settings, runs, and audit records.
 - **Persistence/migrations** — atomic storage, schema versions, backup import,
   recovery, retention, and migration evidence.
 - **Policy/authorization** — normalized capabilities, approval matching,
@@ -436,6 +490,15 @@ state.
   identity, immutable per-run tool ceilings, fixed-point calculations, and
   cross-role/external-effect rejection. This boundary is implemented by
   TASK-0017.
+- **Reminder scheduler** — IANA civil-time resolution, anchored recurrence,
+  restart/missed-event reconciliation, occurrence idempotency, and optional
+  XDG notification delivery. This boundary is implemented by TASK-0018.
+- **Structured memory** — exact agent/project/task/team scope, provenance,
+  revision/retention, retrieval, and immutable per-run bundle evidence. This
+  boundary is implemented by TASK-0018.
+- **Management handoffs** — bounded sequential task/run/review/human transition
+  evidence and management visibility. This boundary is implemented by
+  TASK-0018.
 - **Task orchestrator** — deterministic hard eligibility, scoring, workload and
   overflow decisions, durable global execute-queue ordering, and backend queue
   admission. This boundary is implemented by TASK-0010.
@@ -481,7 +544,9 @@ task must choose the smallest structure supported by the code at that time.
 | Active run | Backend system-wide coordinator and SQLite ledger; only live cancellation handles are in memory | Backend system-wide coordinator |
 | Provider/model truth | Backend registry and exact active-provider/catalog-model resolution; renderer projects availability | Backend provider registry |
 | Workspace evidence | Backend captures and validates bounded Git/non-Git evidence around execution, persists it per attempt/task, and supplies only complete matching records to agent review | Backend durable evidence record |
-| Reminders | Backend SQLite; renderer manages behavior | Backend passive reminder service |
+| Reminders/events | Backend schedule/occurrence store, non-AI timer, and optional XDG notification delivery; renderer requests mutations and projects evidence | Backend passive reminder service |
+| Structured memory | Backend scoped records/events and immutable exact per-attempt bundles; renderer requests revision-bound CRUD and projects provenance | Backend memory service |
+| Management handoffs | Backend task/run/review/human transactions append bounded sequential evidence; renderer projects workspaces | Backend scheduler/orchestrator |
 | UI preferences | Backend SQLite for desktop; preview storage in browsers | Local settings store, with UI ownership where safe |
 
 ## Target hierarchy and flow
@@ -541,9 +606,10 @@ TASK-0015 establishes the unified system-action policy/audit gateway;
 TASK-0016 establishes deterministic offline voice plus non-live
 KDE/portal/XDG integration contracts. TASK-0017 establishes strict bounded
 Coding, Debugging, Browser Research, and Financial Analysis profiles.
-TASK-0020 retains their sequential live and packaged acceptance. TASK-0018
-through TASK-0020 complete management handoffs, packaging, acceptance, and
-release.
+TASK-0018 establishes passive reminders/events, scoped structured memory, and
+sequential management handoffs. TASK-0020 retains their sequential live and
+packaged acceptance; TASK-0019 through TASK-0020 complete packaging,
+acceptance, and release.
 
 Exact dependencies and gates are authoritative in
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).

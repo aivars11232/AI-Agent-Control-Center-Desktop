@@ -38,8 +38,8 @@ ready merely because its predecessor's code was edited.
 | TASK-0014 | TASK-0013 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Data lifecycle, strict backup, retention, and truthful monitoring |
 | TASK-0015 | TASK-0014 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Unified voice intent and system-action policy gateway |
 | TASK-0016 | TASK-0015 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Offline voice runtime, KDE portal control, and XDG integration |
-| TASK-0017 | TASK-0016 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Bounded Coding, Debugging, Browser, and Financial agent capabilities |
-| TASK-0018 | TASK-0017 | NOT STARTED | NO | NOT STARTED | — | — | Reminder scheduler, structured memory, and management handoff workspaces |
+| TASK-0017 | TASK-0016 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Bounded Coding, Debugging, Browser, and Financial agent capabilities |
+| TASK-0018 | TASK-0017 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Reminder scheduler, structured memory, and management handoff workspaces |
 | TASK-0019 | TASK-0018 | NOT STARTED | NO | NOT STARTED | — | — | Packaging, privacy-safe removal, release metadata, and CI security gates |
 | TASK-0020 | TASK-0019 | NOT STARTED | NO | NOT STARTED | — | — | Sequential live acceptance and version 1.0 release gate |
 
@@ -1236,7 +1236,103 @@ ready merely because its predecessor's code was edited.
   request/evidence stay consistent; result validation was tightened to reject
   substituted checks/assumptions; no new dependency, migration class, or
   external security boundary was added
-- Git closure: <code>PENDING USER</code> review, commit, push, and successor
+- Git closure: implementation commit
+  <code>730b966833e8d4f4dde88c3f258c25f28233e334</code>
+  (<code>task17</code>) was identified from actual history at the TASK-0018
+  preflight. It was checked-out <code>main</code> HEAD, reachable from
+  <code>origin/main</code>, and both refs matched with zero ahead/behind and a
+  clean tree. Its actual 29-file scope (4,796 insertions, 140 deletions)
+  matched the reported TASK-0017 implementation with no unexplained
+  intervening state; all seven successor-preflight closure conditions passed.
+
+## TASK-0018 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>730b966833e8d4f4dde88c3f258c25f28233e334</code>
+  (<code>task17</code>)
+- Starting status: clean; checked-out <code>main</code> and
+  <code>origin/main</code> matched with zero ahead/behind
+- Dependency: TASK-0017 satisfied every successor-preflight condition. Its
+  implementation commit was actual checked-out/reachable history, its 29-file
+  scope matched retained evidence, and the tracker lag was backfilled above
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0018 AS PLANNED.</code>
+- Added schema-v11 migration 0011 and dedicated reminder, structured-memory,
+  and management-handoff contracts. Migration normalizes valid legacy UTC
+  reminder instants, holds invalid schedules for attention, promotes non-empty
+  legacy agent memory once with provenance, creates task plan/assignment
+  prefixes, and is ledger-idempotent across reopen
+- Reminder/event mutations are backend revision/idempotency bound. IANA local
+  civil time uses earlier-offset folds and forward-shift gaps; recurrence is
+  anchored to the original civil time. A non-AI timer starts after two seconds,
+  scans every 30 seconds, reconciles missed/reserved occurrences, records
+  delivery/uncertainty, and optionally uses privacy-bounded XDG notification
+  portal delivery. The tray opens Reminders; no due path creates a run
+- Structured memory uses exact agent/project/task/team scope, kind, provenance,
+  record revision, manual/7/30/90-day/task-lifetime retention, inspection, and
+  deletion events. Run admission selects only exact visible records and stores
+  the canonical maximum-128-record/64 KiB JSON plus SHA-256 on the immutable
+  attempt before passing that exact bundle to the provider prompt
+- Management plans, assignments, execution/failure evidence, review decisions,
+  revision requests, trusted human overrides, and recovery records are bounded,
+  idempotent, source/owner/evidence bound, and appended inside the task/run/
+  review/human transaction that owns each transition. Views remain sequential
+  evidence rather than free-form agent-to-agent messaging
+- Portable backup v4 strictly carries sanitized schedules and unexpired memory,
+  accepts v2/v3 through the existing sanitizer, converts portal delivery to
+  in-app behavior, and omits portal grants/delivery evidence, handoffs, run/
+  review authority, system-action audit, provider credentials, and runtime
+  sessions. Retention now includes expired memory, terminal occurrence history,
+  and orphaned handoff history in bounded passes while preserving active work
+- Renderer Reminders supports reminder/event creation, links, recurrence,
+  delivery/privacy selection, explicit due/overdue/missed/issue evidence, and
+  backend events. Agents exposes scoped memory CRUD/provenance and filtered
+  management workspaces without making renderer state authoritative
+- Focused verification passed on 2026-08-28: 21 TASK-0018 Rust tests, 2 focused
+  frontend files/3 tests, TypeScript, rustfmt, and Clippy with warnings denied.
+  Coverage includes DST folds/gaps, overdue windows, anchored recurrence,
+  restart/missed/uncertain delivery, passive model behavior, schema migration,
+  backup sanitization, memory isolation/provenance/exact bundle hashing,
+  handoff ordering/visibility/evidence bounds, and fake-portal failure
+- Complete integration checks passed with 22 frontend files/69 tests, 207
+  locked/offline Rust tests, an exact schema-v5 migration regression, all 8
+  TASK-0014 backup/retention regressions, and a 70-module production build
+- Complete fast gate: <code>npm run verify:fast</code> passed on 2026-08-28
+  with 22 frontend files/69 tests, TypeScript, 7 Python listener/setup tests,
+  rustfmt, and 207 locked/offline Rust tests
+- Full non-live gate: <code>npm run verify:full</code> passed on 2026-08-28 with
+  the same fast checks, a 70-module production build, Clippy with warnings
+  denied, shell/Python/strict-JSON checks, npm/Cargo dependency trees, and
+  production plus full npm audits reporting zero vulnerabilities. The captured
+  dependency-tree display omitted 10,729 tokens because tool output was
+  truncated, but the command exited zero and both audit/final status lines were
+  retained
+- Rust advisory result: **indeterminate** because <code>cargo-audit</code> is
+  unavailable; the full gate reported the skip and did not count it as a pass
+- Cargo dependency/lock change: pinned <code>jiff 0.2.35</code> supplies IANA
+  civil-time/DST arithmetic and <code>ashpd</code> enables its native
+  notification feature. The approved dependency was fetched once; subsequent
+  Rust verification is locked/offline. No npm dependency changed
+- Live Codex/Ollama generation, provider authentication, microphone/listener,
+  KDE/XDG portal authorization or notification, native approval dialog,
+  install/remove, desktop package, and desktop/system-control actions: not run
+- Remaining limits: the scheduler runs while this desktop process is active;
+  no systemd/KAlarm/calendar/daemon integration was added. Deterministic fake-
+  portal and time-zone tests do not establish live installed notification,
+  tray, restart, or DST behavior; TASK-0020 owns those sequential live/package
+  cases. TASK-0019 owns mandatory installed/CI Rust advisory tooling
+- Minor in-scope corrections: terminal handoff projections now link bounded
+  summaries to the full run record so large evidence cannot roll back run
+  completion; retention preserves a valid handoff prefix; legacy UTC schedule
+  text is normalized; unrepresentable future recurrence is held with evidence;
+  and legacy TASK-0011/TASK-0014 fixtures now exercise the v11 authority without
+  assuming generic reminder saves or backup v3. No unapproved subsystem,
+  migration class, provider action, or security-boundary expansion was added
+- Git closure: pending TASK-0018 user review, commit, push, and successor
   evidence
 
 ## Successor-preflight closure rule

@@ -86,6 +86,20 @@ import {
   type MonitoringMutationResult,
   type MonitoringSnapshot,
 } from "../dataLifecycle";
+import {
+  emptyReminderSchedulerSnapshot,
+  type ReminderSchedulerCommand,
+  type ReminderSchedulerSnapshot,
+} from "../reminderScheduler";
+import {
+  emptyStructuredMemorySnapshot,
+  type StructuredMemoryCommand,
+  type StructuredMemorySnapshot,
+} from "../structuredMemory";
+import {
+  emptyManagementHandoffSnapshot,
+  type ManagementHandoffSnapshot,
+} from "../managementHandoffs";
 import "../App.css";
 
 function PlaceholderPage({ page }: { page: Page }) {
@@ -137,6 +151,12 @@ export function AppController() {
     useState<AgentRegistrySnapshot | null>(null);
   const [monitoringSnapshot, setMonitoringSnapshot] =
     useState<MonitoringSnapshot | null>(null);
+  const [reminderScheduler, setReminderScheduler] =
+    useState<ReminderSchedulerSnapshot>(emptyReminderSchedulerSnapshot);
+  const [structuredMemory, setStructuredMemory] =
+    useState<StructuredMemorySnapshot>(emptyStructuredMemorySnapshot);
+  const [managementHandoffs, setManagementHandoffs] =
+    useState<ManagementHandoffSnapshot>(emptyManagementHandoffSnapshot);
 
   const [taskRetentionDays, setTaskRetentionDays] =
     useState<HistoryRetentionDays>(() => {
@@ -614,6 +634,30 @@ export function AppController() {
     setReviewOrchestration(snapshot);
   }
 
+  async function refreshReminderSchedulerSnapshot() {
+    if (!desktopRuntime) return;
+    setReminderScheduler(await desktopClient.reminderSchedulerSnapshot());
+  }
+
+  async function refreshStructuredMemorySnapshot() {
+    if (!desktopRuntime) return;
+    setStructuredMemory(await desktopClient.structuredMemorySnapshot());
+  }
+
+  async function refreshManagementHandoffSnapshot() {
+    if (!desktopRuntime) return;
+    setManagementHandoffs(await desktopClient.managementHandoffSnapshot());
+  }
+
+  async function refreshTask18Snapshots() {
+    if (!desktopRuntime) return;
+    await Promise.all([
+      refreshReminderSchedulerSnapshot(),
+      refreshStructuredMemorySnapshot(),
+      refreshManagementHandoffSnapshot(),
+    ]);
+  }
+
   const refreshMonitoringSnapshot = useCallback(async () => {
     if (!desktopRuntime) return null;
     const snapshot = await desktopClient.monitoringSnapshot();
@@ -632,6 +676,7 @@ export function AppController() {
       await refreshTaskOrchestrationSnapshot();
       await refreshReviewOrchestrationSnapshot();
       await refreshMonitoringSnapshot();
+      await refreshTask18Snapshots();
     } catch (error) {
       setPersistenceMessage(
         `The voice action completed, but authoritative projections could not be refreshed: ${persistenceErrorMessage(error)}`,
@@ -650,6 +695,7 @@ export function AppController() {
       applyAuthoritativeApplicationState(envelope.state);
     }
     await refreshTaskOrchestrationSnapshot();
+    await refreshManagementHandoffSnapshot();
   }
 
   async function refreshAgentRegistrySnapshotAfterCommit() {
@@ -667,6 +713,7 @@ export function AppController() {
       await refreshTaskOrchestrationSnapshot();
       await refreshReviewOrchestrationSnapshot();
       await refreshMonitoringSnapshot();
+      await refreshManagementHandoffSnapshot();
     } catch (error) {
       setPersistenceMessage(
         `Application state was updated, but the task queue could not be refreshed: ${persistenceErrorMessage(error)}`,
@@ -732,6 +779,9 @@ export function AppController() {
         void refreshMonitoringSnapshot().catch((error: unknown) => {
           if (active) setPersistenceMessage(persistenceErrorMessage(error));
         });
+        void refreshTask18Snapshots().catch((error: unknown) => {
+          if (active) setPersistenceMessage(persistenceErrorMessage(error));
+        });
       })
       .catch((error: unknown) => {
         if (active) {
@@ -784,6 +834,7 @@ export function AppController() {
           await refreshTaskOrchestrationSnapshot();
           await refreshReviewOrchestrationSnapshot();
           await refreshMonitoringSnapshot();
+          await refreshManagementHandoffSnapshot();
         }
       } catch (error) {
         if (active) {
@@ -838,6 +889,14 @@ export function AppController() {
       if (active) unlisten.push(stop);
       else stop();
     });
+    void desktopClient.onReminderSchedulerSnapshot((snapshot) => {
+      if (!active) return;
+      setReminderScheduler(snapshot);
+      void refreshAuthoritativeState();
+    }).then((stop) => {
+      if (active) unlisten.push(stop);
+      else stop();
+    });
 
     return () => {
       active = false;
@@ -857,6 +916,7 @@ export function AppController() {
       hydrateApplicationState(envelope.state);
       await refreshAgentRegistrySnapshotAfterCommit();
       await refreshTaskOrchestrationAfterCommit();
+      await refreshTask18Snapshots();
     } catch (error) {
       if (writer.hasFailed) {
         setPersistenceMessage(persistenceErrorMessage(error));
@@ -944,6 +1004,7 @@ export function AppController() {
       hydrateApplicationState(envelope.state);
       await refreshAgentRegistrySnapshotAfterCommit();
       await refreshTaskOrchestrationAfterCommit();
+      await refreshTask18Snapshots();
     } catch (error) {
       if (writer.hasFailed) {
         setPersistenceMessage(persistenceErrorMessage(error));
@@ -1007,6 +1068,43 @@ export function AppController() {
       }
       throw error;
     }
+  }
+
+  async function adoptTask18ApplicationRevision() {
+    const envelope = await desktopClient.loadApplicationState();
+    if (envelope) {
+      persistenceWriter.current?.adoptRevision(envelope.revision);
+      applyAuthoritativeApplicationState(envelope.state);
+    }
+    await refreshMonitoringSnapshot();
+  }
+
+  async function mutateReminderScheduler(
+    command: ReminderSchedulerCommand,
+    request: Record<string, unknown>,
+  ) {
+    const writer = persistenceWriter.current;
+    if (!desktopRuntime || !writer) {
+      throw new Error("The authoritative reminder scheduler requires the desktop app.");
+    }
+    await writer.flush();
+    const snapshot = await desktopClient.mutateReminderScheduler(command, request);
+    setReminderScheduler(snapshot);
+    await adoptTask18ApplicationRevision();
+  }
+
+  async function mutateStructuredMemory(
+    command: StructuredMemoryCommand,
+    request: Record<string, unknown>,
+  ) {
+    const writer = persistenceWriter.current;
+    if (!desktopRuntime || !writer) {
+      throw new Error("Authoritative structured memory requires the desktop app.");
+    }
+    await writer.flush();
+    const snapshot = await desktopClient.mutateStructuredMemory(command, request);
+    setStructuredMemory(snapshot);
+    await adoptTask18ApplicationRevision();
   }
 
   const activeAiProvider = preferences.activeAiProvider;
@@ -1090,14 +1188,19 @@ export function AppController() {
       return;
     }
 
-    let stopListening: (() => void) | undefined;
+    const stopListening: Array<() => void> = [];
     void desktopClient.onVoiceControlOpen(() => setActivePage("Voice Control"))
       .then((unlisten) => {
-        stopListening = unlisten;
+        stopListening.push(unlisten);
+      })
+      .catch(() => undefined);
+    void desktopClient.onRemindersOpen(() => setActivePage("Reminders"))
+      .then((unlisten) => {
+        stopListening.push(unlisten);
       })
       .catch(() => undefined);
 
-    return () => stopListening?.();
+    return () => stopListening.forEach((unlisten) => unlisten());
   }, []);
 
   useEffect(() => {
@@ -1335,6 +1438,10 @@ export function AppController() {
             approvalRequests={approvalRequests}
             setApprovalRequests={setBackendApprovalRequests}
             onOpenApprovals={() => setActivePage("Approvals")}
+            structuredMemory={structuredMemory}
+            managementHandoffs={managementHandoffs}
+            authoritativeMemory={desktopRuntime}
+            onMemoryMutation={mutateStructuredMemory}
           />
         ) : activePage === "Voice Control" ? (
           <VoiceControlPage
@@ -1365,8 +1472,9 @@ export function AppController() {
         ) : activePage === "Reminders" ? (
           <RemindersPage
             agents={operationalAgents}
-            reminders={reminders}
-            setReminders={setReminders}
+            snapshot={reminderScheduler}
+            authoritative={desktopRuntime}
+            onMutation={mutateReminderScheduler}
           />
         ) : activePage === "Activity" ? (
           <ActivityPage

@@ -21,7 +21,8 @@ tauri-build = { version = "2.6.3", features = [] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rusqlite = "=0.32.1"
-ashpd = { version = "0.13.13", features = ["remote_desktop", "screencast"] }
+ashpd = { version = "0.13.13", features = ["notification", "remote_desktop", "screencast"] }
+jiff = "=0.2.35"
 log = "0.4"
 reqwest = { version = "=0.12.28", default-features = false, features = ["brotli", "deflate", "gzip", "json", "stream", "zstd"] }
 sha2 = "=0.10.9"

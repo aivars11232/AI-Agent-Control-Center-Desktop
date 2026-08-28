@@ -28,7 +28,10 @@
 > TASK-0017 adds strict typed core-specialist requests/results, exact stable-
 > template identity, immutable run tool ceilings, fixed-point finance,
 > disposable private scratch, and backend rejection of cross-role or external
-> effects; later tasks still own packaging and live acceptance.
+> effects. TASK-0018 adds backend-owned passive schedule/delivery evidence,
+> exactly scoped structured memory and immutable per-run bundles, and bounded
+> sequential management handoffs; later tasks still own packaging and live
+> acceptance.
 
 ## Security objective
 
@@ -40,7 +43,8 @@ authorization, workspace scope, provider execution, and native system actions.
 ## Assets
 
 - user-selected workspace files and Git state;
-- task text, agent memory, model output, review feedback, and reminders;
+- task text, scoped memory, model output, review feedback, reminders/events,
+  notification evidence, and management handoffs;
 - agent definitions, capabilities, policies, approvals, and run records;
 - local provider authentication or runtime state;
 - clipboard, microphone, keyboard, pointer, applications, windows, and desktop;
@@ -57,7 +61,7 @@ when stored locally.
 | React renderer/WebView | Untrusted for authorization; may be compromised or hold stale/tampered state |
 | Imported backup and <code>localStorage</code> | Untrusted serialized input requiring validation and migration |
 | Tauri IPC | Untrusted request boundary; backend must authenticate semantics, not just types |
-| Rust backend | Authoritative agent registry, task routing/queue, specialist request/tool/result contracts, structured review/revision, workspace evidence, approval/action-policy, canonical system-action gateway/audit, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
+| Rust backend | Authoritative agent registry, task routing/queue, specialist request/tool/result contracts, structured review/revision, workspace evidence, passive scheduler/delivery policy, structured-memory selection, sequential management handoffs, approval/action-policy, canonical system-action gateway/audit, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary |
 | Codex/Ollama output | Untrusted content and action proposals |
 | Selected workspace | Sensitive bounded filesystem root |
 | External/local provider process | Separate process/service with its own failure and trust model |
@@ -200,6 +204,26 @@ Static inspection and deterministic tests found these implemented controls:
   decimal strings use checked fixed-point arithmetic and half-even rounding,
   and provider assumptions/values must exactly match the request/backend
   results;
+- dedicated revision-bound schedule IPC with generic saves unable to create,
+  edit, delete, or forge reminder/event, recurrence, portal-policy, occurrence,
+  delivery, or issue evidence;
+- IANA local-civil-time resolution with deterministic fold/gap policy,
+  recurrence anchored to the original civil time, occurrence idempotency,
+  restart reservation reconciliation, bounded missed-event accounting, and no
+  provider/run invocation from the due path;
+- privacy-bounded XDG notification delivery whose authority is derived by the
+  backend from the current schedule, whose failure remains inspectable, and
+  whose grant/delivery evidence is excluded from portable backup;
+- exactly-one-of agent/project/task/team memory scope validation, compare-and-
+  swap CRUD, provenance/revision/retention events, expiry filtering, and
+  explicit deletion without generic-save authority;
+- deterministic memory selection limited to the admitted agent, reporting
+  team, workspace, and task, with a maximum 128-record/64 KiB canonical bundle
+  and SHA-256 persisted immutably before the exact prompt is dispatched;
+- bounded idempotent management handoffs appended only by authoritative task,
+  run, review, and trusted-human transactions, with source/owner/evidence
+  bindings and sequence validation that prevents review evidence before an
+  assignment/execution prefix;
 - schema-versioned SQLite persistence with foreign keys, integrity checks,
   explicit migration evidence, atomic writes, and stale-revision rejection;
 - one durable global execute queue ordered by priority, monotonic enqueue
@@ -248,7 +272,8 @@ boundary, TASK-0009 agent-registry boundary, and TASK-0010 routing/queue
 boundary, the TASK-0011 structured-review boundary, the TASK-0012 workspace
 evidence boundary, the TASK-0014 backup/retention/monitoring boundary, and the
 TASK-0015 voice/system-action boundary, TASK-0016 offline voice/KDE lifecycle
-boundary, and TASK-0017 specialist-contract boundary. They do not establish
+boundary, TASK-0017 specialist-contract boundary, and TASK-0018 passive-
+scheduler/structured-memory/sequential-handoff boundary. They do not establish
 production readiness or the later live provider/platform guarantees.
 
 ## Known current gaps
@@ -258,12 +283,13 @@ production readiness or the later live provider/platform guarantees.
 Desktop core domain state and agent registry now use a backend-owned SQLite
 transaction boundary, schema/migration ledger, integrity check, and
 compare-and-swap revision. The renderer cannot fall back to WebView storage
-after desktop persistence starts or fails. Portable backup v3 rejects
+after desktop persistence starts or fails. Portable backup v4 rejects
 oversized, deeply nested, duplicate-key, unknown-field, trailing, unsupported,
 and future-schema input before mutation. Export/import strips active approval
-authority and run/review/provider/portal/voice-runtime authority; apply is
+authority and run/review/provider/portal/notification/handoff/voice-runtime
+authority; apply is
 revision checked, idle-run guarded, natively confirmed, and atomic. Legacy v2
-imports cross the same sanitizer. The browser preview remains explicitly
+and v3 imports cross the same sanitizer. The browser preview remains explicitly
 non-authoritative.
 
 Schema v10 persists portable typed task requests and non-portable immutable run
@@ -272,6 +298,14 @@ profiles narrow during migration, while customized rows are preserved. A
 pre-v10 core task without a typed request remains visible but fails closed at
 routing/policy/run admission; the user must review it and create a new typed
 task rather than receiving inferred authority from old prose.
+
+Schema v11 persists portable schedules and unexpired scoped memory but keeps
+portal delivery in-app after import and omits portal grants/delivery evidence,
+management handoffs, and immutable per-attempt bundles with the run ledger.
+Legacy reminder/memory migration is one-time and inspectable; invalid schedules
+become needs-attention evidence rather than executable input. Generic renderer
+saves cannot recreate the old free-text memory authority or mutate scheduler,
+memory, handoff, or run-bundle records.
 
 Schema-v8 retention uses backend time, normalized timestamps, active-record
 protection, 500-row per-domain passes, latest-100 evidence, a 15-minute timer,
@@ -351,7 +385,7 @@ contracts requiring shell checks or delete/rename are rejected at routing.
 
 ### Verification coverage
 
-The checked-in non-live suite contains 66 frontend tests and 186 Rust tests. It
+The checked-in non-live suite contains 69 frontend tests and 207 Rust tests. It
 covers frontend characterization, typed IPC mapping, keyboard/dialog/tab
 interaction, deterministic axe checks, responsive-style contracts, plus backend
 policy, authorization, run
@@ -370,7 +404,12 @@ cases. Nineteen TASK-0017 Rust tests additionally cover strict specialist
 schemas/hashes/ceilings/results, fixed-point arithmetic, exact
 checks/assumptions, cross-role routing/review, schema-v10 persistence and
 reroute, scratch cleanup, and hidden Ollama tool rejection; three frontend
-tests cover composer/profile contracts. These checks do not establish live
+tests cover composer/profile contracts. Twenty-one TASK-0018 Rust tests cover
+local time/DST/due windows/anchored recurrence, restart and delivery evidence,
+passive model behavior, schema-v11 migration, backup-v4 sanitization, scoped
+memory/provenance/exact bundles, sequential handoffs, bounded retention, and a
+fake notification sink; three frontend tests cover due-window and management-
+handoff presentation. These checks do not establish live
 end-to-end, packaging, upgrade, or live acceptance. Rust advisory status remains
 indeterminate when <code>cargo-audit</code> is unavailable.
 
@@ -440,7 +479,9 @@ desktop-control workarounds:
   [Session](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Session.html)
   and
   [RemoteDesktop](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html)
-  interfaces with explicit lifecycle and user-consent semantics.
+  interfaces with explicit lifecycle and user-consent semantics, plus a native
+  [Notification](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Notification.html)
+  interface for app-owned desktop notifications.
 - Tauri documents a configurable
   [Content Security Policy](https://v2.tauri.app/security/csp/).
 - freedesktop.org defines the
@@ -463,6 +504,11 @@ to the exact active Full PC Control agent, and closes after partial grants or
 unconfirmed pressed-input cleanup. Its restore token and listener
 configuration use private atomic files. Base audio stays in memory; optional
 high-accuracy WAV files are mode 0600 and removed on every tested exit path.
+TASK-0018 uses the notification portal through the Rust backend for passive
+reminder delivery, while app-owned timers and the tray route provide bounded
+in-process scheduling/navigation. It does not add KWin rules, a systemd user
+unit, KAlarm integration, or a background AI process; live portal behavior
+remains a TASK-0020 acceptance case.
 Deterministic tests establish the checked-in fail-closed contracts, not live
 KDE compatibility. TASK-0020 retains runtime and packaged acceptance. If a
 native mechanism cannot satisfy a bounded requirement, the
@@ -493,6 +539,16 @@ workarounds before any code change.
   undeclared-mutation, external-effect, or workspace-changing specialist result
   as a typed protocol failure. Remove the private scratch directory on every
   normal/error path; report cleanup failure instead of claiming clean completion.
+- Commit each due occurrence idempotently before delivery, reconcile a reserved
+  pre-crash delivery as uncertain without replay, and hold an unresolvable next
+  recurrence with inspectable issue evidence while preserving the current due
+  occurrence.
+- Reject cross-scope or expired memory before run admission and retain the exact
+  canonical bundle/hash on the attempt; a later memory edit cannot rewrite what
+  an earlier run received.
+- Keep task/run/review/human handoff creation in the owning transaction, bound
+  summaries/payloads, link large evidence to the immutable source record, and
+  preserve a valid sequence prefix under bounded retention.
 - Never infer success from a missing process or UI state.
 - Preserve approval records and workspace evidence needed for audit while
   applying explicit retention and redaction rules.
@@ -512,6 +568,10 @@ workarounds before any code change.
 - Treat typed specialist questions, symptoms, assumptions, constraints,
   calculations, sources, and structured results as sensitive task/run data;
   keep them out of routine logs and non-portable authority records.
+- Treat reminder titles/notes, local schedules, scoped memory content,
+  management summaries, and prompt-bundle evidence as sensitive local data;
+  use generic notification text unless the user explicitly selects title
+  disclosure, and never place those records in routine logs.
 - Do not include secrets, complete private prompts, workspace contents, or raw
   microphone audio in routine logs.
 - Keep age retention bounded and revision visible; protect active authority and

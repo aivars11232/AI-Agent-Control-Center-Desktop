@@ -31,6 +31,15 @@ import type {
 } from "../dataLifecycle";
 import type { CanonicalVoiceIntent } from "../voiceCommand";
 import type { SpecialistResult } from "../specialistCapabilities";
+import type {
+  ReminderSchedulerCommand,
+  ReminderSchedulerSnapshot,
+} from "../reminderScheduler";
+import type {
+  StructuredMemoryCommand,
+  StructuredMemorySnapshot,
+} from "../structuredMemory";
+import type { ManagementHandoffSnapshot } from "../managementHandoffs";
 
 export type AgentRunResult = {
   providerId: RuntimeProviderId | null;
@@ -339,6 +348,32 @@ export function createDesktopClient(
       );
     },
 
+    reminderSchedulerSnapshot() {
+      return invokeFn<ReminderSchedulerSnapshot>("reminder_scheduler_snapshot");
+    },
+
+    mutateReminderScheduler(
+      command: ReminderSchedulerCommand,
+      request: Record<string, unknown>,
+    ) {
+      return invokeFn<ReminderSchedulerSnapshot>(command, { request });
+    },
+
+    structuredMemorySnapshot() {
+      return invokeFn<StructuredMemorySnapshot>("structured_memory_snapshot");
+    },
+
+    mutateStructuredMemory(
+      command: StructuredMemoryCommand,
+      request: Record<string, unknown>,
+    ) {
+      return invokeFn<StructuredMemorySnapshot>(command, { request });
+    },
+
+    managementHandoffSnapshot() {
+      return invokeFn<ManagementHandoffSnapshot>("management_handoff_snapshot");
+    },
+
     loadApplicationState() {
       return invokeFn<StateEnvelope | null>("load_application_state");
     },
@@ -428,6 +463,19 @@ export function createDesktopClient(
 
     onVoiceControlOpen(handler: () => void) {
       return listenFn<unknown>("voice-control-open", handler);
+    },
+
+    onRemindersOpen(handler: () => void) {
+      return listenFn<unknown>("reminders-open", handler);
+    },
+
+    onReminderSchedulerSnapshot(
+      handler: (snapshot: ReminderSchedulerSnapshot) => void,
+    ) {
+      return listenFn<ReminderSchedulerSnapshot>(
+        "reminder-scheduler-snapshot",
+        handler,
+      );
     },
   };
 }

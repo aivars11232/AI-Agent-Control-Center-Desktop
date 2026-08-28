@@ -1,12 +1,12 @@
 # Current State
 
 > **Classification: Current static and fresh non-live evidence.** This snapshot
-> was refreshed for TASK-0017 on 2026-08-28 from starting commit
-> <code>d28ef0b5d4ff1d6c5e36a493d1f28d97515128cb</code>
-> (<code>task16</code>) on branch <code>main</code>. At the TASK-0017 preflight,
+> was refreshed for TASK-0018 on 2026-08-28 from starting commit
+> <code>730b966833e8d4f4dde88c3f258c25f28233e334</code>
+> (<code>task17</code>) on branch <code>main</code>. At the TASK-0018 preflight,
 > checked-out <code>main</code> and <code>origin/main</code> both resolved to that
-> commit, with zero ahead/behind and a clean working tree. Its 21-file actual
-> scope (4,004 insertions and 772 deletions) matched retained TASK-0016
+> commit, with zero ahead/behind and a clean working tree. Its 29-file actual
+> scope (4,796 insertions and 140 deletions) matched retained TASK-0017
 > evidence. Reverify later implementation
 > facts when they may have drifted.
 
@@ -77,11 +77,25 @@ approval, read-only Debugging plus exact reviewer identity, hosted read-only
 Browser Research, backend fixed-point Financial Analysis, disposable private
 scratch workspaces, and structured renderer task/result presentation.
 
-TASK-0017 did **not** run a live Codex task, Ollama, hosted web search, or
+TASK-0018 adds schema-v11 backend-owned reminder/event schedules and occurrence
+evidence, IANA local-time/DST resolution, anchored recurrence, restart/missed-
+event reconciliation, a non-AI app timer and tray route, and optional privacy-
+bounded XDG notification delivery. It replaces free-text memory authority with
+agent/project/task/team records carrying provenance, revisions, retention, and
+deletion evidence, and persists the exact bounded memory bundle and SHA-256
+used by every admitted run. It also appends bounded sequential plans,
+assignments, execution/failure evidence, review decisions/revisions, trusted
+human overrides, and recovery handoffs from the authoritative transactions
+that own those state changes. Portable backup v4 carries sanitized schedules
+and unexpired structured memory while excluding notification authority and
+delivery evidence, management handoffs, and run/review history.
+
+TASK-0018 did **not** run a live Codex task, Ollama, hosted web search, or
 another model/provider. It also did not capture microphone input; import or
 start the Python listener;
-authorize a KDE/XDG portal; execute voice/install/remove scripts; build a desktop
-package; or perform a desktop/system-control action. The retained TASK-0008
+authorize a KDE/XDG portal; send a live desktop notification; execute voice/
+install/remove scripts; build a desktop package; or perform a desktop/system-
+control action. The retained TASK-0008
 Ollama tests use isolated numeric-loopback fake servers and temporary
 workspaces; TASK-0007's
 Codex subprocess tests use an isolated fake CLI. Earlier audit observations
@@ -117,6 +131,7 @@ remain historical unless this document identifies a fresh result.
 | <code>src/agentRegistry.ts</code> | Dynamic active-agent, category-group, ancestor, hierarchy-repair, stable-template, and compatible-manager projections |
 | <code>src/taskOrchestration.ts</code> | Typed projection of backend queue order, positions, state, head admission, and routing evidence |
 | <code>src/specialistCapabilities.ts</code> | Typed core-specialist drafts/requests, truthful profile ceilings, result contracts, and deterministic composer validation |
+| <code>src/reminderScheduler.ts</code> / <code>src/structuredMemory.ts</code> / <code>src/managementHandoffs.ts</code> | Defensive renderer projections for backend-owned schedules, scoped memory/provenance, and sequential management evidence |
 | <code>src/reviewOrchestration.ts</code> | Typed projection of backend review flows, levels, attempts, human fallback, and revision state |
 | <code>src/runCoordinator.ts</code> | Typed renderer projection of authoritative run snapshots/events, stale-event rejection, and global stop state |
 | <code>src/workspaceEvidence.ts</code> | Versioned renderer projection, defensive shape normalization, truthful labels, and safe final-state openability for workspace evidence |
@@ -135,6 +150,9 @@ remain historical unless this document identifies a fresh result.
 | <code>src-tauri/src/task_orchestration.rs</code> | Deterministic routing eligibility/scoring, workload/overflow decisions, and queue DTOs |
 | <code>src-tauri/src/review_orchestration.rs</code> | Versioned review schemas, exact reporting-chain selection, prompt/protocol validation, and review DTOs |
 | <code>src-tauri/src/specialist_capabilities.rs</code> | Strict specialist request/run/result contracts, canonical hashing, fixed-point finance, prompts, and fail-closed result validation |
+| <code>src-tauri/src/reminder_scheduler.rs</code> | Strict schedule contracts, IANA local-time/DST resolution, anchored recurrence, due-window classification, and portal-policy binding |
+| <code>src-tauri/src/structured_memory.rs</code> | Exact agent/project/task/team scopes, provenance/retention contracts, bounded retrieval, and canonical prompt-bundle hashing |
+| <code>src-tauri/src/management_handoffs.rs</code> | Bounded sequential plan/assignment/run/review/human/recovery evidence contracts and visibility rules |
 | <code>src-tauri/src/policy.rs</code> / <code>src-tauri/src/authorization.rs</code> | Normalized action intents, capability evaluation, native confirmation, and approval IPC contracts |
 | <code>src-tauri/src/run_coordinator.rs</code> | Run states, legal transitions, ledger projections, and explicit evidence/retention bounds |
 | <code>src-tauri/src/data_lifecycle.rs</code> | Strict duplicate-free bounded backup parsing, portable-state sanitization, backup/monitoring DTOs, and lifecycle constants |
@@ -172,20 +190,25 @@ approval policy, routing, review, reminders, activity, models, preferences,
 and retention. The app controller composes those features and the typed desktop
 client centralizes Tauri command/event calls. Shared persisted types live in
 <code>src/applicationState.ts</code>. In the desktop runtime, Settings exports,
-previews, and imports the backend-owned portable backup v3 format. Browser mode
+previews, and imports the backend-owned portable backup v4 format. Browser mode
 retains a clearly labelled non-authoritative legacy version 2 preview path.
 
 ### Persistence
 
 In the desktop runtime, core product state and the run ledger are stored in
 <code>application-state.sqlite3</code> below Tauri's operating-system-provided
-application data directory. Schema version 10 stores:
+application data directory. Schema version 11 stores:
 
 - agents, stable template identity, lifecycle/repair metadata, reporting
-  structure, and their nested tasks, activity, memory, roles, and policies;
+  structure, and their nested tasks, activity, roles, and policies;
 - approval requests;
 - models;
-- reminders;
+- normalized reminder/event schedules, local-time/DST and recurrence evidence,
+  occurrence/delivery history, scheduler authority, and a scheduler revision;
+- exactly scoped structured-memory records/events plus immutable canonical
+  prompt-bundle JSON/SHA-256 on admitted attempts;
+- bounded sequential management-handoff records linked to task, run, review,
+  and trusted-human transitions;
 - application preferences and workspace definitions;
 - task/activity retention preferences and routing/review preferences;
 - task routing inputs/evidence, executor assignment, queue state/order,
@@ -205,7 +228,7 @@ The backend validates aggregate size, counts, identifiers, enums, numeric
 ranges, text bounds, and selected relationships before an atomic replacement.
 SQLite foreign keys, rollback-journal mode, full synchronous writes, integrity
 checks, transactional aggregate reads, a migration ledger,
-<code>PRAGMA user_version = 10</code>, and compare-and-swap revisions protect the
+<code>PRAGMA user_version = 11</code>, and compare-and-swap revisions protect the
 repository boundary. The database and its parent directory are restricted to
 the current user on Unix.
 
@@ -290,15 +313,30 @@ specialist request, contract, or result. Pre-v10 core tasks remain visible but
 receive no inferred authority from prose and must be recreated as typed work
 before a new core-specialist run can be admitted.
 
-Portable backup v3 is capped at 16 MiB and 128 JSON levels, rejects duplicate
+Migration 0011 rebuilds reminders as normalized schedules, recurrence and
+portal-policy bindings, occurrence/delivery evidence, scheduler metadata, and
+a dedicated revision. Valid legacy UTC instants become equivalent UTC civil
+times; invalid legacy rows remain inspectable as needs-attention records.
+Legacy agent free text migrates once to agent-scoped provenance records, while
+generic saves preserve the legacy field as empty and cannot forge structured
+memory. New scope/revision/event tables and run-attempt bundle JSON/SHA-256
+make retrieval and exact prompt use inspectable. Task migration creates the
+first plan/assignment handoff prefix, and later task/run/review/human
+transactions append only valid bounded sequential evidence. The migration is
+idempotent through the existing ledger and actual v10-to-v11 reopen checks.
+
+Portable backup v4 is capped at 16 MiB and 128 JSON levels, rejects duplicate
 keys, unknown fields, trailing content, unsupported versions, and future
 schemas, and sanitizes active tasks/approvals/runtime evidence before export or
 import. Import preview and apply use the same backend candidate, compare the
 application revision, require an idle run boundary and trusted native
 confirmation, clear mismatched run/review history, and commit atomically.
 Provider credentials, authorization intents, run/review ledgers, portal
-sessions, voice-runtime sessions, and the system-action audit are not portable
-backup domains.
+sessions/grants, notification delivery evidence, management handoffs, voice-
+runtime sessions, and the system-action audit are not portable backup domains.
+Version 2 and 3 backups remain accepted through the strict sanitizer. Version
+4 carries validated schedules and unexpired structured memory; portal delivery
+is downgraded to in-app behavior and cannot import notification authority.
 
 Dashboard, Tasks, Activity, and Settings consume backend monitoring snapshots
 and pages bound to one application/task/run/review/lifecycle revision tuple.
@@ -842,6 +880,21 @@ npm/Cargo dependency trees, and production plus full npm audits with zero
 vulnerabilities. No live provider, hosted search, transaction, microphone,
 portal, installer, package, or desktop/system action was run.
 
+TASK-0018 focused checks passed on 2026-08-28: 21 Rust tests cover IANA local
+time/DST and due windows, anchored recurrence, restart/missed/uncertain
+delivery, passive model behavior, schema-v11 migration, backup-v4
+sanitization, memory isolation/provenance/exact bundles, handoff ordering/
+visibility/evidence bounds, bounded retention, and a fake portal sink. Two
+focused frontend files passed 3 due-window/handoff tests; TypeScript, rustfmt,
+and Clippy with warnings denied passed. Complete integration checks passed with
+22 frontend files/69 tests, 207 locked/offline Rust tests, all 8 TASK-0014
+backup/retention regressions, the exact legacy schema-v5 review migration, and
+a 70-module production build. The complete fast and full non-live gates passed
+with shell/Python/strict-JSON checks, npm/Cargo dependency trees, and production
+plus full npm audits reporting zero vulnerabilities. No live provider,
+notification portal, microphone, installer, package, or desktop/system action
+was run.
+
 <code>cargo-audit</code> is not installed in the inspected environment. The
 full route therefore reports the Rust advisory result as **indeterminate** and
 does not represent the skip as a pass. Mandatory installed/CI security tooling
@@ -855,10 +908,10 @@ belongs to TASK-0019.
 | Live Codex compatibility, authentication, model, and packaged-platform acceptance | TASK-0020 |
 | Live Ollama connectivity, installed-model behavior, cancellation, and packaged-platform acceptance | TASK-0020 |
 | Live core-specialist provider, hosted-search, structured-result, and adapter-limit acceptance | TASK-0020 |
+| Live installed reminder timer/tray, XDG notification portal, restart, and DST acceptance | TASK-0020 |
 | Physical database/file purge and installed removal evidence | TASK-0019 |
 | Installed WebView, packaged accessibility, and live platform acceptance | TASK-0020 |
 | Live installed voice, microphone, restored-session, and KDE/portal/XDG acceptance | TASK-0020 |
-| Passive reminders, structured memory, and management handoffs | TASK-0018 |
 | Packaging, CI, live acceptance, and production gate | TASK-0019–TASK-0020 |
 
 See [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for exact sequencing.

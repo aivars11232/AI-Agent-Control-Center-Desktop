@@ -14,14 +14,27 @@ use crate::authorization::{
     ApprovalResolution, AuthorizationGrant, AuthorizationOutcome,
 };
 use crate::data_lifecycle::{
-    build_backup_export, parse_backup_candidate, preview_for_candidate, BackupExport,
+    build_backup_export_with_domains, parse_backup_candidate, preview_for_candidate, BackupExport,
     BackupImportPreview, DataLifecycleSummary, MonitoringActivityPage, MonitoringActivityRecord,
     MonitoringCounts, MonitoringMutationResult, MonitoringRevision, MonitoringSnapshot,
     MonitoringTaskPage, MonitoringTaskRecord, RetentionMaintenanceResult, RetentionPruneCounts,
     MAX_MAINTENANCE_EVIDENCE_ROWS, MAX_MAINTENANCE_ROWS_PER_DOMAIN, MONITORING_PAGE_LIMIT,
 };
+use crate::management_handoffs::{
+    ManagementHandoffKind, ManagementHandoffSnapshot, ManagementHandoffSource, ManagementHandoffV1,
+    ManagementOwnerRole, NewManagementHandoff, MAX_HANDOFF_SUMMARY_BYTES,
+};
 use crate::policy::{evaluate_policy, ActionIntent, PolicyDisposition, PolicyEvaluation};
 use crate::provider_runtime::{resolve_model_identity, ProviderRegistrySnapshot};
+use crate::reminder_scheduler::{
+    portal_policy_fingerprint, recurrence_resolution, schedule_fingerprint, system_time_zone_name,
+    validate_create_request as validate_create_scheduled_item,
+    validate_update_request as validate_update_scheduled_item, CreateScheduledItemRequest,
+    DeleteScheduledItemRequest, DeliveryMode, DstResolution, PrivacyMode, RecurrenceKind,
+    RecurrenceRuleV1, ReminderDeliveryJob, ReminderOccurrenceV1, ReminderSchedulerSnapshot,
+    ScheduleStatus, ScheduledItemKind, ScheduledItemV1, SetScheduledItemStatusRequest,
+    UpdateScheduledItemRequest, MAX_SCHEDULED_ITEMS,
+};
 use crate::review_orchestration::{
     build_review_request, human_review_result, next_required_level, parse_review_result,
     required_levels_for_role, select_reviewer, HumanReviewDecisionRequest, ReviewActor,
@@ -40,8 +53,16 @@ use crate::specialist_capabilities::{
     canonical_specialist_result_json, parse_specialist_request_json, parse_specialist_result_json,
     SpecialistKind, SpecialistRunContractV1,
 };
+use crate::structured_memory::{
+    build_prompt_bundle, validate_create_request as validate_create_memory,
+    validate_delete_request as validate_delete_memory,
+    validate_update_request as validate_update_memory, CreateMemoryRecordRequest,
+    DeleteMemoryRecordRequest, MemoryEventV1, MemoryProvenanceKind, MemoryRecordKind,
+    MemoryRecordV1, MemoryRetentionPolicy, MemoryScopeKind, MemoryScopeV1, MemorySelectionContext,
+    StructuredMemorySnapshot, UpdateMemoryRecordRequest, MAX_MEMORY_RECORDS,
+};
 use crate::system_actions::{
-    validate_audit_write, AuditWrite, SystemActionAuditPage, SystemActionAuditRecord,
+    sha256_hex, validate_audit_write, AuditWrite, SystemActionAuditPage, SystemActionAuditRecord,
     MAX_SYSTEM_ACTION_AUDITS, MAX_SYSTEM_ACTION_AUDIT_PAGE,
 };
 use crate::task_orchestration::{
@@ -77,6 +98,8 @@ const SYSTEM_ACTION_GATEWAY_MIGRATION: &str =
     include_str!("../migrations/0009_system_action_gateway.sql");
 const SPECIALIST_CAPABILITIES_MIGRATION: &str =
     include_str!("../migrations/0010_specialist_capabilities.sql");
+const REMINDERS_MEMORY_HANDOFFS_MIGRATION: &str =
+    include_str!("../migrations/0011_reminders_memory_handoffs.sql");
 const MAX_AUTHORIZATION_RECORDS: i64 = 10_000;
 
 #[derive(Debug, Clone)]
@@ -85,6 +108,7 @@ pub struct RunAdmission {
     pub authorization: Option<AuthorizationGrant>,
     pub application_state: ApplicationState,
     pub review_request_json: Option<String>,
+    pub memory_bundle_json: String,
     pub duplicate: bool,
 }
 
@@ -309,6 +333,98 @@ impl PersistenceService {
     ) -> PersistenceResult<StateEnvelope> {
         self.run(move |repository| repository.restore_agent_template(request))
             .await
+    }
+
+    pub async fn reminder_scheduler_snapshot(
+        &self,
+    ) -> PersistenceResult<ReminderSchedulerSnapshot> {
+        self.run(StateRepository::reminder_scheduler_snapshot).await
+    }
+
+    pub async fn create_scheduled_item(
+        &self,
+        request: CreateScheduledItemRequest,
+    ) -> PersistenceResult<ReminderSchedulerSnapshot> {
+        self.run(move |repository| repository.create_scheduled_item(request))
+            .await
+    }
+
+    pub async fn update_scheduled_item(
+        &self,
+        request: UpdateScheduledItemRequest,
+    ) -> PersistenceResult<ReminderSchedulerSnapshot> {
+        self.run(move |repository| repository.update_scheduled_item(request))
+            .await
+    }
+
+    pub async fn set_scheduled_item_status(
+        &self,
+        request: SetScheduledItemStatusRequest,
+    ) -> PersistenceResult<ReminderSchedulerSnapshot> {
+        self.run(move |repository| repository.set_scheduled_item_status(request))
+            .await
+    }
+
+    pub async fn delete_scheduled_item(
+        &self,
+        request: DeleteScheduledItemRequest,
+    ) -> PersistenceResult<ReminderSchedulerSnapshot> {
+        self.run(move |repository| repository.delete_scheduled_item(request))
+            .await
+    }
+
+    pub async fn structured_memory_snapshot(&self) -> PersistenceResult<StructuredMemorySnapshot> {
+        self.run(StateRepository::structured_memory_snapshot).await
+    }
+
+    pub async fn create_memory_record(
+        &self,
+        request: CreateMemoryRecordRequest,
+    ) -> PersistenceResult<StructuredMemorySnapshot> {
+        self.run(move |repository| repository.create_memory_record(request))
+            .await
+    }
+
+    pub async fn update_memory_record(
+        &self,
+        request: UpdateMemoryRecordRequest,
+    ) -> PersistenceResult<StructuredMemorySnapshot> {
+        self.run(move |repository| repository.update_memory_record(request))
+            .await
+    }
+
+    pub async fn delete_memory_record(
+        &self,
+        request: DeleteMemoryRecordRequest,
+    ) -> PersistenceResult<StructuredMemorySnapshot> {
+        self.run(move |repository| repository.delete_memory_record(request))
+            .await
+    }
+
+    pub async fn management_handoff_snapshot(
+        &self,
+    ) -> PersistenceResult<ManagementHandoffSnapshot> {
+        self.run(StateRepository::management_handoff_snapshot).await
+    }
+
+    pub(crate) async fn scan_due_reminders(
+        &self,
+        now_unix_ms: i64,
+    ) -> PersistenceResult<Vec<ReminderDeliveryJob>> {
+        self.run(move |repository| repository.scan_due_reminders(now_unix_ms))
+            .await
+    }
+
+    pub(crate) async fn finish_reminder_delivery(
+        &self,
+        occurrence_id: i64,
+        accepted: bool,
+        detail: Option<String>,
+    ) -> PersistenceResult<()> {
+        self.run(move |repository| {
+            repository.finish_reminder_delivery(occurrence_id, accepted, detail.as_deref())
+        })
+        .await
     }
 
     pub async fn create_routed_task(
@@ -627,6 +743,7 @@ impl StateRepository {
         repository.apply_migrations()?;
         repository.reconcile_interrupted_runs()?;
         repository.reconcile_dispatched_system_actions()?;
+        repository.reconcile_reserved_reminder_deliveries()?;
         let timestamp = now_unix_ms()?;
         if let Err(error) = repository.run_data_lifecycle_maintenance("startup", timestamp) {
             log::warn!("data lifecycle startup maintenance failed: {}", error.code);
@@ -635,7 +752,7 @@ impl StateRepository {
     }
 
     #[cfg(test)]
-    fn open_in_memory() -> PersistenceResult<Self> {
+    pub(crate) fn open_in_memory() -> PersistenceResult<Self> {
         let connection = Connection::open_in_memory().map_err(PersistenceError::database)?;
         let mut repository = Self { connection };
         repository.configure_connection_preflight()?;
@@ -645,6 +762,7 @@ impl StateRepository {
         repository.apply_migrations()?;
         repository.reconcile_interrupted_runs()?;
         repository.reconcile_dispatched_system_actions()?;
+        repository.reconcile_reserved_reminder_deliveries()?;
         Ok(repository)
     }
 
@@ -940,13 +1058,6 @@ impl StateRepository {
                 state.preferences.default_performance.redirect_agent_id = None;
                 state.preferences.default_performance.overflow_action = "queue".to_string();
             }
-            for reminder in &mut state.reminders {
-                if reminder.agent_id == Some(request.agent_id) {
-                    reminder.agent_id = None;
-                    reminder.task_id = None;
-                }
-            }
-
             let target = &mut state.agents[target_index];
             target.registry_state = "deleted".to_string();
             target.registry_issue = None;
@@ -960,6 +1071,34 @@ impl StateRepository {
                      SET status = 'Expired', resolved_at = COALESCE(resolved_at, ?1)
                      WHERE agent_id = ?2 AND status IN ('Pending', 'Approved')",
                     params![resolved_at, request.agent_id],
+                )
+                .map_err(PersistenceError::database)?;
+            transaction
+                .execute(
+                    "UPDATE reminders
+                     SET subject_agent_id = CASE WHEN subject_agent_id = ?1 THEN NULL
+                                                 ELSE subject_agent_id END,
+                         task_owner_agent_id = CASE WHEN task_owner_agent_id = ?1 THEN NULL
+                                                    ELSE task_owner_agent_id END,
+                         task_id = CASE WHEN task_owner_agent_id = ?1 THEN NULL ELSE task_id END,
+                         scheduler_agent_id = CASE WHEN scheduler_agent_id = ?1 THEN NULL
+                                                   ELSE scheduler_agent_id END,
+                         delivery_mode = CASE WHEN scheduler_agent_id = ?1 THEN 'in_app'
+                                              ELSE delivery_mode END,
+                         schedule_fingerprint = CASE WHEN scheduler_agent_id = ?1 THEN NULL
+                                                     ELSE schedule_fingerprint END,
+                         authorization_kind = CASE WHEN scheduler_agent_id = ?1 THEN NULL
+                                                   ELSE authorization_kind END,
+                         approval_id = CASE WHEN scheduler_agent_id = ?1 THEN NULL
+                                            ELSE approval_id END,
+                         authorization_policy_fingerprint =
+                             CASE WHEN scheduler_agent_id = ?1 THEN NULL
+                                  ELSE authorization_policy_fingerprint END,
+                         revision = revision + 1,
+                         updated_at_unix_ms = ?2
+                     WHERE subject_agent_id = ?1 OR task_owner_agent_id = ?1
+                        OR scheduler_agent_id = ?1",
+                    params![request.agent_id, timestamp],
                 )
                 .map_err(PersistenceError::database)?;
             Ok(())
@@ -1061,7 +1200,7 @@ impl StateRepository {
                 restored.id = state.agents[index].id;
                 restored.tasks = std::mem::take(&mut state.agents[index].tasks);
                 restored.activity = std::mem::take(&mut state.agents[index].activity);
-                restored.memory = std::mem::take(&mut state.agents[index].memory);
+                restored.memory.clear();
                 state.agents[index] = restored;
             } else {
                 restored.id = allocate_agent_id(transaction)?;
@@ -1069,6 +1208,1120 @@ impl StateRepository {
             }
             Ok(())
         })
+    }
+
+    pub fn reminder_scheduler_snapshot(&mut self) -> PersistenceResult<ReminderSchedulerSnapshot> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(PersistenceError::database)?;
+        ensure_application_initialized(&transaction, "loading the reminder scheduler")?;
+        let snapshot = read_reminder_scheduler_snapshot(&transaction)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(snapshot)
+    }
+
+    pub fn create_scheduled_item(
+        &mut self,
+        request: CreateScheduledItemRequest,
+    ) -> PersistenceResult<ReminderSchedulerSnapshot> {
+        let resolution = validate_create_scheduled_item(&request)
+            .map_err(|error| PersistenceError::new(error.code, error.message, true))?;
+        let request_fingerprint =
+            persistence_request_fingerprint(&request, "REMINDER_REQUEST_INVALID")?;
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_application_initialized(&transaction, "creating a scheduled item")?;
+        if reminder_request_is_duplicate(&transaction, &request.request_id, &request_fingerprint)? {
+            let snapshot = read_reminder_scheduler_snapshot(&transaction)?;
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(snapshot);
+        }
+        let (revision, next_item_id, _next_occurrence_id): (i64, i64, i64) = transaction
+            .query_row(
+                "SELECT revision, next_reminder_id, next_occurrence_id
+                 FROM reminder_scheduler_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(PersistenceError::database)?;
+        ensure_subsystem_revision(
+            revision,
+            request.expected_revision,
+            "REMINDER_REVISION_CONFLICT",
+        )?;
+        let count: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM reminders", [], |row| row.get(0))
+            .map_err(PersistenceError::database)?;
+        if count >= MAX_SCHEDULED_ITEMS as i64 {
+            return Err(PersistenceError::new(
+                "REMINDER_CAPACITY_EXCEEDED",
+                "The reminder scheduler already contains its maximum of 10000 items.",
+                true,
+            ));
+        }
+        validate_schedule_links(
+            &transaction,
+            request.subject_agent_id,
+            request.workspace_id.as_deref(),
+            request.task_owner_agent_id,
+            request.task_id,
+        )?;
+        let event_end = request
+            .event_end_local
+            .as_deref()
+            .map(|value| crate::reminder_scheduler::resolve_local_due_at(value, &request.time_zone))
+            .transpose()
+            .map_err(|error| PersistenceError::new(error.code, error.message, true))?;
+        let fingerprint = schedule_fingerprint(&request, &resolution)
+            .map_err(|error| PersistenceError::new(error.code, error.message, false))?;
+        let position: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(position) + 1, 0) FROM reminders",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        let portal_policy = (request.delivery_mode == DeliveryMode::Portal)
+            .then(|| portal_policy_fingerprint(&fingerprint));
+        let new_revision = next_revision(revision)?;
+        let created_at = format_unix_ms(timestamp);
+        transaction
+            .execute(
+                "INSERT INTO reminders
+                 (id, position, revision, kind, title, notes, local_due_at, time_zone,
+                  due_at, due_at_unix_ms, event_end_local, event_end_unix_ms,
+                  dst_resolution, status, recurrence_kind, recurrence_interval,
+                  recurrence_limit, recurrence_until_unix_ms, next_occurrence_sequence,
+                  missed_occurrence_count, delivery_mode, privacy_mode, schedule_fingerprint,
+                  authorization_kind, approval_id, authorization_policy_fingerprint,
+                  subject_agent_id, workspace_id, task_owner_agent_id, task_id,
+                  scheduler_agent_id, created_at, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES
+                 (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                  'scheduled', ?13, ?14, ?15, ?16, 0, 0, ?17, ?18, ?19, ?20,
+                  ?21, ?22, ?23, ?24, ?25, ?26,
+                  (SELECT id FROM agents WHERE template_key = 'event-reminder'
+                   AND registry_state = 'active' ORDER BY id LIMIT 1),
+                  ?27, ?28, ?28)",
+                params![
+                    next_item_id,
+                    position,
+                    request.kind.as_storage_value(),
+                    request.title.trim(),
+                    request.notes,
+                    resolution.local_due_at,
+                    resolution.time_zone,
+                    resolution.due_at,
+                    resolution.due_at_unix_ms,
+                    event_end.as_ref().map(|value| value.local_due_at.as_str()),
+                    event_end.as_ref().map(|value| value.due_at_unix_ms),
+                    resolution.dst_resolution.as_storage_value(),
+                    request.recurrence.kind.as_storage_value(),
+                    request.recurrence.interval,
+                    request.recurrence.occurrence_limit,
+                    request.recurrence.until_unix_ms,
+                    request.delivery_mode.as_storage_value(),
+                    request.privacy_mode.as_storage_value(),
+                    fingerprint,
+                    portal_policy.as_ref().map(|_| "policy_allow"),
+                    Option::<i64>::None,
+                    portal_policy.as_deref(),
+                    request.subject_agent_id,
+                    request.workspace_id,
+                    request.task_owner_agent_id,
+                    request.task_id,
+                    created_at,
+                    timestamp,
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction
+            .execute(
+                "UPDATE reminder_scheduler_meta
+                 SET revision = ?1, next_reminder_id = ?2
+                 WHERE singleton = 1",
+                params![new_revision, next_revision(next_item_id)?],
+            )
+            .map_err(PersistenceError::database)?;
+        advance_application_revision(&transaction)?;
+        record_reminder_request(
+            &transaction,
+            &request.request_id,
+            &request_fingerprint,
+            new_revision,
+            Some(next_item_id),
+            timestamp,
+        )?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        self.reminder_scheduler_snapshot()
+    }
+
+    pub fn update_scheduled_item(
+        &mut self,
+        request: UpdateScheduledItemRequest,
+    ) -> PersistenceResult<ReminderSchedulerSnapshot> {
+        let request_fingerprint =
+            persistence_request_fingerprint(&request, "REMINDER_REQUEST_INVALID")?;
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_application_initialized(&transaction, "updating a scheduled item")?;
+        if reminder_request_is_duplicate(&transaction, &request.request_id, &request_fingerprint)? {
+            let snapshot = read_reminder_scheduler_snapshot(&transaction)?;
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(snapshot);
+        }
+        let revision: i64 = transaction
+            .query_row(
+                "SELECT revision FROM reminder_scheduler_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        ensure_subsystem_revision(
+            revision,
+            request.expected_revision,
+            "REMINDER_REVISION_CONFLICT",
+        )?;
+        let (stored_kind, item_revision): (String, i64) = transaction
+            .query_row(
+                "SELECT kind, revision FROM reminders WHERE id = ?1",
+                [request.item_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(PersistenceError::database)?
+            .ok_or_else(|| {
+                PersistenceError::new(
+                    "REMINDER_NOT_FOUND",
+                    "The selected scheduled item no longer exists.",
+                    true,
+                )
+            })?;
+        if item_revision != request.expected_item_revision {
+            return Err(PersistenceError::new(
+                "REMINDER_ITEM_REVISION_CONFLICT",
+                "The scheduled item changed; refresh it before editing.",
+                true,
+            ));
+        }
+        let kind = ScheduledItemKind::from_storage_value(&stored_kind)
+            .map_err(|error| PersistenceError::new(error.code, error.message, false))?;
+        let resolution = validate_update_scheduled_item(&request, kind)
+            .map_err(|error| PersistenceError::new(error.code, error.message, true))?;
+        validate_schedule_links(
+            &transaction,
+            request.subject_agent_id,
+            request.workspace_id.as_deref(),
+            request.task_owner_agent_id,
+            request.task_id,
+        )?;
+        let event_end = request
+            .event_end_local
+            .as_deref()
+            .map(|value| crate::reminder_scheduler::resolve_local_due_at(value, &request.time_zone))
+            .transpose()
+            .map_err(|error| PersistenceError::new(error.code, error.message, true))?;
+        let create_shape = CreateScheduledItemRequest {
+            expected_revision: request.expected_revision,
+            request_id: request.request_id.clone(),
+            kind,
+            title: request.title.clone(),
+            notes: request.notes.clone(),
+            local_due_at: request.local_due_at.clone(),
+            time_zone: request.time_zone.clone(),
+            event_end_local: request.event_end_local.clone(),
+            recurrence: request.recurrence.clone(),
+            delivery_mode: request.delivery_mode,
+            privacy_mode: request.privacy_mode,
+            subject_agent_id: request.subject_agent_id,
+            workspace_id: request.workspace_id.clone(),
+            task_owner_agent_id: request.task_owner_agent_id,
+            task_id: request.task_id,
+        };
+        let fingerprint = schedule_fingerprint(&create_shape, &resolution)
+            .map_err(|error| PersistenceError::new(error.code, error.message, false))?;
+        let portal_policy = (request.delivery_mode == DeliveryMode::Portal)
+            .then(|| portal_policy_fingerprint(&fingerprint));
+        let new_revision = next_revision(revision)?;
+        let new_item_revision = next_revision(item_revision)?;
+        transaction
+            .execute(
+                "UPDATE reminders
+                 SET revision = ?1, title = ?2, notes = ?3, local_due_at = ?4,
+                     time_zone = ?5, due_at = ?6, due_at_unix_ms = ?7,
+                     event_end_local = ?8, event_end_unix_ms = ?9,
+                     dst_resolution = ?10, status = 'scheduled',
+                     recurrence_kind = ?11, recurrence_interval = ?12,
+                     recurrence_limit = ?13, recurrence_until_unix_ms = ?14,
+                     next_occurrence_sequence = 0, missed_occurrence_count = 0,
+                     delivery_mode = ?15, privacy_mode = ?16,
+                     schedule_fingerprint = ?17, authorization_kind = ?18,
+                     approval_id = ?19, authorization_policy_fingerprint = ?20,
+                     subject_agent_id = ?21, workspace_id = ?22,
+                     task_owner_agent_id = ?23, task_id = ?24,
+                     schedule_issue_code = NULL, schedule_issue_message = NULL,
+                     resolved_at_unix_ms = NULL, updated_at_unix_ms = ?25
+                 WHERE id = ?26",
+                params![
+                    new_item_revision,
+                    request.title.trim(),
+                    request.notes,
+                    resolution.local_due_at,
+                    resolution.time_zone,
+                    resolution.due_at,
+                    resolution.due_at_unix_ms,
+                    event_end.as_ref().map(|value| value.local_due_at.as_str()),
+                    event_end.as_ref().map(|value| value.due_at_unix_ms),
+                    resolution.dst_resolution.as_storage_value(),
+                    request.recurrence.kind.as_storage_value(),
+                    request.recurrence.interval,
+                    request.recurrence.occurrence_limit,
+                    request.recurrence.until_unix_ms,
+                    request.delivery_mode.as_storage_value(),
+                    request.privacy_mode.as_storage_value(),
+                    fingerprint,
+                    portal_policy.as_ref().map(|_| "policy_allow"),
+                    Option::<i64>::None,
+                    portal_policy.as_deref(),
+                    request.subject_agent_id,
+                    request.workspace_id,
+                    request.task_owner_agent_id,
+                    request.task_id,
+                    timestamp,
+                    request.item_id,
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction
+            .execute(
+                "UPDATE reminder_scheduler_meta SET revision = ?1 WHERE singleton = 1",
+                [new_revision],
+            )
+            .map_err(PersistenceError::database)?;
+        advance_application_revision(&transaction)?;
+        record_reminder_request(
+            &transaction,
+            &request.request_id,
+            &request_fingerprint,
+            new_revision,
+            Some(request.item_id),
+            timestamp,
+        )?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        self.reminder_scheduler_snapshot()
+    }
+
+    pub fn set_scheduled_item_status(
+        &mut self,
+        request: SetScheduledItemStatusRequest,
+    ) -> PersistenceResult<ReminderSchedulerSnapshot> {
+        if request.expected_revision < 0
+            || request.expected_item_revision <= 0
+            || request.item_id <= 0
+            || request.request_id.trim().is_empty()
+            || request.request_id.len() > 128
+            || !matches!(
+                request.status,
+                ScheduleStatus::Scheduled | ScheduleStatus::Completed | ScheduleStatus::Dismissed
+            )
+        {
+            return Err(PersistenceError::new(
+                "REMINDER_REQUEST_INVALID",
+                "The scheduled-item status request is invalid.",
+                true,
+            ));
+        }
+        let request_fingerprint =
+            persistence_request_fingerprint(&request, "REMINDER_REQUEST_INVALID")?;
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_application_initialized(&transaction, "changing a scheduled-item status")?;
+        if reminder_request_is_duplicate(&transaction, &request.request_id, &request_fingerprint)? {
+            let snapshot = read_reminder_scheduler_snapshot(&transaction)?;
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(snapshot);
+        }
+        let revision: i64 = transaction
+            .query_row(
+                "SELECT revision FROM reminder_scheduler_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        ensure_subsystem_revision(
+            revision,
+            request.expected_revision,
+            "REMINDER_REVISION_CONFLICT",
+        )?;
+        let item_revision: Option<i64> = transaction
+            .query_row(
+                "SELECT revision FROM reminders WHERE id = ?1",
+                [request.item_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(PersistenceError::database)?;
+        let item_revision = item_revision.ok_or_else(|| {
+            PersistenceError::new(
+                "REMINDER_NOT_FOUND",
+                "The selected scheduled item no longer exists.",
+                true,
+            )
+        })?;
+        if item_revision != request.expected_item_revision {
+            return Err(PersistenceError::new(
+                "REMINDER_ITEM_REVISION_CONFLICT",
+                "The scheduled item changed; refresh it before changing its status.",
+                true,
+            ));
+        }
+        let new_revision = next_revision(revision)?;
+        transaction
+            .execute(
+                "UPDATE reminders
+                 SET revision = revision + 1, status = ?1,
+                     resolved_at_unix_ms = CASE WHEN ?1 IN ('completed', 'dismissed')
+                                                THEN ?2 ELSE NULL END,
+                     updated_at_unix_ms = ?2
+                 WHERE id = ?3",
+                params![
+                    request.status.as_storage_value(),
+                    timestamp,
+                    request.item_id
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction
+            .execute(
+                "UPDATE reminder_scheduler_meta SET revision = ?1 WHERE singleton = 1",
+                [new_revision],
+            )
+            .map_err(PersistenceError::database)?;
+        advance_application_revision(&transaction)?;
+        record_reminder_request(
+            &transaction,
+            &request.request_id,
+            &request_fingerprint,
+            new_revision,
+            Some(request.item_id),
+            timestamp,
+        )?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        self.reminder_scheduler_snapshot()
+    }
+
+    pub fn delete_scheduled_item(
+        &mut self,
+        request: DeleteScheduledItemRequest,
+    ) -> PersistenceResult<ReminderSchedulerSnapshot> {
+        if request.expected_revision < 0
+            || request.expected_item_revision <= 0
+            || request.item_id <= 0
+            || request.request_id.trim().is_empty()
+            || request.request_id.len() > 128
+        {
+            return Err(PersistenceError::new(
+                "REMINDER_REQUEST_INVALID",
+                "The scheduled-item delete request is invalid.",
+                true,
+            ));
+        }
+        let request_fingerprint =
+            persistence_request_fingerprint(&request, "REMINDER_REQUEST_INVALID")?;
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_application_initialized(&transaction, "deleting a scheduled item")?;
+        if reminder_request_is_duplicate(&transaction, &request.request_id, &request_fingerprint)? {
+            let snapshot = read_reminder_scheduler_snapshot(&transaction)?;
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(snapshot);
+        }
+        let revision: i64 = transaction
+            .query_row(
+                "SELECT revision FROM reminder_scheduler_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        ensure_subsystem_revision(
+            revision,
+            request.expected_revision,
+            "REMINDER_REVISION_CONFLICT",
+        )?;
+        let changed = transaction
+            .execute(
+                "DELETE FROM reminders WHERE id = ?1 AND revision = ?2",
+                params![request.item_id, request.expected_item_revision],
+            )
+            .map_err(PersistenceError::database)?;
+        if changed == 0 {
+            return Err(PersistenceError::new(
+                "REMINDER_ITEM_REVISION_CONFLICT",
+                "The scheduled item is absent or changed; refresh before deleting it.",
+                true,
+            ));
+        }
+        let new_revision = next_revision(revision)?;
+        transaction
+            .execute(
+                "UPDATE reminder_scheduler_meta SET revision = ?1 WHERE singleton = 1",
+                [new_revision],
+            )
+            .map_err(PersistenceError::database)?;
+        advance_application_revision(&transaction)?;
+        record_reminder_request(
+            &transaction,
+            &request.request_id,
+            &request_fingerprint,
+            new_revision,
+            None,
+            timestamp,
+        )?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        self.reminder_scheduler_snapshot()
+    }
+
+    pub fn structured_memory_snapshot(&mut self) -> PersistenceResult<StructuredMemorySnapshot> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(PersistenceError::database)?;
+        ensure_application_initialized(&transaction, "loading structured memory")?;
+        let snapshot = read_structured_memory_snapshot(&transaction)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(snapshot)
+    }
+
+    pub fn create_memory_record(
+        &mut self,
+        request: CreateMemoryRecordRequest,
+    ) -> PersistenceResult<StructuredMemorySnapshot> {
+        validate_create_memory(&request)
+            .map_err(|error| PersistenceError::new(error.code, error.message, true))?;
+        let request_fingerprint =
+            persistence_request_fingerprint(&request, "MEMORY_REQUEST_INVALID")?;
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_application_initialized(&transaction, "creating a memory record")?;
+        if memory_request_is_duplicate(&transaction, &request.request_id, &request_fingerprint)? {
+            let snapshot = read_structured_memory_snapshot(&transaction)?;
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(snapshot);
+        }
+        let (revision, next_record_id, next_event_id): (i64, i64, i64) = transaction
+            .query_row(
+                "SELECT revision, next_record_id, next_event_id
+                 FROM structured_memory_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(PersistenceError::database)?;
+        ensure_subsystem_revision(
+            revision,
+            request.expected_revision,
+            "MEMORY_REVISION_CONFLICT",
+        )?;
+        let count: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM memory_records", [], |row| row.get(0))
+            .map_err(PersistenceError::database)?;
+        if count >= MAX_MEMORY_RECORDS as i64 {
+            return Err(PersistenceError::new(
+                "MEMORY_CAPACITY_EXCEEDED",
+                "Structured memory already contains its maximum of 50000 records.",
+                true,
+            ));
+        }
+        validate_memory_scope_references(&transaction, &request.scope)?;
+        let expires_at = request.retention.expiry_from(timestamp);
+        transaction
+            .execute(
+                "INSERT INTO memory_records
+                 (id, scope_kind, agent_id, workspace_id, task_owner_agent_id, task_id,
+                  team_leader_agent_id, record_kind, content, provenance_kind,
+                  provenance_ref, revision, retention_policy, expires_at_unix_ms,
+                  created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'user', NULL, 1,
+                         ?10, ?11, ?12, ?12)",
+                params![
+                    next_record_id,
+                    request.scope.kind.as_storage_value(),
+                    request.scope.agent_id,
+                    request.scope.workspace_id,
+                    request.scope.task_owner_agent_id,
+                    request.scope.task_id,
+                    request.scope.team_leader_agent_id,
+                    request.kind.as_storage_value(),
+                    request.content,
+                    request.retention.as_storage_value(),
+                    expires_at,
+                    timestamp,
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction
+            .execute(
+                "INSERT INTO memory_events
+                 (id, record_id, action, actor_kind, record_revision, created_at_unix_ms)
+                 VALUES (?1, ?2, 'created', 'human', 1, ?3)",
+                params![next_event_id, next_record_id, timestamp],
+            )
+            .map_err(PersistenceError::database)?;
+        let new_revision = next_revision(revision)?;
+        transaction
+            .execute(
+                "UPDATE structured_memory_meta
+                 SET revision = ?1, next_record_id = ?2, next_event_id = ?3
+                 WHERE singleton = 1",
+                params![
+                    new_revision,
+                    next_revision(next_record_id)?,
+                    next_revision(next_event_id)?,
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        advance_application_revision(&transaction)?;
+        record_memory_request(
+            &transaction,
+            &request.request_id,
+            &request_fingerprint,
+            new_revision,
+            Some(next_record_id),
+            timestamp,
+        )?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        self.structured_memory_snapshot()
+    }
+
+    pub fn update_memory_record(
+        &mut self,
+        request: UpdateMemoryRecordRequest,
+    ) -> PersistenceResult<StructuredMemorySnapshot> {
+        validate_update_memory(&request)
+            .map_err(|error| PersistenceError::new(error.code, error.message, true))?;
+        let request_fingerprint =
+            persistence_request_fingerprint(&request, "MEMORY_REQUEST_INVALID")?;
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_application_initialized(&transaction, "updating a memory record")?;
+        if memory_request_is_duplicate(&transaction, &request.request_id, &request_fingerprint)? {
+            let snapshot = read_structured_memory_snapshot(&transaction)?;
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(snapshot);
+        }
+        let (revision, next_event_id): (i64, i64) = transaction
+            .query_row(
+                "SELECT revision, next_event_id FROM structured_memory_meta
+                 WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(PersistenceError::database)?;
+        ensure_subsystem_revision(
+            revision,
+            request.expected_revision,
+            "MEMORY_REVISION_CONFLICT",
+        )?;
+        let stored_scope_kind: Option<String> = transaction
+            .query_row(
+                "SELECT scope_kind FROM memory_records
+                 WHERE id = ?1 AND revision = ?2",
+                params![request.record_id, request.expected_record_revision],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(PersistenceError::database)?;
+        let stored_scope_kind = stored_scope_kind.ok_or_else(|| {
+            PersistenceError::new(
+                "MEMORY_RECORD_REVISION_CONFLICT",
+                "The memory record is absent or changed; refresh it before editing.",
+                true,
+            )
+        })?;
+        if request.retention == MemoryRetentionPolicy::TaskLifetime && stored_scope_kind != "task" {
+            return Err(PersistenceError::new(
+                "MEMORY_RETENTION_INVALID",
+                "Task-lifetime retention is only valid for task-scoped memory.",
+                true,
+            ));
+        }
+        let new_record_revision = next_revision(request.expected_record_revision)?;
+        transaction
+            .execute(
+                "UPDATE memory_records
+                 SET record_kind = ?1, content = ?2, revision = ?3,
+                     retention_policy = ?4, expires_at_unix_ms = ?5,
+                     updated_at_unix_ms = ?6
+                 WHERE id = ?7",
+                params![
+                    request.kind.as_storage_value(),
+                    request.content,
+                    new_record_revision,
+                    request.retention.as_storage_value(),
+                    request.retention.expiry_from(timestamp),
+                    timestamp,
+                    request.record_id,
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction
+            .execute(
+                "INSERT INTO memory_events
+                 (id, record_id, action, actor_kind, record_revision, created_at_unix_ms)
+                 VALUES (?1, ?2, 'updated', 'human', ?3, ?4)",
+                params![
+                    next_event_id,
+                    request.record_id,
+                    new_record_revision,
+                    timestamp,
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        let new_revision = next_revision(revision)?;
+        transaction
+            .execute(
+                "UPDATE structured_memory_meta
+                 SET revision = ?1, next_event_id = ?2 WHERE singleton = 1",
+                params![new_revision, next_revision(next_event_id)?],
+            )
+            .map_err(PersistenceError::database)?;
+        advance_application_revision(&transaction)?;
+        record_memory_request(
+            &transaction,
+            &request.request_id,
+            &request_fingerprint,
+            new_revision,
+            Some(request.record_id),
+            timestamp,
+        )?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        self.structured_memory_snapshot()
+    }
+
+    pub fn delete_memory_record(
+        &mut self,
+        request: DeleteMemoryRecordRequest,
+    ) -> PersistenceResult<StructuredMemorySnapshot> {
+        validate_delete_memory(&request)
+            .map_err(|error| PersistenceError::new(error.code, error.message, true))?;
+        let request_fingerprint =
+            persistence_request_fingerprint(&request, "MEMORY_REQUEST_INVALID")?;
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_application_initialized(&transaction, "deleting a memory record")?;
+        if memory_request_is_duplicate(&transaction, &request.request_id, &request_fingerprint)? {
+            let snapshot = read_structured_memory_snapshot(&transaction)?;
+            transaction.commit().map_err(PersistenceError::database)?;
+            return Ok(snapshot);
+        }
+        let (revision, next_event_id): (i64, i64) = transaction
+            .query_row(
+                "SELECT revision, next_event_id FROM structured_memory_meta
+                 WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(PersistenceError::database)?;
+        ensure_subsystem_revision(
+            revision,
+            request.expected_revision,
+            "MEMORY_REVISION_CONFLICT",
+        )?;
+        let changed = transaction
+            .execute(
+                "DELETE FROM memory_records WHERE id = ?1 AND revision = ?2",
+                params![request.record_id, request.expected_record_revision],
+            )
+            .map_err(PersistenceError::database)?;
+        if changed == 0 {
+            return Err(PersistenceError::new(
+                "MEMORY_RECORD_REVISION_CONFLICT",
+                "The memory record is absent or changed; refresh it before deleting.",
+                true,
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO memory_events
+                 (id, record_id, action, actor_kind, record_revision, created_at_unix_ms)
+                 VALUES (?1, ?2, 'deleted', 'human', ?3, ?4)",
+                params![
+                    next_event_id,
+                    request.record_id,
+                    request.expected_record_revision,
+                    timestamp,
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        let new_revision = next_revision(revision)?;
+        transaction
+            .execute(
+                "UPDATE structured_memory_meta
+                 SET revision = ?1, next_event_id = ?2 WHERE singleton = 1",
+                params![new_revision, next_revision(next_event_id)?],
+            )
+            .map_err(PersistenceError::database)?;
+        advance_application_revision(&transaction)?;
+        record_memory_request(
+            &transaction,
+            &request.request_id,
+            &request_fingerprint,
+            new_revision,
+            None,
+            timestamp,
+        )?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        self.structured_memory_snapshot()
+    }
+
+    pub fn management_handoff_snapshot(&mut self) -> PersistenceResult<ManagementHandoffSnapshot> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(PersistenceError::database)?;
+        ensure_application_initialized(&transaction, "loading management handoffs")?;
+        let snapshot = read_management_handoff_snapshot(&transaction)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(snapshot)
+    }
+
+    pub fn scan_due_reminders(
+        &mut self,
+        now_unix_ms: i64,
+    ) -> PersistenceResult<Vec<ReminderDeliveryJob>> {
+        if now_unix_ms < 0 {
+            return Err(PersistenceError::new(
+                "REMINDER_SCAN_INVALID",
+                "The reminder scan timestamp must be non-negative.",
+                false,
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_application_initialized(&transaction, "scanning reminders")?;
+        let (scheduler_revision, mut next_occurrence_id): (i64, i64) = transaction
+            .query_row(
+                "SELECT revision, next_occurrence_id FROM reminder_scheduler_meta
+                 WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(PersistenceError::database)?;
+        let snapshot = read_reminder_scheduler_snapshot(&transaction)?;
+        let mut jobs = Vec::new();
+        let mut changed = false;
+        let mut processed = 0_usize;
+        for item in snapshot.items.iter().filter(|item| {
+            item.status == ScheduleStatus::Scheduled
+                && item.due_at_unix_ms.is_some_and(|due| due <= now_unix_ms)
+        }) {
+            if processed >= 1_000 {
+                break;
+            }
+            let mut sequence = item.next_occurrence_sequence;
+            let mut due_at_unix_ms = item
+                .due_at_unix_ms
+                .expect("filtered scheduled reminder has an instant");
+            let mut next_resolution = None;
+            let mut recurrence_error = None;
+            let mut item_missed = 0_i64;
+            loop {
+                if processed >= 1_000 {
+                    break;
+                }
+                let missed = i64::from(due_at_unix_ms < now_unix_ms);
+                item_missed = item_missed.saturating_add(missed);
+                let occurrence_key = format!(
+                    "reminder-v1:{}:{}:{}:{}",
+                    item.id, item.revision, sequence, due_at_unix_ms
+                );
+                let occurrence_status = if item.delivery_mode == DeliveryMode::Portal {
+                    "reserved"
+                } else {
+                    "in_app_due"
+                };
+                let inserted = transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO reminder_occurrences
+                         (id, reminder_id, schedule_revision, occurrence_sequence,
+                          occurrence_key, due_at_unix_ms, status, missed_count,
+                          first_missed_at_unix_ms, last_missed_at_unix_ms,
+                          portal_notification_id, created_at_unix_ms, updated_at_unix_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                                 CASE WHEN ?8 > 0 THEN ?9 END,
+                                 CASE WHEN ?8 > 0 THEN ?9 END,
+                                 CASE WHEN ?7 = 'reserved' THEN ?5 END, ?9, ?9)",
+                        params![
+                            next_occurrence_id,
+                            item.id,
+                            item.revision,
+                            sequence,
+                            occurrence_key,
+                            due_at_unix_ms,
+                            occurrence_status,
+                            missed,
+                            now_unix_ms,
+                        ],
+                    )
+                    .map_err(PersistenceError::database)?;
+                if inserted == 1 {
+                    processed += 1;
+                    if item.delivery_mode == DeliveryMode::Portal {
+                        let (title, body) = match item.privacy_mode {
+                            PrivacyMode::Generic => (
+                                "AI Agent Control Center reminder".to_string(),
+                                "A scheduled item is due. Open the app to inspect it.".to_string(),
+                            ),
+                            PrivacyMode::Title => {
+                                (item.title.clone(), "A scheduled item is due.".to_string())
+                            }
+                        };
+                        jobs.push(ReminderDeliveryJob {
+                            occurrence_id: next_occurrence_id,
+                            notification_id: occurrence_key,
+                            title,
+                            body,
+                        });
+                    }
+                    next_occurrence_id = next_revision(next_occurrence_id)?;
+                }
+
+                let next_sequence = next_revision(sequence)?;
+                match recurrence_resolution(
+                    &item.local_due_at,
+                    &item.time_zone,
+                    &item.recurrence,
+                    next_sequence,
+                ) {
+                    Ok(resolution) => next_resolution = resolution,
+                    Err(error) => {
+                        sequence = next_sequence;
+                        recurrence_error = Some(error);
+                        break;
+                    }
+                }
+                match next_resolution.as_ref() {
+                    Some(next) if next.due_at_unix_ms <= now_unix_ms => {
+                        sequence = next_sequence;
+                        due_at_unix_ms = next.due_at_unix_ms;
+                    }
+                    _ => {
+                        sequence = next_sequence;
+                        break;
+                    }
+                }
+            }
+
+            if let Some(error) = recurrence_error {
+                transaction
+                    .execute(
+                        "UPDATE reminders
+                         SET status = 'needs_attention', next_occurrence_sequence = ?1,
+                             schedule_issue_code = ?2, schedule_issue_message = ?3,
+                             missed_occurrence_count = missed_occurrence_count + ?4,
+                             updated_at_unix_ms = ?5
+                         WHERE id = ?6",
+                        params![
+                            sequence,
+                            error.code,
+                            error.message,
+                            item_missed,
+                            now_unix_ms,
+                            item.id,
+                        ],
+                    )
+                    .map_err(PersistenceError::database)?;
+                changed = true;
+                continue;
+            }
+
+            if processed >= 1_000
+                && next_resolution
+                    .as_ref()
+                    .is_some_and(|next| next.due_at_unix_ms <= now_unix_ms)
+            {
+                transaction
+                    .execute(
+                        "UPDATE reminders
+                         SET status = 'needs_attention', schedule_issue_code = 'MISSED_EVENT_LIMIT',
+                             schedule_issue_message =
+                                 'More than 1000 due occurrences require review before scheduling continues.',
+                             missed_occurrence_count = missed_occurrence_count + ?1,
+                             updated_at_unix_ms = ?2
+                         WHERE id = ?3",
+                        params![item_missed, now_unix_ms, item.id],
+                    )
+                    .map_err(PersistenceError::database)?;
+                changed = true;
+                break;
+            }
+
+            match next_resolution {
+                Some(next) => {
+                    transaction
+                        .execute(
+                            "UPDATE reminders
+                             SET due_at = ?1, due_at_unix_ms = ?2, dst_resolution = ?3,
+                                 next_occurrence_sequence = ?4, status = 'scheduled',
+                                 missed_occurrence_count = missed_occurrence_count + ?5,
+                                 updated_at_unix_ms = ?6
+                             WHERE id = ?7",
+                            params![
+                                next.due_at,
+                                next.due_at_unix_ms,
+                                next.dst_resolution.as_storage_value(),
+                                sequence,
+                                item_missed,
+                                now_unix_ms,
+                                item.id,
+                            ],
+                        )
+                        .map_err(PersistenceError::database)?;
+                }
+                None => {
+                    transaction
+                        .execute(
+                            "UPDATE reminders
+                             SET status = 'due', missed_occurrence_count = missed_occurrence_count + ?1,
+                                 updated_at_unix_ms = ?2
+                             WHERE id = ?3",
+                            params![item_missed, now_unix_ms, item.id],
+                        )
+                        .map_err(PersistenceError::database)?;
+                }
+            }
+            changed = true;
+        }
+        transaction
+            .execute(
+                "UPDATE reminder_scheduler_meta
+                 SET next_occurrence_id = ?1, last_scan_at_unix_ms = ?2,
+                     last_error_code = NULL, last_error_message = NULL
+                 WHERE singleton = 1",
+                params![next_occurrence_id, now_unix_ms],
+            )
+            .map_err(PersistenceError::database)?;
+        if changed {
+            transaction
+                .execute(
+                    "UPDATE reminder_scheduler_meta SET revision = ?1 WHERE singleton = 1",
+                    [next_revision(scheduler_revision)?],
+                )
+                .map_err(PersistenceError::database)?;
+            advance_application_revision(&transaction)?;
+        }
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(jobs)
+    }
+
+    pub fn finish_reminder_delivery(
+        &mut self,
+        occurrence_id: i64,
+        accepted: bool,
+        detail: Option<&str>,
+    ) -> PersistenceResult<()> {
+        if occurrence_id <= 0 || detail.is_some_and(|value| value.len() > 4 * 1024) {
+            return Err(PersistenceError::new(
+                "REMINDER_DELIVERY_INVALID",
+                "The notification delivery result is invalid.",
+                false,
+            ));
+        }
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let status: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM reminder_occurrences WHERE id = ?1",
+                [occurrence_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(PersistenceError::database)?;
+        match status.as_deref() {
+            Some("reserved") => {}
+            Some("portal_accepted") if accepted => {
+                transaction.commit().map_err(PersistenceError::database)?;
+                return Ok(());
+            }
+            Some(_) => {
+                return Err(PersistenceError::new(
+                    "REMINDER_DELIVERY_STATE_CONFLICT",
+                    "The notification delivery is no longer reserved.",
+                    true,
+                ));
+            }
+            None => {
+                return Err(PersistenceError::new(
+                    "REMINDER_OCCURRENCE_NOT_FOUND",
+                    "The reminder occurrence no longer exists.",
+                    true,
+                ));
+            }
+        }
+        let revision: i64 = transaction
+            .query_row(
+                "SELECT revision FROM reminder_scheduler_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        transaction
+            .execute(
+                "UPDATE reminder_occurrences
+                 SET status = ?1, detail_code = ?2, detail_message = ?3,
+                     updated_at_unix_ms = ?4
+                 WHERE id = ?5",
+                params![
+                    if accepted {
+                        "portal_accepted"
+                    } else {
+                        "failed"
+                    },
+                    if accepted {
+                        None
+                    } else {
+                        Some("PORTAL_DELIVERY_FAILED")
+                    },
+                    detail,
+                    timestamp,
+                    occurrence_id,
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction
+            .execute(
+                "UPDATE reminder_scheduler_meta SET revision = ?1 WHERE singleton = 1",
+                [next_revision(revision)?],
+            )
+            .map_err(PersistenceError::database)?;
+        advance_application_revision(&transaction)?;
+        transaction.commit().map_err(PersistenceError::database)
     }
 
     pub fn create_routed_task(
@@ -1165,6 +2418,64 @@ impl StateRepository {
             (Some(timestamp), None),
             timestamp,
         )?;
+        let owner_role = management_owner_role(&state.agents[owner_index].role);
+        insert_management_handoff(
+            &transaction,
+            NewManagementHandoff {
+                task_owner_agent_id: request.task_owner_agent_id,
+                task_id,
+                kind: ManagementHandoffKind::TaskPlan,
+                from_agent_id: Some(request.task_owner_agent_id),
+                to_agent_id: Some(task.assigned_agent_id),
+                owner_role,
+                revision_round: 0,
+                run_attempt_id: None,
+                review_flow_id: None,
+                review_stage_attempt_id: None,
+                source: ManagementHandoffSource::TaskOrchestration,
+                summary: format!("Plan created for task: {}", task.title),
+                payload: serde_json::json!({
+                    "title": task.title,
+                    "category": task.category,
+                    "priority": task.priority,
+                    "workspaceId": task.workspace_id,
+                    "routingMode": task.routing_mode,
+                    "queueState": task.queue_state,
+                }),
+                idempotency_key: format!(
+                    "task-orchestration:plan:{}:{}",
+                    request.task_owner_agent_id, task_id
+                ),
+            },
+            timestamp,
+        )?;
+        insert_management_handoff(
+            &transaction,
+            NewManagementHandoff {
+                task_owner_agent_id: request.task_owner_agent_id,
+                task_id,
+                kind: ManagementHandoffKind::Assignment,
+                from_agent_id: Some(request.task_owner_agent_id),
+                to_agent_id: Some(task.assigned_agent_id),
+                owner_role,
+                revision_round: 0,
+                run_attempt_id: None,
+                review_flow_id: None,
+                review_stage_attempt_id: None,
+                source: ManagementHandoffSource::TaskOrchestration,
+                summary: "Task assigned through deterministic routing.".to_string(),
+                payload: serde_json::json!({
+                    "assignedAgentId": task.assigned_agent_id,
+                    "routingReason": task.routing_reason,
+                    "routingEvidence": task.routing_evidence,
+                }),
+                idempotency_key: format!(
+                    "task-orchestration:assignment:{}:{}:initial",
+                    request.task_owner_agent_id, task_id
+                ),
+            },
+            timestamp,
+        )?;
         finish_task_orchestration_mutation(&transaction, meta.state_revision)?;
         transaction.commit().map_err(PersistenceError::database)?;
         self.load()?.ok_or_else(|| {
@@ -1181,6 +2492,7 @@ impl StateRepository {
         request: RerouteTaskRequest,
         providers: &ProviderRegistrySnapshot,
     ) -> PersistenceResult<StateEnvelope> {
+        let timestamp = now_unix_ms()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1271,6 +2583,34 @@ impl StateRepository {
                 ],
             )
             .map_err(PersistenceError::database)?;
+        insert_management_handoff(
+            &transaction,
+            NewManagementHandoff {
+                task_owner_agent_id: request.task_owner_agent_id,
+                task_id: request.task_id,
+                kind: ManagementHandoffKind::Assignment,
+                from_agent_id: task.routed_from_agent_id,
+                to_agent_id: Some(task.assigned_agent_id),
+                owner_role: management_owner_role(&state.agents[owner_index].role),
+                revision_round: 0,
+                run_attempt_id: None,
+                review_flow_id: None,
+                review_stage_attempt_id: None,
+                source: ManagementHandoffSource::TaskOrchestration,
+                summary: "Task assignment changed through deterministic rerouting.".to_string(),
+                payload: serde_json::json!({
+                    "assignedAgentId": task.assigned_agent_id,
+                    "routedFromAgentId": task.routed_from_agent_id,
+                    "routingReason": task.routing_reason,
+                    "routingEvidence": task.routing_evidence,
+                }),
+                idempotency_key: format!(
+                    "task-orchestration:assignment:{}:{}:revision:{}",
+                    request.task_owner_agent_id, request.task_id, meta.state_revision
+                ),
+            },
+            timestamp,
+        )?;
         expire_task_approvals(&transaction, request.task_owner_agent_id, request.task_id)?;
         finish_task_orchestration_mutation(&transaction, meta.state_revision)?;
         transaction.commit().map_err(PersistenceError::database)?;
@@ -1920,6 +3260,34 @@ impl StateRepository {
             None,
             timestamp,
         )?;
+        insert_management_handoff(
+            &transaction,
+            NewManagementHandoff {
+                task_owner_agent_id: request.task_owner_agent_id,
+                task_id: request.task_id,
+                kind: ManagementHandoffKind::HumanOverride,
+                from_agent_id: None,
+                to_agent_id: Some(flow.executor_agent_id),
+                owner_role: ManagementOwnerRole::Human,
+                revision_round: flow.revision_round,
+                run_attempt_id: Some(execution_attempt_id),
+                review_flow_id: Some(flow.id),
+                review_stage_attempt_id: Some(stage_attempt_id),
+                source: ManagementHandoffSource::HumanDecision,
+                summary: format!("Human review decision: {}", result.verdict.as_storage()),
+                payload: serde_json::json!({
+                    "level": level.as_storage(),
+                    "verdict": result.verdict.as_storage(),
+                    "feedback": result.feedback,
+                    "requestFingerprint": review_request.request_fingerprint,
+                }),
+                idempotency_key: format!(
+                    "human-review:{}:{}:{}",
+                    flow.id, flow.revision_round, stage_attempt_id
+                ),
+            },
+            timestamp,
+        )?;
         let snapshot = read_review_orchestration_snapshot(&transaction)?;
         transaction.commit().map_err(PersistenceError::database)?;
         Ok(snapshot)
@@ -2070,8 +3438,11 @@ impl StateRepository {
             ));
         }
         let state = read_application_state(&transaction)?;
+        let reminders = read_reminder_scheduler_snapshot(&transaction)?;
+        let memory = read_structured_memory_snapshot(&transaction)?;
         let backup =
-            build_backup_export(&state, timestamp).map_err(PersistenceError::validation)?;
+            build_backup_export_with_domains(&state, &reminders.items, &memory.records, timestamp)
+                .map_err(PersistenceError::validation)?;
         transaction.commit().map_err(PersistenceError::database)?;
         Ok(backup)
     }
@@ -2140,7 +3511,7 @@ impl StateRepository {
         let pruned = if clock_rollback {
             RetentionPruneCounts::default()
         } else {
-            prune_retention_rows(&transaction, task_cutoff, activity_cutoff)?
+            prune_retention_rows(&transaction, task_cutoff, activity_cutoff, timestamp)?
         };
         let skipped_protected = if clock_rollback {
             0
@@ -2150,7 +3521,7 @@ impl StateRepository {
         let backlog_remaining = if clock_rollback {
             false
         } else {
-            retention_backlog_exists(&transaction, task_cutoff, activity_cutoff)?
+            retention_backlog_exists(&transaction, task_cutoff, activity_cutoff, timestamp)?
         };
 
         let mut application_state_revision = application_meta.state_revision;
@@ -2222,7 +3593,12 @@ impl StateRepository {
                      total_pruned_approvals = total_pruned_approvals + ?10,
                      total_pruned_reminders = total_pruned_reminders + ?11,
                      total_pruned_system_action_audits =
-                         total_pruned_system_action_audits + ?12
+                         total_pruned_system_action_audits + ?12,
+                     total_pruned_memory_records = total_pruned_memory_records + ?13,
+                     total_pruned_reminder_occurrences =
+                         total_pruned_reminder_occurrences + ?14,
+                     total_pruned_management_handoffs =
+                         total_pruned_management_handoffs + ?15
                  WHERE singleton = 1",
                 params![
                     next_lifecycle_revision,
@@ -2236,7 +3612,10 @@ impl StateRepository {
                     pruned.activity,
                     pruned.approvals,
                     pruned.reminders,
-                    pruned.system_action_audits
+                    pruned.system_action_audits,
+                    pruned.memory_records,
+                    pruned.reminder_occurrences,
+                    pruned.management_handoffs,
                 ],
             )
             .map_err(PersistenceError::database)?;
@@ -2647,10 +4026,18 @@ impl StateRepository {
         write_application_state(
             &transaction,
             &candidate.state,
-            "legacy_backup",
+            candidate.source_kind,
             &approval_origins,
             true,
         )?;
+        if candidate.format_version == 4 {
+            write_portable_task18_domains(
+                &transaction,
+                &candidate.scheduled_items,
+                &candidate.memory_records,
+                timestamp,
+            )?;
+        }
         let revision = next_revision(meta.state_revision)?;
         transaction
             .execute(
@@ -3283,12 +4670,23 @@ impl StateRepository {
                 .review_stage_attempt_id
                 .map(|stage_id| read_review_request_json(&transaction, stage_id))
                 .transpose()?;
+            let memory_bundle_json: String = transaction
+                .query_row(
+                    "SELECT memory_bundle_json FROM run_attempts WHERE id = ?1",
+                    [attempt_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .map_err(PersistenceError::database)?
+                .unwrap_or_else(|| {
+                    "{\"schemaVersion\":1,\"records\":[],\"omittedRecordCount\":0}".to_string()
+                });
             transaction.commit().map_err(PersistenceError::database)?;
             return Ok(RunAdmission {
                 attempt,
                 authorization,
                 application_state: state,
                 review_request_json,
+                memory_bundle_json,
                 duplicate: true,
             });
         }
@@ -3393,6 +4791,24 @@ impl StateRepository {
         } else {
             None
         };
+        let memory_bundle = build_prompt_bundle(
+            &read_structured_memory_snapshot(&transaction)?.records,
+            MemorySelectionContext {
+                agent_id,
+                workspace_id: task.workspace_id.clone(),
+                task_owner_agent_id: Some(task_owner_agent_id),
+                task_id: Some(task_id),
+                team_leader_agent_ids: management_chain_for_agent(&state, agent_id)?,
+            },
+            timestamp,
+        )
+        .map_err(|error| PersistenceError::new(error.code, error.message, false))?;
+        let memory_bundle_json = memory_bundle
+            .canonical_json()
+            .map_err(|error| PersistenceError::new(error.code, error.message, false))?;
+        let memory_bundle_sha256 = memory_bundle
+            .sha256()
+            .map_err(|error| PersistenceError::new(error.code, error.message, false))?;
         transaction
             .execute(
                 "INSERT INTO run_attempts
@@ -3401,9 +4817,9 @@ impl StateRepository {
                   run_mode, review_flow_id, review_stage_attempt_id, review_revision_round,
                   status, workspace_id, approval_id, task_status_before,
                   task_phase_before, review_status_before, admitted_at_unix_ms,
-                  specialist_contract_json)
+                  specialist_contract_json, memory_bundle_json, memory_bundle_sha256)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                         ?13, 'admitted', ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                         ?13, 'admitted', ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
                 params![
                     request_id,
                     intent_json,
@@ -3428,7 +4844,9 @@ impl StateRepository {
                     task.phase,
                     task.review_status,
                     timestamp,
-                    specialist_contract_json
+                    specialist_contract_json,
+                    memory_bundle_json,
+                    memory_bundle_sha256,
                 ],
             )
             .map_err(PersistenceError::database)?;
@@ -3517,6 +4935,7 @@ impl StateRepository {
             authorization,
             application_state,
             review_request_json,
+            memory_bundle_json,
             duplicate: false,
         })
     }
@@ -4056,6 +5475,104 @@ impl StateRepository {
                 timestamp,
             )?;
         }
+        let owner_role: String = transaction
+            .query_row(
+                "SELECT role FROM agents WHERE id = ?1",
+                [completed_attempt.task_owner_agent_id],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        let memory_bundle_sha256: Option<String> = transaction
+            .query_row(
+                "SELECT memory_bundle_sha256 FROM run_attempts WHERE id = ?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        let review_verdict = completed_attempt
+            .review_stage_attempt_id
+            .map(|stage_id| {
+                transaction
+                    .query_row(
+                        "SELECT verdict FROM review_stage_attempts WHERE id = ?1",
+                        [stage_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .map_err(PersistenceError::database)
+            })
+            .transpose()?
+            .flatten();
+        let handoff_kind = match (
+            completed_attempt.run_mode,
+            terminal_status,
+            review_verdict.as_deref(),
+        ) {
+            (RunAttemptMode::Execute, RunAttemptStatus::Succeeded, _) => {
+                ManagementHandoffKind::ExecutionEvidence
+            }
+            (RunAttemptMode::Review, RunAttemptStatus::Succeeded, Some("approved")) => {
+                ManagementHandoffKind::ReviewDecision
+            }
+            (RunAttemptMode::Review, RunAttemptStatus::Succeeded, Some("changes_requested")) => {
+                ManagementHandoffKind::RevisionRequest
+            }
+            _ => ManagementHandoffKind::Failure,
+        };
+        let handoff_summary = BoundedText::from_text(
+            summary_text
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| terminal_status.as_str()),
+            MAX_HANDOFF_SUMMARY_BYTES,
+        );
+        let handoff_error_code = completion
+            .error_code
+            .as_deref()
+            .map(|value| BoundedText::from_text(value, 4 * 1024).into_string());
+        insert_management_handoff(
+            &transaction,
+            NewManagementHandoff {
+                task_owner_agent_id: completed_attempt.task_owner_agent_id,
+                task_id: completed_attempt.task_id,
+                kind: handoff_kind,
+                from_agent_id: Some(completed_attempt.agent_id),
+                to_agent_id: Some(completed_attempt.task_owner_agent_id),
+                owner_role: management_owner_role(&owner_role),
+                revision_round: completed_attempt.review_revision_round.unwrap_or(0),
+                run_attempt_id: Some(attempt_id),
+                review_flow_id: completed_attempt.review_flow_id,
+                review_stage_attempt_id: completed_attempt.review_stage_attempt_id,
+                source: if completed_attempt.run_mode == RunAttemptMode::Review {
+                    ManagementHandoffSource::ReviewOrchestration
+                } else {
+                    ManagementHandoffSource::RunCoordinator
+                },
+                summary: handoff_summary.as_str().to_string(),
+                payload: serde_json::json!({
+                    "terminalStatus": terminal_status.as_str(),
+                    "reviewVerdict": review_verdict,
+                    "summaryTruncatedForHandoff": handoff_summary.truncated(),
+                    "errorCode": handoff_error_code,
+                    "memoryBundleSha256": memory_bundle_sha256,
+                    "recoveryDisposition": recovery_disposition,
+                    "runEvidence": {
+                        "attemptId": attempt_id,
+                        "workspaceEvidenceSha256": sha256_hex(workspace_evidence_json.as_bytes()),
+                        "workspaceMode": completion.workspace_changes.mode,
+                        "workspaceStatus": completion.workspace_changes.status,
+                        "workspaceReviewability": completion.workspace_changes.reviewability,
+                        "workspaceSummary": completion.workspace_changes.summary,
+                        "workspaceIssueCount": completion.workspace_changes.issues.len(),
+                        "workspaceIssuesTruncated": completion.workspace_changes.issues_truncated,
+                        "retainedChangedFileCount": bounded_paths.paths.len(),
+                        "originalChangedFileCount": bounded_paths.original_count,
+                        "changedFilesTruncated": bounded_paths.truncated,
+                        "fullEvidenceLocation": "run_attempt",
+                    },
+                }),
+                idempotency_key: format!("run-coordinator:completion:{attempt_id}"),
+            },
+            timestamp,
+        )?;
         transaction
             .execute(
                 "DELETE FROM run_approval_reservations WHERE attempt_id = ?1",
@@ -4198,6 +5715,11 @@ impl StateRepository {
                     10,
                     "bounded_specialist_capabilities",
                     SPECIALIST_CAPABILITIES_MIGRATION,
+                )?,
+                10 => self.apply_migration(
+                    11,
+                    "reminders_memory_management_handoffs",
+                    REMINDERS_MEMORY_HANDOFFS_MIGRATION,
                 )?,
                 version => {
                     return Err(PersistenceError::new(
@@ -4621,6 +6143,37 @@ impl StateRepository {
             )
             .map_err(PersistenceError::database)?;
         Ok(())
+    }
+
+    fn reconcile_reserved_reminder_deliveries(&mut self) -> PersistenceResult<()> {
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        let changed = transaction
+            .execute(
+                "UPDATE reminder_occurrences
+                 SET status = 'uncertain',
+                     detail_code = 'NOTIFICATION_DISPATCH_INTERRUPTED',
+                     detail_message =
+                         'The application restarted after notification dispatch began; the notification was not retried.',
+                     updated_at_unix_ms = ?1
+                 WHERE status = 'reserved'",
+                [timestamp],
+            )
+            .map_err(PersistenceError::database)?;
+        if changed > 0 {
+            transaction
+                .execute(
+                    "UPDATE reminder_scheduler_meta SET revision = revision + 1
+                     WHERE singleton = 1",
+                    [],
+                )
+                .map_err(PersistenceError::database)?;
+            advance_application_revision(&transaction)?;
+        }
+        transaction.commit().map_err(PersistenceError::database)
     }
 }
 
@@ -7026,8 +8579,79 @@ fn prune_retention_rows(
     transaction: &Transaction<'_>,
     task_cutoff: Option<i64>,
     activity_cutoff: Option<i64>,
+    timestamp: i64,
 ) -> PersistenceResult<RetentionPruneCounts> {
     let mut counts = RetentionPruneCounts::default();
+    let expiring_memory_ids = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT memory.id, memory.revision FROM memory_records AS memory
+                 WHERE (memory.expires_at_unix_ms IS NOT NULL
+                        AND memory.expires_at_unix_ms <= ?1)
+                    OR (memory.retention_policy = 'task_lifetime'
+                        AND (
+                            NOT EXISTS (
+                                SELECT 1 FROM agent_tasks AS task
+                                WHERE task.owner_agent_id = memory.task_owner_agent_id
+                                  AND task.id = memory.task_id
+                            )
+                            OR EXISTS (
+                                SELECT 1 FROM agent_tasks AS task
+                                WHERE task.owner_agent_id = memory.task_owner_agent_id
+                                  AND task.id = memory.task_id
+                                  AND task.status IN ('Completed', 'Failed')
+                            )
+                        ))
+                 ORDER BY COALESCE(memory.expires_at_unix_ms, memory.updated_at_unix_ms),
+                          memory.id
+                 LIMIT ?2",
+            )
+            .map_err(PersistenceError::database)?;
+        collect_rows(
+            statement.query_map(params![timestamp, MAX_MAINTENANCE_ROWS_PER_DOMAIN], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            }),
+        )?
+    };
+    if !expiring_memory_ids.is_empty() {
+        let (memory_revision, mut next_event_id): (i64, i64) = transaction
+            .query_row(
+                "SELECT revision, next_event_id FROM structured_memory_meta
+                 WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(PersistenceError::database)?;
+        for (record_id, record_revision) in &expiring_memory_ids {
+            transaction
+                .execute(
+                    "INSERT INTO memory_events
+                     (id, record_id, action, actor_kind, record_revision,
+                      created_at_unix_ms)
+                     VALUES (?1, ?2, 'retention_deleted', 'maintenance', ?3, ?4)",
+                    params![next_event_id, record_id, record_revision, timestamp],
+                )
+                .map_err(PersistenceError::database)?;
+            transaction
+                .execute("DELETE FROM memory_records WHERE id = ?1", [record_id])
+                .map_err(PersistenceError::database)?;
+            next_event_id = next_revision(next_event_id)?;
+        }
+        counts.memory_records = i64::try_from(expiring_memory_ids.len()).map_err(|_| {
+            PersistenceError::new(
+                "MEMORY_CAPACITY_EXCEEDED",
+                "The memory retention count is outside the supported range.",
+                false,
+            )
+        })?;
+        transaction
+            .execute(
+                "UPDATE structured_memory_meta
+                 SET revision = ?1, next_event_id = ?2 WHERE singleton = 1",
+                params![next_revision(memory_revision)?, next_event_id],
+            )
+            .map_err(PersistenceError::database)?;
+    }
     if let Some(cutoff) = task_cutoff {
         counts.review_flows = transaction
             .execute(
@@ -7111,8 +8735,45 @@ fn prune_retention_rows(
                 params![cutoff, MAX_MAINTENANCE_ROWS_PER_DOMAIN],
             )
             .map_err(PersistenceError::database)? as i64;
+        counts.management_handoffs = transaction
+            .execute(
+                "DELETE FROM management_handoffs WHERE id IN (
+                     SELECT handoff.id FROM management_handoffs AS handoff
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM agent_tasks AS task
+                         WHERE task.owner_agent_id = handoff.task_owner_agent_id
+                           AND task.id = handoff.task_id
+                     )
+                     ORDER BY handoff.created_at_unix_ms DESC, handoff.id DESC
+                     LIMIT ?1
+                 )",
+                [MAX_MAINTENANCE_ROWS_PER_DOMAIN],
+            )
+            .map_err(PersistenceError::database)? as i64;
+        if counts.management_handoffs > 0 {
+            transaction
+                .execute(
+                    "UPDATE management_handoff_meta SET revision = revision + 1
+                     WHERE singleton = 1",
+                    [],
+                )
+                .map_err(PersistenceError::database)?;
+        }
     }
     if let Some(cutoff) = activity_cutoff {
+        counts.reminder_occurrences = transaction
+            .execute(
+                "DELETE FROM reminder_occurrences WHERE id IN (
+                     SELECT occurrence.id FROM reminder_occurrences AS occurrence
+                     JOIN reminders AS reminder ON reminder.id = occurrence.reminder_id
+                     WHERE reminder.status IN ('completed', 'dismissed')
+                       AND occurrence.updated_at_unix_ms < ?1
+                     ORDER BY occurrence.updated_at_unix_ms, occurrence.id
+                     LIMIT ?2
+                 )",
+                params![cutoff, MAX_MAINTENANCE_ROWS_PER_DOMAIN],
+            )
+            .map_err(PersistenceError::database)? as i64;
         counts.activity = transaction
             .execute(
                 "DELETE FROM agent_activity WHERE (owner_agent_id, id) IN (
@@ -7155,15 +8816,28 @@ fn prune_retention_rows(
             .execute(
                 "DELETE FROM reminders WHERE id IN (
                      SELECT id FROM reminders
-                     WHERE status IN ('Completed', 'Dismissed')
+                     WHERE status IN ('completed', 'dismissed')
                        AND resolved_at_unix_ms IS NOT NULL
                        AND resolved_at_unix_ms < ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM reminder_occurrences AS occurrence
+                           WHERE occurrence.reminder_id = reminders.id
+                       )
                      ORDER BY resolved_at_unix_ms, id
                      LIMIT ?2
                  )",
                 params![cutoff, MAX_MAINTENANCE_ROWS_PER_DOMAIN],
             )
             .map_err(PersistenceError::database)? as i64;
+        if counts.reminders > 0 || counts.reminder_occurrences > 0 {
+            transaction
+                .execute(
+                    "UPDATE reminder_scheduler_meta SET revision = revision + 1
+                     WHERE singleton = 1",
+                    [],
+                )
+                .map_err(PersistenceError::database)?;
+        }
         counts.system_action_audits = transaction
             .execute(
                 "DELETE FROM system_action_audits WHERE id IN (
@@ -7184,7 +8858,36 @@ fn retention_backlog_exists(
     transaction: &Transaction<'_>,
     task_cutoff: Option<i64>,
     activity_cutoff: Option<i64>,
+    timestamp: i64,
 ) -> PersistenceResult<bool> {
+    let memory_exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM memory_records AS memory
+                 WHERE (memory.expires_at_unix_ms IS NOT NULL
+                        AND memory.expires_at_unix_ms <= ?1)
+                    OR (memory.retention_policy = 'task_lifetime'
+                        AND (
+                            NOT EXISTS (
+                                SELECT 1 FROM agent_tasks AS task
+                                WHERE task.owner_agent_id = memory.task_owner_agent_id
+                                  AND task.id = memory.task_id
+                            )
+                            OR EXISTS (
+                                SELECT 1 FROM agent_tasks AS task
+                                WHERE task.owner_agent_id = memory.task_owner_agent_id
+                                  AND task.id = memory.task_id
+                                  AND task.status IN ('Completed', 'Failed')
+                            )
+                        ))
+             )",
+            [timestamp],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    if memory_exists {
+        return Ok(true);
+    }
     if let Some(cutoff) = task_cutoff {
         let exists: bool = transaction
             .query_row(
@@ -7246,6 +8949,13 @@ fn retention_backlog_exists(
                            WHERE flow.task_owner_agent_id = task.owner_agent_id
                              AND flow.task_id = task.id
                        )
+                     UNION ALL
+                     SELECT 1 FROM management_handoffs AS handoff
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM agent_tasks AS task
+                         WHERE task.owner_agent_id = handoff.task_owner_agent_id
+                           AND task.id = handoff.task_id
+                     )
                  )",
                 [cutoff],
                 |row| row.get(0),
@@ -7277,9 +8987,18 @@ fn retention_backlog_exists(
                        )
                      UNION ALL
                      SELECT 1 FROM reminders
-                     WHERE status IN ('Completed', 'Dismissed')
+                     WHERE status IN ('completed', 'dismissed')
                        AND resolved_at_unix_ms IS NOT NULL
                        AND resolved_at_unix_ms < ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM reminder_occurrences AS occurrence
+                           WHERE occurrence.reminder_id = reminders.id
+                       )
+                     UNION ALL
+                     SELECT 1 FROM reminder_occurrences AS occurrence
+                     JOIN reminders AS reminder ON reminder.id = occurrence.reminder_id
+                     WHERE reminder.status IN ('completed', 'dismissed')
+                       AND occurrence.updated_at_unix_ms < ?1
                      UNION ALL
                      SELECT 1 FROM system_action_audits
                      WHERE status IN ('taskCreated', 'applied', 'rejected', 'failed', 'uncertain')
@@ -7346,9 +9065,10 @@ fn insert_data_lifecycle_run(
               task_cutoff_unix_ms, activity_cutoff_unix_ms, pruned_tasks,
               pruned_attempts, pruned_review_flows, pruned_activity, pruned_approvals,
               pruned_reminders, pruned_system_action_audits, skipped_protected,
-              backlog_remaining, error_code, error_message)
+              backlog_remaining, error_code, error_message, pruned_memory_records,
+              pruned_reminder_occurrences, pruned_management_handoffs)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                     ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 lifecycle_revision,
                 application_state_revision,
@@ -7368,7 +9088,10 @@ fn insert_data_lifecycle_run(
                 skipped_protected,
                 backlog_remaining as i64,
                 error_code,
-                error_message
+                error_message,
+                pruned.memory_records,
+                pruned.reminder_occurrences,
+                pruned.management_handoffs,
             ],
         )
         .map_err(PersistenceError::database)?;
@@ -7472,7 +9195,8 @@ fn read_monitoring_snapshot(
                  (SELECT COUNT(*) FROM agent_activity),
                  (SELECT COUNT(*) FROM approval_requests
                   WHERE authoritative = 1 AND status = 'Pending'),
-                 (SELECT COUNT(*) FROM reminders WHERE status = 'Upcoming'),
+                 (SELECT COUNT(*) FROM reminders
+                  WHERE status IN ('scheduled', 'due', 'needs_attention')),
                  (SELECT COUNT(*) FROM run_attempts),
                  (SELECT COUNT(*) FROM run_attempts
                   WHERE status IN ('admitted', 'starting', 'dispatching', 'running',
@@ -7515,6 +9239,8 @@ fn read_monitoring_snapshot(
                     total_pruned_review_flows, total_pruned_activity,
                     total_pruned_approvals, total_pruned_reminders,
                     total_pruned_system_action_audits,
+                    total_pruned_memory_records, total_pruned_reminder_occurrences,
+                    total_pruned_management_handoffs,
                     inferred_timestamp_count
              FROM data_lifecycle_meta WHERE singleton = 1",
             [],
@@ -7535,8 +9261,11 @@ fn read_monitoring_snapshot(
                         approvals: row.get(9)?,
                         reminders: row.get(10)?,
                         system_action_audits: row.get(11)?,
+                        memory_records: row.get(12)?,
+                        reminder_occurrences: row.get(13)?,
+                        management_handoffs: row.get(14)?,
                     },
-                    inferred_timestamp_count: row.get(12)?,
+                    inferred_timestamp_count: row.get(15)?,
                     latest_run: None,
                 })
             },
@@ -7550,7 +9279,8 @@ fn read_monitoring_snapshot(
                     pruned_review_flows, pruned_activity, pruned_approvals,
                     pruned_reminders, pruned_system_action_audits,
                     skipped_protected, backlog_remaining,
-                    error_code, error_message
+                    error_code, error_message, pruned_memory_records,
+                    pruned_reminder_occurrences, pruned_management_handoffs
              FROM data_lifecycle_runs ORDER BY id DESC LIMIT 1",
             [],
             |row| {
@@ -7571,6 +9301,9 @@ fn read_monitoring_snapshot(
                         approvals: row.get(12)?,
                         reminders: row.get(13)?,
                         system_action_audits: row.get(14)?,
+                        memory_records: row.get(19)?,
+                        reminder_occurrences: row.get(20)?,
+                        management_handoffs: row.get(21)?,
                     },
                     skipped_protected: row.get(15)?,
                     backlog_remaining: row.get::<_, i64>(16)? != 0,
@@ -7628,6 +9361,29 @@ fn protect_run_owned_state(
     requested: &ApplicationState,
     timestamp: i64,
 ) -> PersistenceResult<ApplicationState> {
+    if current.reminders != requested.reminders {
+        return Err(PersistenceError::new(
+            "REMINDER_SCHEDULER_AUTHORITY_REQUIRED",
+            "Create and edit reminders through the authoritative reminder scheduler commands.",
+            true,
+        ));
+    }
+    let current_memory = current
+        .agents
+        .iter()
+        .map(|agent| (agent.id, agent.memory.as_str()))
+        .collect::<HashMap<_, _>>();
+    if requested.agents.iter().any(|agent| {
+        current_memory
+            .get(&agent.id)
+            .is_some_and(|memory| **memory != agent.memory)
+    }) {
+        return Err(PersistenceError::new(
+            "STRUCTURED_MEMORY_AUTHORITY_REQUIRED",
+            "Create and edit memory through the authoritative structured-memory commands.",
+            true,
+        ));
+    }
     let mut locked_tasks = {
         let mut statement = transaction
             .prepare(
@@ -9003,6 +10759,446 @@ fn application_meta_from(
     connection.query_meta().map_err(PersistenceError::database)
 }
 
+fn ensure_application_initialized(
+    connection: &impl DatabaseConnection,
+    operation: &str,
+) -> PersistenceResult<ApplicationMeta> {
+    let meta = application_meta_from(connection)?;
+    if !meta.initialized {
+        return Err(PersistenceError::new(
+            "APPLICATION_STATE_UNINITIALIZED",
+            format!("Application state must be initialized before {operation}."),
+            true,
+        ));
+    }
+    Ok(meta)
+}
+
+fn ensure_subsystem_revision(actual: i64, expected: i64, code: &str) -> PersistenceResult<()> {
+    if actual != expected {
+        return Err(PersistenceError::new(
+            code,
+            format!(
+                "The subsystem changed (expected revision {expected}, current revision {actual}); refresh before retrying."
+            ),
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn advance_application_revision(transaction: &Transaction<'_>) -> PersistenceResult<i64> {
+    let revision: i64 = transaction
+        .query_row(
+            "SELECT state_revision FROM application_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let revision = next_revision(revision)?;
+    transaction
+        .execute(
+            "UPDATE application_meta SET state_revision = ?1 WHERE singleton = 1",
+            [revision],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(revision)
+}
+
+fn persistence_request_fingerprint<T: Serialize>(
+    request: &T,
+    code: &str,
+) -> PersistenceResult<String> {
+    let bytes = serde_json::to_vec(request).map_err(|_| {
+        PersistenceError::new(
+            code,
+            "The mutation request could not be canonicalized.",
+            false,
+        )
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn reminder_request_is_duplicate(
+    transaction: &Transaction<'_>,
+    request_id: &str,
+    fingerprint: &str,
+) -> PersistenceResult<bool> {
+    let existing: Option<String> = transaction
+        .query_row(
+            "SELECT request_fingerprint FROM reminder_mutation_requests
+             WHERE request_id = ?1",
+            [request_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(PersistenceError::database)?;
+    match existing {
+        None => Ok(false),
+        Some(existing) if existing == fingerprint => Ok(true),
+        Some(_) => Err(PersistenceError::new(
+            "REMINDER_IDEMPOTENCY_CONFLICT",
+            "The reminder request identifier is already bound to different content.",
+            false,
+        )),
+    }
+}
+
+fn record_reminder_request(
+    transaction: &Transaction<'_>,
+    request_id: &str,
+    fingerprint: &str,
+    resulting_revision: i64,
+    item_id: Option<i64>,
+    timestamp: i64,
+) -> PersistenceResult<()> {
+    transaction
+        .execute(
+            "INSERT INTO reminder_mutation_requests
+             (request_id, request_fingerprint, resulting_revision, item_id,
+              created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                request_id,
+                fingerprint,
+                resulting_revision,
+                item_id,
+                timestamp,
+            ],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+fn memory_request_is_duplicate(
+    transaction: &Transaction<'_>,
+    request_id: &str,
+    fingerprint: &str,
+) -> PersistenceResult<bool> {
+    let existing: Option<String> = transaction
+        .query_row(
+            "SELECT request_fingerprint FROM memory_mutation_requests WHERE request_id = ?1",
+            [request_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(PersistenceError::database)?;
+    match existing {
+        None => Ok(false),
+        Some(existing) if existing == fingerprint => Ok(true),
+        Some(_) => Err(PersistenceError::new(
+            "MEMORY_IDEMPOTENCY_CONFLICT",
+            "The memory request identifier is already bound to different content.",
+            false,
+        )),
+    }
+}
+
+fn record_memory_request(
+    transaction: &Transaction<'_>,
+    request_id: &str,
+    fingerprint: &str,
+    resulting_revision: i64,
+    record_id: Option<i64>,
+    timestamp: i64,
+) -> PersistenceResult<()> {
+    transaction
+        .execute(
+            "INSERT INTO memory_mutation_requests
+             (request_id, request_fingerprint, resulting_revision, record_id,
+              created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                request_id,
+                fingerprint,
+                resulting_revision,
+                record_id,
+                timestamp,
+            ],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+fn validate_schedule_links(
+    transaction: &Transaction<'_>,
+    subject_agent_id: Option<i64>,
+    workspace_id: Option<&str>,
+    task_owner_agent_id: Option<i64>,
+    task_id: Option<i64>,
+) -> PersistenceResult<()> {
+    if let Some(agent_id) = subject_agent_id {
+        ensure_active_agent_exists(transaction, agent_id, "REMINDER_AGENT_NOT_FOUND")?;
+    }
+    if let Some(workspace_id) = workspace_id {
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = ?1)",
+                [workspace_id],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        if !exists {
+            return Err(PersistenceError::new(
+                "REMINDER_WORKSPACE_NOT_FOUND",
+                "The selected reminder workspace no longer exists.",
+                true,
+            ));
+        }
+    }
+    if let (Some(owner), Some(task)) = (task_owner_agent_id, task_id) {
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_tasks
+                 WHERE owner_agent_id = ?1 AND id = ?2)",
+                params![owner, task],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        if !exists {
+            return Err(PersistenceError::new(
+                "REMINDER_TASK_NOT_FOUND",
+                "The selected reminder task no longer exists.",
+                true,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_memory_scope_references(
+    transaction: &Transaction<'_>,
+    scope: &MemoryScopeV1,
+) -> PersistenceResult<()> {
+    match scope.kind {
+        MemoryScopeKind::Agent => ensure_active_agent_exists(
+            transaction,
+            scope.agent_id.expect("validated agent memory scope"),
+            "MEMORY_AGENT_NOT_FOUND",
+        ),
+        MemoryScopeKind::Team => {
+            let team_leader_agent_id = scope
+                .team_leader_agent_id
+                .expect("validated team memory scope");
+            let valid_manager: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM agents
+                         WHERE id = ?1 AND registry_state = 'active'
+                           AND role IN ('Supervisor', 'Team Leader', 'Senior Agent')
+                     )",
+                    [team_leader_agent_id],
+                    |row| row.get(0),
+                )
+                .map_err(PersistenceError::database)?;
+            if valid_manager {
+                Ok(())
+            } else {
+                Err(PersistenceError::new(
+                    "MEMORY_TEAM_NOT_FOUND",
+                    "Team memory requires an active Supervisor, Team Leader, or Senior Agent.",
+                    true,
+                ))
+            }
+        }
+        MemoryScopeKind::Project => {
+            let workspace_id = scope
+                .workspace_id
+                .as_deref()
+                .expect("validated project memory scope");
+            let exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = ?1)",
+                    [workspace_id],
+                    |row| row.get(0),
+                )
+                .map_err(PersistenceError::database)?;
+            if exists {
+                Ok(())
+            } else {
+                Err(PersistenceError::new(
+                    "MEMORY_PROJECT_NOT_FOUND",
+                    "The selected memory project no longer exists.",
+                    true,
+                ))
+            }
+        }
+        MemoryScopeKind::Task => {
+            let exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agent_tasks
+                     WHERE owner_agent_id = ?1 AND id = ?2)",
+                    params![
+                        scope
+                            .task_owner_agent_id
+                            .expect("validated task memory scope"),
+                        scope.task_id.expect("validated task memory scope"),
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(PersistenceError::database)?;
+            if exists {
+                Ok(())
+            } else {
+                Err(PersistenceError::new(
+                    "MEMORY_TASK_NOT_FOUND",
+                    "The selected memory task no longer exists.",
+                    true,
+                ))
+            }
+        }
+    }
+}
+
+fn ensure_active_agent_exists(
+    transaction: &Transaction<'_>,
+    agent_id: i64,
+    code: &str,
+) -> PersistenceResult<()> {
+    let exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1 AND registry_state = 'active')",
+            [agent_id],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    if exists {
+        Ok(())
+    } else {
+        Err(PersistenceError::new(
+            code,
+            "The selected active agent no longer exists.",
+            true,
+        ))
+    }
+}
+
+fn management_owner_role(role: &str) -> ManagementOwnerRole {
+    match role {
+        "Supervisor" => ManagementOwnerRole::Supervisor,
+        "Team Leader" => ManagementOwnerRole::TeamLeader,
+        "Senior Agent" => ManagementOwnerRole::Senior,
+        _ => ManagementOwnerRole::Human,
+    }
+}
+
+fn management_chain_for_agent(
+    state: &ApplicationState,
+    agent_id: i64,
+) -> PersistenceResult<Vec<i64>> {
+    let by_id = state
+        .agents
+        .iter()
+        .map(|agent| (agent.id, agent))
+        .collect::<HashMap<_, _>>();
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = by_id.get(&agent_id).and_then(|agent| agent.reports_to);
+    while let Some(manager_id) = current {
+        if !seen.insert(manager_id) {
+            return Err(PersistenceError::new(
+                "MEMORY_MANAGEMENT_CHAIN_INVALID",
+                "The stored agent reporting chain contains a cycle.",
+                false,
+            ));
+        }
+        let manager = by_id.get(&manager_id).ok_or_else(|| {
+            PersistenceError::new(
+                "MEMORY_MANAGEMENT_CHAIN_INVALID",
+                "The stored agent reporting chain references a missing manager.",
+                false,
+            )
+        })?;
+        chain.push(manager_id);
+        current = manager.reports_to;
+    }
+    Ok(chain)
+}
+
+fn insert_management_handoff(
+    transaction: &Transaction<'_>,
+    handoff: NewManagementHandoff,
+    timestamp: i64,
+) -> PersistenceResult<i64> {
+    handoff
+        .validate()
+        .map_err(|error| PersistenceError::new(error.code, error.message, false))?;
+    let payload_json = serde_json::to_string(&handoff.payload).map_err(|_| {
+        PersistenceError::new(
+            "HANDOFF_INVALID",
+            "The management handoff payload could not be serialized.",
+            false,
+        )
+    })?;
+    let existing: Option<(i64, String, String, String)> = transaction
+        .query_row(
+            "SELECT id, kind, summary, payload_json FROM management_handoffs
+             WHERE idempotency_key = ?1",
+            [handoff.idempotency_key.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(PersistenceError::database)?;
+    if let Some((id, kind, summary, payload)) = existing {
+        if kind == handoff.kind.as_storage_value()
+            && summary == handoff.summary
+            && payload == payload_json
+        {
+            return Ok(id);
+        }
+        return Err(PersistenceError::new(
+            "HANDOFF_IDEMPOTENCY_CONFLICT",
+            "The management handoff identifier is already bound to different evidence.",
+            false,
+        ));
+    }
+    let (revision, next_handoff_id): (i64, i64) = transaction
+        .query_row(
+            "SELECT revision, next_handoff_id FROM management_handoff_meta
+             WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(PersistenceError::database)?;
+    transaction
+        .execute(
+            "INSERT INTO management_handoffs
+             (id, task_owner_agent_id, task_id, kind, from_agent_id, to_agent_id,
+              owner_role, revision_round, run_attempt_id, review_flow_id,
+              review_stage_attempt_id, source_kind, summary, payload_json,
+              idempotency_key, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     ?13, ?14, ?15, ?16)",
+            params![
+                next_handoff_id,
+                handoff.task_owner_agent_id,
+                handoff.task_id,
+                handoff.kind.as_storage_value(),
+                handoff.from_agent_id,
+                handoff.to_agent_id,
+                handoff.owner_role.as_storage_value(),
+                handoff.revision_round,
+                handoff.run_attempt_id,
+                handoff.review_flow_id,
+                handoff.review_stage_attempt_id,
+                handoff.source.as_storage_value(),
+                handoff.summary,
+                payload_json,
+                handoff.idempotency_key,
+                timestamp,
+            ],
+        )
+        .map_err(PersistenceError::database)?;
+    transaction
+        .execute(
+            "UPDATE management_handoff_meta
+             SET revision = ?1, next_handoff_id = ?2 WHERE singleton = 1",
+            params![next_revision(revision)?, next_revision(next_handoff_id)?],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(next_handoff_id)
+}
+
 fn clear_application_state(
     transaction: &Transaction<'_>,
     replace_approvals: bool,
@@ -9011,11 +11207,32 @@ fn clear_application_state(
         transaction
             .execute("DELETE FROM approval_requests", [])
             .map_err(PersistenceError::database)?;
+        transaction
+            .execute_batch(
+                "DELETE FROM reminder_mutation_requests;
+                 DELETE FROM reminder_occurrences;
+                 DELETE FROM reminders;
+                 DELETE FROM memory_mutation_requests;
+                 DELETE FROM memory_events;
+                 DELETE FROM memory_records;
+                 DELETE FROM management_handoffs;
+                 UPDATE reminder_scheduler_meta
+                    SET revision = 0, next_reminder_id = 1, next_occurrence_id = 1,
+                        last_scan_at_unix_ms = NULL, last_error_code = NULL,
+                        last_error_message = NULL
+                  WHERE singleton = 1;
+                 UPDATE structured_memory_meta
+                    SET revision = 0, next_record_id = 1, next_event_id = 1
+                  WHERE singleton = 1;
+                 UPDATE management_handoff_meta
+                    SET revision = 0, next_handoff_id = 1
+                  WHERE singleton = 1;",
+            )
+            .map_err(PersistenceError::database)?;
     }
     transaction
         .execute_batch(
-            "DELETE FROM reminders;
-             DELETE FROM models;
+            "DELETE FROM models;
              DELETE FROM agents;
              DELETE FROM workspaces;
              DELETE FROM retention_settings;
@@ -9026,7 +11243,6 @@ fn clear_application_state(
 
 type ExistingTaskTimestamps = HashMap<(i64, i64), (Option<i64>, Option<i64>)>;
 type ExistingActivityTimestamps = HashMap<(i64, i64), Option<i64>>;
-type ExistingReminderTimestamps = HashMap<i64, (String, Option<i64>, Option<i64>)>;
 
 fn read_existing_task_timestamps(
     transaction: &Transaction<'_>,
@@ -9075,32 +11291,6 @@ fn read_existing_activity_timestamps(
     Ok(timestamps)
 }
 
-fn read_existing_reminder_timestamps(
-    transaction: &Transaction<'_>,
-) -> PersistenceResult<ExistingReminderTimestamps> {
-    let mut statement = transaction
-        .prepare("SELECT id, status, created_at_unix_ms, resolved_at_unix_ms FROM reminders")
-        .map_err(PersistenceError::database)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                (
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                ),
-            ))
-        })
-        .map_err(PersistenceError::database)?;
-    let mut timestamps = HashMap::new();
-    for row in rows {
-        let (id, value) = row.map_err(PersistenceError::database)?;
-        timestamps.insert(id, value);
-    }
-    Ok(timestamps)
-}
-
 fn write_application_state(
     transaction: &Transaction<'_>,
     state: &ApplicationState,
@@ -9110,16 +11300,14 @@ fn write_application_state(
 ) -> PersistenceResult<()> {
     validate_application_state(state).map_err(PersistenceError::validation)?;
     let lifecycle_timestamp = now_unix_ms()?;
-    let (existing_task_timestamps, existing_activity_timestamps, existing_reminder_timestamps) =
-        if replace_approvals {
-            (HashMap::new(), HashMap::new(), HashMap::new())
-        } else {
-            (
-                read_existing_task_timestamps(transaction)?,
-                read_existing_activity_timestamps(transaction)?,
-                read_existing_reminder_timestamps(transaction)?,
-            )
-        };
+    let (existing_task_timestamps, existing_activity_timestamps) = if replace_approvals {
+        (HashMap::new(), HashMap::new())
+    } else {
+        (
+            read_existing_task_timestamps(transaction)?,
+            read_existing_activity_timestamps(transaction)?,
+        )
+    };
     clear_application_state(transaction, replace_approvals)?;
     write_preferences(transaction, &state.preferences)?;
     transaction
@@ -9160,44 +11348,364 @@ fn write_application_state(
             write_approval_request(transaction, position, request, origin, lifecycle_timestamp)?;
         }
     }
-    for (position, reminder) in state.reminders.iter().enumerate() {
-        let existing = existing_reminder_timestamps.get(&reminder.id);
-        let created_at_unix_ms = existing.and_then(|(_, timestamp, _)| *timestamp);
-        let resolved_at_unix_ms = if matches!(reminder.status.as_str(), "Completed" | "Dismissed") {
-            existing
-                .filter(|(status, _, _)| matches!(status.as_str(), "Completed" | "Dismissed"))
-                .and_then(|(_, _, timestamp)| *timestamp)
-                .or(Some(lifecycle_timestamp))
-        } else {
-            None
+    if replace_approvals {
+        write_legacy_reminders_v11(transaction, &state.reminders, lifecycle_timestamp)?;
+        write_legacy_agent_memory_v11(
+            transaction,
+            &state.agents,
+            default_approval_origin,
+            lifecycle_timestamp,
+        )?;
+    }
+    synchronize_agent_id_allocator(transaction, state)?;
+    synchronize_task_orchestration_allocators(transaction, state)?;
+    Ok(())
+}
+
+fn write_legacy_reminders_v11(
+    transaction: &Transaction<'_>,
+    reminders: &[Reminder],
+    lifecycle_timestamp: i64,
+) -> PersistenceResult<()> {
+    for (position, reminder) in reminders.iter().enumerate() {
+        let due_at_unix_ms: Option<i64> = transaction
+            .query_row(
+                "SELECT CAST(strftime('%s', ?1) AS INTEGER) * 1000",
+                [reminder.due_at.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        let (status, issue_code, issue_message) = match reminder.status.as_str() {
+            "Completed" => ("completed", None, None),
+            "Dismissed" => ("dismissed", None, None),
+            _ if due_at_unix_ms.is_some() => ("scheduled", None, None),
+            _ => (
+                "needs_attention",
+                Some("LEGACY_DUE_AT_INVALID"),
+                Some("The imported legacy due time is invalid and must be corrected before scheduling."),
+            ),
         };
+        let created_at_unix_ms: Option<i64> = transaction
+            .query_row(
+                "SELECT CAST(strftime('%s', ?1) AS INTEGER) * 1000",
+                [reminder.created_at.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        let resolved_at_unix_ms =
+            matches!(status, "completed" | "dismissed").then_some(lifecycle_timestamp);
         transaction
             .execute(
                 "INSERT INTO reminders
-                 (id, position, title, notes, due_at, status, agent_id, task_id, created_at,
-                  created_at_unix_ms, resolved_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-                         COALESCE(?10, CAST(strftime('%s', ?9) AS INTEGER) * 1000, ?11), ?12)",
+                 (id, position, revision, kind, title, notes, local_due_at, time_zone,
+                  due_at, due_at_unix_ms, dst_resolution, status, recurrence_kind,
+                  recurrence_interval, next_occurrence_sequence, missed_occurrence_count,
+                  delivery_mode, privacy_mode, subject_agent_id, task_owner_agent_id,
+                  task_id, scheduler_agent_id, schedule_issue_code, schedule_issue_message,
+                  created_at, created_at_unix_ms, resolved_at_unix_ms, updated_at_unix_ms)
+                 VALUES
+                 (?1, ?2, 1, 'reminder', ?3, ?4,
+                  CASE WHEN ?6 IS NULL THEN ?5
+                       ELSE strftime('%Y-%m-%dT%H:%M:%S', ?5) END,
+                  'UTC', ?5, ?6,
+                  CASE WHEN ?6 IS NULL THEN 'unresolved' ELSE 'exact' END,
+                  ?7, 'none', 1, 0, 0, 'in_app', 'generic', ?8,
+                  CASE WHEN ?8 IS NOT NULL AND ?9 IS NOT NULL THEN ?8 END,
+                  CASE WHEN ?8 IS NOT NULL THEN ?9 END,
+                  (SELECT id FROM agents WHERE template_key = 'event-reminder'
+                   ORDER BY id LIMIT 1),
+                  ?10, ?11, ?12, COALESCE(?13, ?14), ?15, ?14)",
                 params![
                     reminder.id,
                     position as i64,
                     reminder.title,
                     reminder.notes,
                     reminder.due_at,
-                    reminder.status,
+                    due_at_unix_ms,
+                    status,
                     reminder.agent_id,
                     reminder.task_id,
+                    issue_code,
+                    issue_message,
                     reminder.created_at,
                     created_at_unix_ms,
                     lifecycle_timestamp,
-                    resolved_at_unix_ms
+                    resolved_at_unix_ms,
                 ],
             )
             .map_err(PersistenceError::database)?;
     }
-    synchronize_agent_id_allocator(transaction, state)?;
-    synchronize_task_orchestration_allocators(transaction, state)?;
+    let next_id = reminders
+        .iter()
+        .map(|reminder| reminder.id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| {
+            PersistenceError::new(
+                "REMINDER_CAPACITY_EXCEEDED",
+                "The reminder identifier allocator is exhausted.",
+                false,
+            )
+        })?;
+    transaction
+        .execute(
+            "UPDATE reminder_scheduler_meta SET next_reminder_id = ?1 WHERE singleton = 1",
+            [next_id.max(1)],
+        )
+        .map_err(PersistenceError::database)?;
     Ok(())
+}
+
+fn write_legacy_agent_memory_v11(
+    transaction: &Transaction<'_>,
+    agents: &[Agent],
+    source: &str,
+    lifecycle_timestamp: i64,
+) -> PersistenceResult<()> {
+    let provenance = if source.starts_with("backup") {
+        "backup_import"
+    } else {
+        "legacy_agent_memory"
+    };
+    let mut next_id = 1_i64;
+    for agent in agents
+        .iter()
+        .filter(|agent| !agent.memory.trim().is_empty())
+    {
+        transaction
+            .execute(
+                "INSERT INTO memory_records
+                 (id, scope_kind, agent_id, record_kind, content, provenance_kind,
+                  provenance_ref, revision, retention_policy, created_at_unix_ms,
+                  updated_at_unix_ms)
+                 VALUES (?1, 'agent', ?2, 'instruction', ?3, ?4, ?5, 1, 'manual', ?6, ?6)",
+                params![
+                    next_id,
+                    agent.id,
+                    agent.memory,
+                    provenance,
+                    source,
+                    lifecycle_timestamp,
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction
+            .execute(
+                "INSERT INTO memory_events
+                 (id, record_id, action, actor_kind, record_revision, created_at_unix_ms)
+                 VALUES (?1, ?1, 'created', ?2, 1, ?3)",
+                params![
+                    next_id,
+                    if provenance == "backup_import" {
+                        "import"
+                    } else {
+                        "migration"
+                    },
+                    lifecycle_timestamp,
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        next_id = next_revision(next_id)?;
+    }
+    transaction
+        .execute(
+            "UPDATE structured_memory_meta
+             SET next_record_id = ?1, next_event_id = ?1
+             WHERE singleton = 1",
+            [next_id],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+fn write_portable_task18_domains(
+    transaction: &Transaction<'_>,
+    scheduled_items: &[ScheduledItemV1],
+    memory_records: &[MemoryRecordV1],
+    timestamp: i64,
+) -> PersistenceResult<()> {
+    for (position, item) in scheduled_items.iter().enumerate() {
+        let subject_agent_id = match item.subject_agent_id {
+            Some(id) if database_agent_exists(transaction, id)? => Some(id),
+            _ => None,
+        };
+        let workspace_id = match item.workspace_id.as_deref() {
+            Some(id)
+                if transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = ?1)",
+                        [id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(PersistenceError::database)? =>
+            {
+                Some(id)
+            }
+            _ => None,
+        };
+        let task_link_valid = match (item.task_owner_agent_id, item.task_id) {
+            (Some(owner), Some(task)) => transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agent_tasks
+                     WHERE owner_agent_id = ?1 AND id = ?2)",
+                    params![owner, task],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(PersistenceError::database)?,
+            _ => false,
+        };
+        transaction
+            .execute(
+                "INSERT INTO reminders
+                 (id, position, revision, kind, title, notes, local_due_at, time_zone,
+                  due_at, due_at_unix_ms, event_end_local, event_end_unix_ms,
+                  dst_resolution, status, recurrence_kind, recurrence_interval,
+                  recurrence_limit, recurrence_until_unix_ms, next_occurrence_sequence,
+                  missed_occurrence_count, delivery_mode, privacy_mode,
+                  subject_agent_id, workspace_id, task_owner_agent_id, task_id,
+                  scheduler_agent_id, schedule_issue_code, schedule_issue_message,
+                  created_at, created_at_unix_ms, resolved_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, 'in_app', ?21,
+                         ?22, ?23, ?24, ?25,
+                         (SELECT id FROM agents WHERE template_key = 'event-reminder'
+                          AND registry_state = 'active' ORDER BY id LIMIT 1),
+                         ?26, ?27, ?28, ?29, ?30, ?31)",
+                params![
+                    item.id,
+                    position as i64,
+                    item.revision,
+                    item.kind.as_storage_value(),
+                    item.title,
+                    item.notes,
+                    item.local_due_at,
+                    item.time_zone,
+                    item.due_at,
+                    item.due_at_unix_ms,
+                    item.event_end_local,
+                    item.event_end_unix_ms,
+                    item.dst_resolution.as_storage_value(),
+                    item.status.as_storage_value(),
+                    item.recurrence.kind.as_storage_value(),
+                    item.recurrence.interval,
+                    item.recurrence.occurrence_limit,
+                    item.recurrence.until_unix_ms,
+                    item.next_occurrence_sequence,
+                    item.missed_occurrence_count,
+                    item.privacy_mode.as_storage_value(),
+                    subject_agent_id,
+                    workspace_id,
+                    task_link_valid
+                        .then_some(item.task_owner_agent_id)
+                        .flatten(),
+                    task_link_valid.then_some(item.task_id).flatten(),
+                    item.schedule_issue_code,
+                    item.schedule_issue_message,
+                    item.created_at,
+                    item.created_at_unix_ms,
+                    item.resolved_at_unix_ms,
+                    item.updated_at_unix_ms,
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+    }
+    let next_reminder_id = scheduled_items
+        .iter()
+        .map(|item| item.id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| {
+            PersistenceError::new(
+                "REMINDER_CAPACITY_EXCEEDED",
+                "The imported reminder identifier allocator is exhausted.",
+                false,
+            )
+        })?
+        .max(1);
+    transaction
+        .execute(
+            "UPDATE reminder_scheduler_meta SET next_reminder_id = ?1 WHERE singleton = 1",
+            [next_reminder_id],
+        )
+        .map_err(PersistenceError::database)?;
+
+    let mut next_event_id = 1_i64;
+    for record in memory_records {
+        // Portable memory retains exact historical scope identifiers even when the
+        // referenced agent, project, or task is no longer active. New records still
+        // require live references, and prompt selection cannot match an absent scope.
+        transaction
+            .execute(
+                "INSERT INTO memory_records
+                 (id, scope_kind, agent_id, workspace_id, task_owner_agent_id, task_id,
+                  team_leader_agent_id, record_kind, content, provenance_kind,
+                  provenance_ref, revision, retention_policy, expires_at_unix_ms,
+                  created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'backup_import',
+                         ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    record.id,
+                    record.scope.kind.as_storage_value(),
+                    record.scope.agent_id,
+                    record.scope.workspace_id,
+                    record.scope.task_owner_agent_id,
+                    record.scope.task_id,
+                    record.scope.team_leader_agent_id,
+                    record.kind.as_storage_value(),
+                    record.content,
+                    format!("backup-v4:{}", record.provenance.as_storage_value()),
+                    record.revision,
+                    record.retention.as_storage_value(),
+                    record.expires_at_unix_ms,
+                    record.created_at_unix_ms,
+                    record.updated_at_unix_ms,
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction
+            .execute(
+                "INSERT INTO memory_events
+                 (id, record_id, action, actor_kind, record_revision, created_at_unix_ms)
+                 VALUES (?1, ?2, 'created', 'import', ?3, ?4)",
+                params![next_event_id, record.id, record.revision, timestamp],
+            )
+            .map_err(PersistenceError::database)?;
+        next_event_id = next_revision(next_event_id)?;
+    }
+    let next_record_id = memory_records
+        .iter()
+        .map(|record| record.id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| {
+            PersistenceError::new(
+                "MEMORY_CAPACITY_EXCEEDED",
+                "The imported memory identifier allocator is exhausted.",
+                false,
+            )
+        })?
+        .max(1);
+    transaction
+        .execute(
+            "UPDATE structured_memory_meta
+             SET next_record_id = ?1, next_event_id = ?2 WHERE singleton = 1",
+            params![next_record_id, next_event_id],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+fn database_agent_exists(connection: &Connection, agent_id: i64) -> PersistenceResult<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+            [agent_id],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)
 }
 
 fn write_preferences(
@@ -9309,7 +11817,7 @@ fn write_agent(
                 agent.reports_to,
                 agent.authority_level,
                 agent.model,
-                agent.memory,
+                "",
                 agent.performance.strength,
                 agent.performance.focus,
                 agent.performance.cpu_limit,
@@ -9659,7 +12167,7 @@ fn read_agents(connection: &Connection) -> PersistenceResult<Vec<Agent>> {
                 reports_to: row.get(10)?,
                 authority_level: row.get(11)?,
                 model: row.get(12)?,
-                memory: row.get(13)?,
+                memory: String::new(),
                 tasks: Vec::new(),
                 activity: Vec::new(),
                 performance: AgentPerformance {
@@ -9926,10 +12434,310 @@ fn read_approval_scopes(
     collect_rows(statement.query_map([approval_id], |row| row.get(0)))
 }
 
+fn read_reminder_scheduler_snapshot(
+    connection: &Connection,
+) -> PersistenceResult<ReminderSchedulerSnapshot> {
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM reminder_scheduler_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let application_state_revision: i64 = connection
+        .query_row(
+            "SELECT state_revision FROM application_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, position, revision, kind, title, notes, local_due_at, time_zone,
+                    due_at, due_at_unix_ms, event_end_local, event_end_unix_ms,
+                    dst_resolution, status, recurrence_kind, recurrence_interval,
+                    recurrence_limit, recurrence_until_unix_ms, next_occurrence_sequence,
+                    missed_occurrence_count, delivery_mode, privacy_mode, schedule_fingerprint,
+                    subject_agent_id, workspace_id, task_owner_agent_id, task_id,
+                    scheduler_agent_id, schedule_issue_code, schedule_issue_message,
+                    created_at, created_at_unix_ms, resolved_at_unix_ms, updated_at_unix_ms
+             FROM reminders ORDER BY position, id",
+        )
+        .map_err(PersistenceError::database)?;
+    let items = collect_rows(statement.query_map([], |row| {
+        let kind: String = row.get(3)?;
+        let dst_resolution: String = row.get(12)?;
+        let status: String = row.get(13)?;
+        let recurrence_kind: String = row.get(14)?;
+        let delivery_mode: String = row.get(20)?;
+        let privacy_mode: String = row.get(21)?;
+        Ok(ScheduledItemV1 {
+            id: row.get(0)?,
+            position: row.get(1)?,
+            revision: row.get(2)?,
+            kind: ScheduledItemKind::from_storage_value(&kind)
+                .map_err(|error| sql_text_conversion_error(3, error))?,
+            title: row.get(4)?,
+            notes: row.get(5)?,
+            local_due_at: row.get(6)?,
+            time_zone: row.get(7)?,
+            due_at: row.get(8)?,
+            due_at_unix_ms: row.get(9)?,
+            event_end_local: row.get(10)?,
+            event_end_unix_ms: row.get(11)?,
+            dst_resolution: DstResolution::from_storage_value(&dst_resolution)
+                .map_err(|error| sql_text_conversion_error(12, error))?,
+            status: ScheduleStatus::from_storage_value(&status)
+                .map_err(|error| sql_text_conversion_error(13, error))?,
+            recurrence: RecurrenceRuleV1 {
+                kind: RecurrenceKind::from_storage_value(&recurrence_kind)
+                    .map_err(|error| sql_text_conversion_error(14, error))?,
+                interval: row.get(15)?,
+                occurrence_limit: row.get(16)?,
+                until_unix_ms: row.get(17)?,
+            },
+            next_occurrence_sequence: row.get(18)?,
+            missed_occurrence_count: row.get(19)?,
+            delivery_mode: DeliveryMode::from_storage_value(&delivery_mode)
+                .map_err(|error| sql_text_conversion_error(20, error))?,
+            privacy_mode: PrivacyMode::from_storage_value(&privacy_mode)
+                .map_err(|error| sql_text_conversion_error(21, error))?,
+            schedule_fingerprint: row.get(22)?,
+            subject_agent_id: row.get(23)?,
+            workspace_id: row.get(24)?,
+            task_owner_agent_id: row.get(25)?,
+            task_id: row.get(26)?,
+            scheduler_agent_id: row.get(27)?,
+            schedule_issue_code: row.get(28)?,
+            schedule_issue_message: row.get(29)?,
+            created_at: row.get(30)?,
+            created_at_unix_ms: row.get(31)?,
+            resolved_at_unix_ms: row.get(32)?,
+            updated_at_unix_ms: row.get(33)?,
+        })
+    }))?;
+    if items.len() > MAX_SCHEDULED_ITEMS {
+        return Err(PersistenceError::new(
+            "REMINDER_STORAGE_INVALID",
+            "The stored reminder count exceeds the supported limit.",
+            false,
+        ));
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT id, reminder_id, schedule_revision, occurrence_sequence, occurrence_key,
+                    due_at_unix_ms, status, missed_count, first_missed_at_unix_ms,
+                    last_missed_at_unix_ms, detail_code, detail_message,
+                    created_at_unix_ms, updated_at_unix_ms
+             FROM reminder_occurrences ORDER BY updated_at_unix_ms DESC, id DESC LIMIT 500",
+        )
+        .map_err(PersistenceError::database)?;
+    let recent_occurrences = collect_rows(statement.query_map([], |row| {
+        Ok(ReminderOccurrenceV1 {
+            id: row.get(0)?,
+            reminder_id: row.get(1)?,
+            schedule_revision: row.get(2)?,
+            occurrence_sequence: row.get(3)?,
+            occurrence_key: row.get(4)?,
+            due_at_unix_ms: row.get(5)?,
+            status: row.get(6)?,
+            missed_count: row.get(7)?,
+            first_missed_at_unix_ms: row.get(8)?,
+            last_missed_at_unix_ms: row.get(9)?,
+            detail_code: row.get(10)?,
+            detail_message: row.get(11)?,
+            created_at_unix_ms: row.get(12)?,
+            updated_at_unix_ms: row.get(13)?,
+        })
+    }))?;
+    Ok(ReminderSchedulerSnapshot {
+        revision,
+        application_state_revision,
+        system_time_zone: system_time_zone_name(),
+        items,
+        recent_occurrences,
+    })
+}
+
+fn read_structured_memory_snapshot(
+    connection: &Connection,
+) -> PersistenceResult<StructuredMemorySnapshot> {
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM structured_memory_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let application_state_revision: i64 = connection
+        .query_row(
+            "SELECT state_revision FROM application_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, scope_kind, agent_id, workspace_id, task_owner_agent_id, task_id,
+                    team_leader_agent_id, record_kind, content, provenance_kind,
+                    provenance_ref, revision, retention_policy, expires_at_unix_ms,
+                    created_at_unix_ms, updated_at_unix_ms
+             FROM memory_records ORDER BY updated_at_unix_ms DESC, id DESC",
+        )
+        .map_err(PersistenceError::database)?;
+    let records = collect_rows(statement.query_map([], |row| {
+        let scope_kind: String = row.get(1)?;
+        let record_kind: String = row.get(7)?;
+        let provenance: String = row.get(9)?;
+        let retention: String = row.get(12)?;
+        let record = MemoryRecordV1 {
+            id: row.get(0)?,
+            scope: MemoryScopeV1 {
+                kind: MemoryScopeKind::from_storage_value(&scope_kind)
+                    .map_err(|error| sql_text_conversion_error(1, error))?,
+                agent_id: row.get(2)?,
+                workspace_id: row.get(3)?,
+                task_owner_agent_id: row.get(4)?,
+                task_id: row.get(5)?,
+                team_leader_agent_id: row.get(6)?,
+            },
+            kind: MemoryRecordKind::from_storage_value(&record_kind)
+                .map_err(|error| sql_text_conversion_error(7, error))?,
+            content: row.get(8)?,
+            provenance: MemoryProvenanceKind::from_storage_value(&provenance)
+                .map_err(|error| sql_text_conversion_error(9, error))?,
+            provenance_ref: row.get(10)?,
+            revision: row.get(11)?,
+            retention: MemoryRetentionPolicy::from_storage_value(&retention)
+                .map_err(|error| sql_text_conversion_error(12, error))?,
+            expires_at_unix_ms: row.get(13)?,
+            created_at_unix_ms: row.get(14)?,
+            updated_at_unix_ms: row.get(15)?,
+        };
+        crate::structured_memory::validate_memory_record(&record)
+            .map_err(|error| sql_text_conversion_error(8, error))?;
+        Ok(record)
+    }))?;
+    if records.len() > MAX_MEMORY_RECORDS {
+        return Err(PersistenceError::new(
+            "MEMORY_STORAGE_INVALID",
+            "The stored memory count exceeds the supported limit.",
+            false,
+        ));
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT id, record_id, action, actor_kind, record_revision, created_at_unix_ms
+             FROM memory_events ORDER BY created_at_unix_ms DESC, id DESC LIMIT 500",
+        )
+        .map_err(PersistenceError::database)?;
+    let recent_events = collect_rows(statement.query_map([], |row| {
+        Ok(MemoryEventV1 {
+            id: row.get(0)?,
+            record_id: row.get(1)?,
+            action: row.get(2)?,
+            actor_kind: row.get(3)?,
+            record_revision: row.get(4)?,
+            created_at_unix_ms: row.get(5)?,
+        })
+    }))?;
+    Ok(StructuredMemorySnapshot {
+        revision,
+        application_state_revision,
+        records,
+        recent_events,
+    })
+}
+
+fn read_management_handoff_snapshot(
+    connection: &Connection,
+) -> PersistenceResult<ManagementHandoffSnapshot> {
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM management_handoff_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let application_state_revision: i64 = connection
+        .query_row(
+            "SELECT state_revision FROM application_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, task_owner_agent_id, task_id, kind, from_agent_id, to_agent_id,
+                    owner_role, revision_round, run_attempt_id, review_flow_id,
+                    review_stage_attempt_id, source_kind, summary, payload_json,
+                    idempotency_key, created_at_unix_ms
+             FROM management_handoffs ORDER BY created_at_unix_ms, id",
+        )
+        .map_err(PersistenceError::database)?;
+    let handoffs = collect_rows(statement.query_map([], |row| {
+        let kind: String = row.get(3)?;
+        let role: String = row.get(6)?;
+        let source: String = row.get(11)?;
+        let payload_json: String = row.get(13)?;
+        let payload = serde_json::from_str(&payload_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        let handoff = ManagementHandoffV1 {
+            id: row.get(0)?,
+            task_owner_agent_id: row.get(1)?,
+            task_id: row.get(2)?,
+            kind: ManagementHandoffKind::from_storage_value(&kind)
+                .map_err(|error| sql_text_conversion_error(3, error))?,
+            from_agent_id: row.get(4)?,
+            to_agent_id: row.get(5)?,
+            owner_role: ManagementOwnerRole::from_storage_value(&role)
+                .map_err(|error| sql_text_conversion_error(6, error))?,
+            revision_round: row.get(7)?,
+            run_attempt_id: row.get(8)?,
+            review_flow_id: row.get(9)?,
+            review_stage_attempt_id: row.get(10)?,
+            source: ManagementHandoffSource::from_storage_value(&source)
+                .map_err(|error| sql_text_conversion_error(11, error))?,
+            summary: row.get(12)?,
+            payload,
+            idempotency_key: row.get(14)?,
+            created_at_unix_ms: row.get(15)?,
+        };
+        crate::management_handoffs::validate_handoff(&handoff)
+            .map_err(|error| sql_text_conversion_error(13, error))?;
+        Ok(handoff)
+    }))?;
+    crate::management_handoffs::validate_sequential_handoffs(&handoffs)
+        .map_err(|error| PersistenceError::new(error.code, error.message, false))?;
+    Ok(ManagementHandoffSnapshot {
+        revision,
+        application_state_revision,
+        handoffs,
+    })
+}
+
+fn sql_text_conversion_error(
+    index: usize,
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(error))
+}
+
 fn read_reminders(connection: &Connection) -> PersistenceResult<Vec<Reminder>> {
     let mut statement = connection
         .prepare(
-            "SELECT id, title, notes, due_at, status, agent_id, task_id, created_at
+            "SELECT id, title, notes, due_at,
+                    CASE status
+                        WHEN 'completed' THEN 'Completed'
+                        WHEN 'dismissed' THEN 'Dismissed'
+                        ELSE 'Upcoming'
+                    END,
+                    subject_agent_id, task_id, created_at
              FROM reminders ORDER BY position",
         )
         .map_err(PersistenceError::database)?;
@@ -10144,6 +12952,60 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn schema_ten_repository(path: &Path) -> StateRepository {
+        prepare_private_database_file(path).unwrap();
+        let connection = Connection::open(path).unwrap();
+        let mut repository = StateRepository { connection };
+        repository.configure_connection_preflight().unwrap();
+        repository.configure_write_durability(false).unwrap();
+        for (version, name, migration) in [
+            (1, "initial_application_state", INITIAL_MIGRATION),
+            (
+                2,
+                "authoritative_approval_lifecycle",
+                AUTHORIZATION_MIGRATION,
+            ),
+            (
+                3,
+                "authoritative_run_coordination",
+                RUN_COORDINATION_MIGRATION,
+            ),
+            (4, "dynamic_agent_registry", AGENT_REGISTRY_MIGRATION),
+            (
+                5,
+                "authoritative_task_orchestration",
+                TASK_ORCHESTRATION_MIGRATION,
+            ),
+            (
+                6,
+                "structured_review_orchestration",
+                REVIEW_ORCHESTRATION_MIGRATION,
+            ),
+            (
+                7,
+                "structured_workspace_evidence",
+                WORKSPACE_EVIDENCE_MIGRATION,
+            ),
+            (8, "data_lifecycle_and_monitoring", DATA_LIFECYCLE_MIGRATION),
+            (
+                9,
+                "system_action_policy_gateway",
+                SYSTEM_ACTION_GATEWAY_MIGRATION,
+            ),
+            (
+                10,
+                "bounded_specialist_capabilities",
+                SPECIALIST_CAPABILITIES_MIGRATION,
+            ),
+        ] {
+            repository
+                .apply_migration(version, name, migration)
+                .unwrap();
+        }
+        assert_eq!(repository.schema_version().unwrap(), 10);
+        repository
     }
 
     fn legacy_renderer_state(state: &ApplicationState) -> LegacyRendererState {
@@ -10398,7 +13260,8 @@ mod tests {
                     (7, "structured_workspace_evidence".to_string()),
                     (8, "data_lifecycle_and_monitoring".to_string()),
                     (9, "system_action_policy_gateway".to_string()),
-                    (10, "bounded_specialist_capabilities".to_string())
+                    (10, "bounded_specialist_capabilities".to_string()),
+                    (11, "reminders_memory_management_handoffs".to_string())
                 ]
             );
             let journal_mode: String = repository
@@ -10425,6 +13288,595 @@ mod tests {
         let reopened = repository.load().unwrap().expect("state should exist");
         assert_eq!(reopened.revision, 1);
         assert_eq!(reopened.state, expected);
+    }
+
+    fn task_0018_schedule_request(
+        request_id: &str,
+        delivery_mode: DeliveryMode,
+        recurrence: RecurrenceRuleV1,
+    ) -> CreateScheduledItemRequest {
+        CreateScheduledItemRequest {
+            expected_revision: 0,
+            request_id: request_id.to_string(),
+            kind: ScheduledItemKind::Reminder,
+            title: "Inspect the deterministic reminder".to_string(),
+            notes: "No model run is attached to this schedule.".to_string(),
+            local_due_at: "2026-08-28T12:00:00".to_string(),
+            time_zone: "UTC".to_string(),
+            event_end_local: None,
+            recurrence,
+            delivery_mode,
+            privacy_mode: PrivacyMode::Title,
+            subject_agent_id: Some(8),
+            workspace_id: None,
+            task_owner_agent_id: None,
+            task_id: None,
+        }
+    }
+
+    #[test]
+    fn task_0018_schema_ten_migrates_legacy_reminders_memory_and_task_plans_once() {
+        let directory = TestDirectory::new();
+        let path = directory.database_path();
+        let legacy_memory = "Preserve this exact legacy instruction.\nSecond line.";
+        {
+            let mut repository = schema_ten_repository(&path);
+            let mut state = authorization_state();
+            state.agents[1].memory = legacy_memory.to_string();
+            let transaction = repository
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            write_application_state(&transaction, &state, "fresh", &HashMap::new(), false).unwrap();
+            transaction
+                .execute(
+                    "UPDATE agents SET memory = ?1 WHERE id = 2",
+                    [legacy_memory],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO reminders
+                     (id, position, title, notes, due_at, status, agent_id, task_id,
+                      created_at, created_at_unix_ms, resolved_at_unix_ms)
+                     VALUES (91, 0, 'Legacy local follow-up', 'Preserve legacy notes',
+                             '2026-09-03T14:30:00.000Z', 'Upcoming', 2, 41,
+                             '2026-08-28T10:00:00.000Z', 1787911200000, NULL)",
+                    [],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "UPDATE application_meta
+                     SET initialized = 1, state_revision = 7, source_kind = 'fresh'
+                     WHERE singleton = 1",
+                    [],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        {
+            let mut migrated = StateRepository::open(&path).unwrap();
+            assert_eq!(migrated.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+            let state = migrated.load().unwrap().unwrap().state;
+            assert!(state.agents.iter().all(|agent| agent.memory.is_empty()));
+
+            let memory = migrated.structured_memory_snapshot().unwrap();
+            assert_eq!(memory.records.len(), 1);
+            assert_eq!(memory.records[0].content, legacy_memory);
+            assert_eq!(memory.records[0].scope, MemoryScopeV1::agent(2));
+            assert_eq!(
+                memory.records[0].provenance,
+                MemoryProvenanceKind::LegacyAgentMemory
+            );
+
+            let reminders = migrated.reminder_scheduler_snapshot().unwrap();
+            assert_eq!(reminders.items.len(), 1);
+            assert_eq!(reminders.items[0].title, "Legacy local follow-up");
+            assert_eq!(reminders.items[0].notes, "Preserve legacy notes");
+            assert_eq!(reminders.items[0].local_due_at, "2026-09-03T14:30:00");
+            assert_eq!(reminders.items[0].time_zone, "UTC");
+            assert_eq!(reminders.items[0].delivery_mode, DeliveryMode::InApp);
+            assert_eq!(reminders.items[0].task_owner_agent_id, Some(2));
+            assert_eq!(reminders.items[0].task_id, Some(41));
+
+            let handoffs = migrated.management_handoff_snapshot().unwrap();
+            assert_eq!(handoffs.handoffs.len(), 2);
+            assert_eq!(handoffs.handoffs[0].kind, ManagementHandoffKind::TaskPlan);
+            assert_eq!(
+                handoffs.handoffs[0].source,
+                ManagementHandoffSource::MigrationV11
+            );
+            assert_eq!(handoffs.handoffs[0].payload["historical"], true);
+            assert_eq!(handoffs.handoffs[1].kind, ManagementHandoffKind::Assignment);
+            assert_eq!(handoffs.handoffs[1].payload["assignedAgentId"], 2);
+            assert_eq!(migrated.export_backup().unwrap().counts.reminders, 1);
+        }
+
+        let mut reopened = StateRepository::open(&path).unwrap();
+        assert_eq!(
+            reopened.structured_memory_snapshot().unwrap().records.len(),
+            1
+        );
+        assert_eq!(
+            reopened.reminder_scheduler_snapshot().unwrap().items.len(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .management_handoff_snapshot()
+                .unwrap()
+                .handoffs
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn task_0018_reminder_scheduler_is_authoritative_restart_safe_and_model_passive() {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        repository.initialize_fresh().unwrap();
+        let request = task_0018_schedule_request(
+            "task-0018-reminder-create",
+            DeliveryMode::Portal,
+            RecurrenceRuleV1 {
+                kind: RecurrenceKind::Daily,
+                interval: 1,
+                occurrence_limit: Some(3),
+                until_unix_ms: None,
+            },
+        );
+        let created = repository.create_scheduled_item(request.clone()).unwrap();
+        assert_eq!(created.revision, 1);
+        assert_eq!(created.items.len(), 1);
+        let duplicate = repository.create_scheduled_item(request).unwrap();
+        assert_eq!(duplicate.revision, 1);
+        assert_eq!(duplicate.items.len(), 1);
+        let (authorization_kind, approval_id, policy_fingerprint): (String, Option<i64>, String) =
+            repository
+                .connection
+                .query_row(
+                    "SELECT authorization_kind, approval_id, authorization_policy_fingerprint
+                 FROM reminders WHERE id = ?1",
+                    [created.items[0].id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(authorization_kind, "policy_allow");
+        assert_eq!(approval_id, None);
+        assert_eq!(policy_fingerprint.len(), 64);
+
+        let due = crate::reminder_scheduler::resolve_local_due_at("2026-08-28T12:00:00", "UTC")
+            .unwrap()
+            .due_at_unix_ms;
+        let jobs = repository
+            .scan_due_reminders(due + 2 * 24 * 60 * 60 * 1000)
+            .unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(
+            repository
+                .connection
+                .query_row("SELECT COUNT(*) FROM run_attempts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        repository
+            .finish_reminder_delivery(jobs[0].occurrence_id, true, None)
+            .unwrap();
+        repository.reconcile_reserved_reminder_deliveries().unwrap();
+        let snapshot = repository.reminder_scheduler_snapshot().unwrap();
+        assert_eq!(snapshot.items[0].status, ScheduleStatus::Due);
+        assert_eq!(snapshot.items[0].missed_occurrence_count, 2);
+        assert_eq!(
+            snapshot
+                .recent_occurrences
+                .iter()
+                .filter(|occurrence| occurrence.status == "portal_accepted")
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .recent_occurrences
+                .iter()
+                .filter(|occurrence| occurrence.status == "uncertain")
+                .count(),
+            2
+        );
+        assert!(repository
+            .scan_due_reminders(due + 3 * 24 * 60 * 60 * 1000)
+            .unwrap()
+            .is_empty());
+
+        let envelope = repository.load().unwrap().unwrap();
+        let mut forged = envelope.state;
+        forged.reminders[0].title = "Renderer-forged title".to_string();
+        assert_eq!(
+            repository
+                .save(envelope.revision, &forged, true)
+                .unwrap_err()
+                .code,
+            "REMINDER_SCHEDULER_AUTHORITY_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn task_0018_unrepresentable_next_recurrence_is_held_with_evidence() {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        repository.initialize_fresh().unwrap();
+        let mut request = task_0018_schedule_request(
+            "task-0018-recurrence-boundary",
+            DeliveryMode::InApp,
+            RecurrenceRuleV1 {
+                kind: RecurrenceKind::Daily,
+                interval: 366,
+                occurrence_limit: None,
+                until_unix_ms: None,
+            },
+        );
+        request.local_due_at = "9999-01-01T12:00:00".to_string();
+        let created = repository.create_scheduled_item(request).unwrap();
+        let due = created.items[0].due_at_unix_ms.unwrap();
+
+        assert!(repository.scan_due_reminders(due).unwrap().is_empty());
+        let snapshot = repository.reminder_scheduler_snapshot().unwrap();
+        assert_eq!(snapshot.items[0].status, ScheduleStatus::NeedsAttention);
+        assert_eq!(snapshot.items[0].next_occurrence_sequence, 1);
+        assert_eq!(
+            snapshot.items[0].schedule_issue_code.as_deref(),
+            Some("REMINDER_RECURRENCE_INVALID")
+        );
+        assert_eq!(snapshot.recent_occurrences.len(), 1);
+        assert_eq!(snapshot.recent_occurrences[0].status, "in_app_due");
+        let backup = repository.export_backup().unwrap();
+        assert_eq!(backup.counts.reminders, 1);
+    }
+
+    #[test]
+    fn task_0018_memory_mutations_are_scoped_revised_deletable_and_run_exact() {
+        let (mut repository, task_id) = task_0011_repository();
+        let records = [
+            (MemoryScopeV1::agent(2), "agent-two-only"),
+            (MemoryScopeV1::agent(3), "wrong-agent-secret"),
+            (MemoryScopeV1::project("workspace-1"), "project-one-only"),
+            (MemoryScopeV1::task(2, task_id), "task-only"),
+            (MemoryScopeV1::team(6), "team-chain-only"),
+        ];
+        let mut snapshot = repository.structured_memory_snapshot().unwrap();
+        for (index, (scope, content)) in records.into_iter().enumerate() {
+            snapshot = repository
+                .create_memory_record(CreateMemoryRecordRequest {
+                    expected_revision: snapshot.revision,
+                    request_id: format!("task-0018-memory-create-{index}"),
+                    scope,
+                    kind: MemoryRecordKind::Instruction,
+                    content: content.to_string(),
+                    retention: MemoryRetentionPolicy::Manual,
+                })
+                .unwrap();
+        }
+        assert_eq!(snapshot.records.len(), 5);
+        let editable = snapshot
+            .records
+            .iter()
+            .find(|record| record.content == "agent-two-only")
+            .unwrap()
+            .clone();
+        let updated = repository
+            .update_memory_record(UpdateMemoryRecordRequest {
+                expected_revision: snapshot.revision,
+                expected_record_revision: editable.revision,
+                request_id: "task-0018-memory-update".to_string(),
+                record_id: editable.id,
+                kind: MemoryRecordKind::Decision,
+                content: "agent-two-updated".to_string(),
+                retention: MemoryRetentionPolicy::Days7,
+            })
+            .unwrap();
+        let edited = updated
+            .records
+            .iter()
+            .find(|record| record.id == editable.id)
+            .unwrap();
+        assert_eq!(edited.revision, 2);
+        assert!(edited.expires_at_unix_ms.is_some());
+
+        let intent = ActionIntent::RunTask {
+            agent_id: 2,
+            task_owner_agent_id: 2,
+            task_id,
+            run_mode: RunMode::Execute,
+            review_context: None,
+        };
+        approve_authorization(&mut repository, &intent);
+        let admitted = repository
+            .admit_run("task-0018-exact-memory-bundle", &intent)
+            .unwrap();
+        assert!(admitted.memory_bundle_json.contains("agent-two-updated"));
+        assert!(admitted.memory_bundle_json.contains("project-one-only"));
+        assert!(admitted.memory_bundle_json.contains("task-only"));
+        assert!(admitted.memory_bundle_json.contains("team-chain-only"));
+        assert!(!admitted.memory_bundle_json.contains("wrong-agent-secret"));
+        let (stored_json, stored_sha): (String, String) = repository
+            .connection
+            .query_row(
+                "SELECT memory_bundle_json, memory_bundle_sha256
+                 FROM run_attempts WHERE id = ?1",
+                [admitted.attempt.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_json, admitted.memory_bundle_json);
+        assert_eq!(stored_sha, sha256_hex(stored_json.as_bytes()));
+
+        let deletable = updated
+            .records
+            .iter()
+            .find(|record| record.content == "wrong-agent-secret")
+            .unwrap();
+        let after_delete = repository
+            .delete_memory_record(DeleteMemoryRecordRequest {
+                expected_revision: updated.revision,
+                expected_record_revision: deletable.revision,
+                request_id: "task-0018-memory-delete".to_string(),
+                record_id: deletable.id,
+            })
+            .unwrap();
+        assert!(!after_delete
+            .records
+            .iter()
+            .any(|record| record.content == "wrong-agent-secret"));
+
+        let envelope = repository.load().unwrap().unwrap();
+        let mut forged = envelope.state;
+        forged.agents[1].memory = "renderer free text".to_string();
+        assert_eq!(
+            repository
+                .save(envelope.revision, &forged, true)
+                .unwrap_err()
+                .code,
+            "STRUCTURED_MEMORY_AUTHORITY_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn task_0018_backup_v4_restores_portable_schedules_and_memory_without_portal_grants() {
+        let mut source = StateRepository::open_in_memory().unwrap();
+        source.initialize_fresh().unwrap();
+        source
+            .create_scheduled_item(task_0018_schedule_request(
+                "task-0018-backup-reminder",
+                DeliveryMode::Portal,
+                RecurrenceRuleV1::default(),
+            ))
+            .unwrap();
+        source
+            .create_memory_record(CreateMemoryRecordRequest {
+                expected_revision: 0,
+                request_id: "task-0018-backup-memory".to_string(),
+                scope: MemoryScopeV1::agent(2),
+                kind: MemoryRecordKind::Fact,
+                content: "portable structured memory".to_string(),
+                retention: MemoryRetentionPolicy::Manual,
+            })
+            .unwrap();
+        let export = source.export_backup().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&export.backup_json).unwrap();
+        assert_eq!(value["version"], 4);
+        assert_eq!(value["scheduledItems"][0]["deliveryMode"], "in_app");
+        assert!(value["scheduledItems"][0]["scheduleFingerprint"].is_null());
+        assert_eq!(value["memoryRecords"].as_array().unwrap().len(), 1);
+        assert_eq!(export.sanitizations.portal_deliveries_disabled, 1);
+        assert!(export
+            .omitted_domains
+            .iter()
+            .any(|domain| domain == "notificationDeliveryEvidence"));
+        let mut tampered = value.clone();
+        tampered["scheduledItems"][0]["dueAtUnixMs"] = serde_json::json!(1);
+        assert_eq!(
+            crate::data_lifecycle::parse_backup_candidate(
+                &serde_json::to_string(&tampered).unwrap(),
+                &source.load().unwrap().unwrap().state,
+            )
+            .unwrap_err()
+            .path,
+            "backup.scheduledItems"
+        );
+
+        let mut target = StateRepository::open_in_memory().unwrap();
+        let initialized = target.initialize_fresh().unwrap();
+        target
+            .apply_backup_import(initialized.revision, &export.backup_json)
+            .unwrap();
+        let reminders = target.reminder_scheduler_snapshot().unwrap();
+        assert_eq!(reminders.items.len(), 1);
+        assert_eq!(reminders.items[0].delivery_mode, DeliveryMode::InApp);
+        let memory = target.structured_memory_snapshot().unwrap();
+        assert_eq!(memory.records.len(), 1);
+        assert_eq!(
+            memory.records[0].provenance,
+            MemoryProvenanceKind::BackupImport
+        );
+        assert_eq!(memory.records[0].content, "portable structured memory");
+        assert_eq!(
+            target
+                .connection
+                .query_row("SELECT COUNT(*) FROM management_handoffs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn task_0018_retention_prunes_expired_memory_occurrences_and_orphaned_handoffs_truthfully() {
+        let (mut repository, task_id) = task_0011_repository();
+        let memory = repository.structured_memory_snapshot().unwrap();
+        let memory = repository
+            .create_memory_record(CreateMemoryRecordRequest {
+                expected_revision: memory.revision,
+                request_id: "task-0018-retention-agent-memory".to_string(),
+                scope: MemoryScopeV1::agent(2),
+                kind: MemoryRecordKind::Fact,
+                content: "Expires after seven days.".to_string(),
+                retention: MemoryRetentionPolicy::Days7,
+            })
+            .unwrap();
+        repository
+            .create_memory_record(CreateMemoryRecordRequest {
+                expected_revision: memory.revision,
+                request_id: "task-0018-retention-task-memory".to_string(),
+                scope: MemoryScopeV1::task(2, task_id),
+                kind: MemoryRecordKind::Decision,
+                content: "Expires when the task becomes terminal.".to_string(),
+                retention: MemoryRetentionPolicy::TaskLifetime,
+            })
+            .unwrap();
+
+        let created = repository
+            .create_scheduled_item(task_0018_schedule_request(
+                "task-0018-retention-reminder",
+                DeliveryMode::InApp,
+                RecurrenceRuleV1::default(),
+            ))
+            .unwrap();
+        let due = created.items[0].due_at_unix_ms.unwrap();
+        assert!(repository.scan_due_reminders(due).unwrap().is_empty());
+        let due_snapshot = repository.reminder_scheduler_snapshot().unwrap();
+        assert_eq!(due_snapshot.recent_occurrences.len(), 1);
+        repository
+            .set_scheduled_item_status(SetScheduledItemStatusRequest {
+                expected_revision: due_snapshot.revision,
+                expected_item_revision: due_snapshot.items[0].revision,
+                request_id: "task-0018-retention-reminder-complete".to_string(),
+                item_id: due_snapshot.items[0].id,
+                status: ScheduleStatus::Completed,
+            })
+            .unwrap();
+
+        let terminal_at = now_unix_ms().unwrap();
+        repository
+            .connection
+            .execute(
+                "UPDATE agent_tasks
+                 SET status = 'Completed', phase = 'Finished', queue_state = 'notQueued',
+                     enqueue_sequence = NULL, completed_at = ?1, completed_at_unix_ms = ?2
+                 WHERE owner_agent_id = 2 AND id = ?3",
+                params![format_unix_ms(terminal_at), terminal_at, task_id],
+            )
+            .unwrap();
+
+        let maintenance_at = terminal_at + 40 * 24 * 60 * 60 * 1000;
+        let result = repository
+            .run_data_lifecycle_maintenance("test", maintenance_at)
+            .unwrap();
+        assert_eq!(result.pruned.memory_records, 2);
+        assert_eq!(result.pruned.reminder_occurrences, 1);
+        assert_eq!(result.pruned.reminders, 1);
+        assert_eq!(result.pruned.tasks, 1);
+        assert_eq!(result.pruned.management_handoffs, 2);
+        assert!(!result.backlog_remaining);
+        assert!(repository
+            .structured_memory_snapshot()
+            .unwrap()
+            .records
+            .is_empty());
+        assert!(repository
+            .reminder_scheduler_snapshot()
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(repository
+            .management_handoff_snapshot()
+            .unwrap()
+            .handoffs
+            .is_empty());
+    }
+
+    #[test]
+    fn task_0018_bounded_handoff_retention_preserves_a_valid_prefix() {
+        let (mut repository, task_id) = task_0011_repository();
+        repository
+            .connection
+            .execute(
+                "DELETE FROM agent_tasks WHERE owner_agent_id = 2 AND id = ?1",
+                [task_id],
+            )
+            .unwrap();
+        let first_extra_id: i64 = repository
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) + 1 FROM management_handoffs",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let timestamp = now_unix_ms().unwrap();
+        let transaction = repository.connection.transaction().unwrap();
+        for offset in 0..MAX_MAINTENANCE_ROWS_PER_DOMAIN {
+            transaction
+                .execute(
+                    "INSERT INTO management_handoffs
+                     (id, task_owner_agent_id, task_id, kind, from_agent_id, to_agent_id,
+                      owner_role, revision_round, source_kind, summary, payload_json,
+                      idempotency_key, created_at_unix_ms)
+                     VALUES (?1, 2, ?2, 'assignment', 2, 2, 'human', 0,
+                             'task_orchestration', 'Retained assignment evidence.',
+                             '{\"bulk\":true}', ?3, ?4)",
+                    params![
+                        first_extra_id + offset,
+                        task_id,
+                        format!("task-0018-retention-prefix-{offset}"),
+                        timestamp + offset,
+                    ],
+                )
+                .unwrap();
+        }
+        transaction
+            .execute(
+                "UPDATE management_handoff_meta
+                 SET revision = revision + ?1, next_handoff_id = ?2
+                 WHERE singleton = 1",
+                params![
+                    MAX_MAINTENANCE_ROWS_PER_DOMAIN,
+                    first_extra_id + MAX_MAINTENANCE_ROWS_PER_DOMAIN,
+                ],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let first = repository
+            .run_data_lifecycle_maintenance("test", timestamp + 40 * 24 * 60 * 60 * 1000)
+            .unwrap();
+        assert_eq!(
+            first.pruned.management_handoffs,
+            MAX_MAINTENANCE_ROWS_PER_DOMAIN
+        );
+        assert!(first.backlog_remaining);
+        let retained = repository.management_handoff_snapshot().unwrap();
+        assert_eq!(
+            retained
+                .handoffs
+                .iter()
+                .map(|handoff| handoff.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                ManagementHandoffKind::TaskPlan,
+                ManagementHandoffKind::Assignment,
+            ]
+        );
+
+        let second = repository
+            .run_data_lifecycle_maintenance("test", timestamp + 40 * 24 * 60 * 60 * 1000 + 1)
+            .unwrap();
+        assert_eq!(second.pruned.management_handoffs, 2);
+        assert!(repository
+            .management_handoff_snapshot()
+            .unwrap()
+            .handoffs
+            .is_empty());
     }
 
     #[test]
@@ -10689,7 +14141,7 @@ mod tests {
             &state,
             "renderer_prototype",
             &HashMap::new(),
-            true,
+            false,
         )
         .unwrap();
         transaction
@@ -11747,7 +15199,7 @@ mod tests {
         let preview = repository
             .preview_backup_import(initialized.revision, &backup_json)
             .unwrap();
-        assert_eq!(preview.format_version, 3);
+        assert_eq!(preview.format_version, 4);
         assert_eq!(preview.source_schema_version, Some(CURRENT_SCHEMA_VERSION));
         assert!(preview.replaces_current_state);
         assert!(preview.clears_run_and_review_history);
@@ -11757,8 +15209,8 @@ mod tests {
             .unwrap();
         assert_eq!(imported.revision, initialized.revision + 1);
         assert_eq!(imported.state.preferences.theme, "light");
-        assert_eq!(imported.migration.source_kind.as_deref(), Some("backup_v3"));
-        assert_eq!(imported.migration.source_version, Some(3));
+        assert_eq!(imported.migration.source_kind.as_deref(), Some("backup_v4"));
+        assert_eq!(imported.migration.source_version, Some(4));
 
         assert_eq!(
             repository
@@ -11790,16 +15242,6 @@ mod tests {
             message: "Legacy activity".to_string(),
             created_at: "legacy-activity-time".to_string(),
         }];
-        state.reminders = vec![Reminder {
-            id: 9,
-            title: "Legacy reminder".to_string(),
-            notes: String::new(),
-            due_at: "legacy-due-time".to_string(),
-            status: "Completed".to_string(),
-            agent_id: Some(2),
-            task_id: Some(41),
-            created_at: "legacy-reminder-time".to_string(),
-        }];
         let transaction = repository
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -11821,6 +15263,15 @@ mod tests {
             .unwrap();
         advance_task_orchestration_revision(&transaction).unwrap();
         transaction.commit().unwrap();
+        let scheduled = repository
+            .create_scheduled_item(task_0018_schedule_request(
+                "task-0014-timestamp-stability",
+                DeliveryMode::InApp,
+                RecurrenceRuleV1::default(),
+            ))
+            .unwrap();
+        let reminder_id = scheduled.items[0].id;
+        let revision = scheduled.application_state_revision;
         repository
             .connection
             .execute(
@@ -11838,8 +15289,10 @@ mod tests {
         repository
             .connection
             .execute(
-                "UPDATE reminders SET created_at_unix_ms = 103, resolved_at_unix_ms = 104 WHERE id = 9",
-                [],
+                "UPDATE reminders SET status = 'completed', created_at_unix_ms = 103,
+                         resolved_at_unix_ms = 104, updated_at_unix_ms = 104
+                 WHERE id = ?1",
+                [reminder_id],
             )
             .unwrap();
 
@@ -11866,8 +15319,8 @@ mod tests {
         let reminder_timestamps: (i64, i64) = repository
             .connection
             .query_row(
-                "SELECT created_at_unix_ms, resolved_at_unix_ms FROM reminders WHERE id = 9",
-                [],
+                "SELECT created_at_unix_ms, resolved_at_unix_ms FROM reminders WHERE id = ?1",
+                [reminder_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -11936,16 +15389,6 @@ mod tests {
             message: "Old activity".to_string(),
             created_at: old_timestamp.clone(),
         });
-        state.reminders.push(Reminder {
-            id: 301,
-            title: "Resolved reminder".to_string(),
-            notes: "Old resolved reminder".to_string(),
-            due_at: old_timestamp.clone(),
-            status: "Completed".to_string(),
-            agent_id: Some(owner_id),
-            task_id: None,
-            created_at: old_timestamp.clone(),
-        });
         let transaction = repository
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -11969,6 +15412,26 @@ mod tests {
             .unwrap();
         advance_task_orchestration_revision(&transaction).unwrap();
         transaction.commit().unwrap();
+        let scheduled = repository
+            .create_scheduled_item(task_0018_schedule_request(
+                "task-0014-retention-reminder",
+                DeliveryMode::InApp,
+                RecurrenceRuleV1::default(),
+            ))
+            .unwrap();
+        let reminder_id = scheduled.items[0].id;
+        let saved_revision = scheduled.application_state_revision;
+        repository
+            .connection
+            .execute(
+                "UPDATE reminders
+                 SET status = 'completed', created_at = ?1,
+                     created_at_unix_ms = ?2, resolved_at_unix_ms = ?2,
+                     updated_at_unix_ms = ?2
+                 WHERE id = ?3",
+                params![old_timestamp, old_time, reminder_id],
+            )
+            .unwrap();
 
         let expired_approval = ApprovalRequest {
             id: 401,
@@ -12666,6 +16129,123 @@ mod tests {
         assert_eq!(task.status, "Completed");
         assert_eq!(task.phase, "Finished");
         assert_eq!(task.review_status, "Approved");
+    }
+
+    #[test]
+    fn task_0018_management_handoffs_follow_task_execution_and_review_sequentially() {
+        let (mut repository, task_id) = task_0011_repository();
+        let initial = repository.management_handoff_snapshot().unwrap();
+        assert_eq!(
+            initial
+                .handoffs
+                .iter()
+                .map(|handoff| handoff.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                ManagementHandoffKind::TaskPlan,
+                ManagementHandoffKind::Assignment,
+            ]
+        );
+
+        let execution = task_0011_execute(&mut repository, task_id, "task-0018-handoff-execution");
+        task_0011_review_stage(
+            &mut repository,
+            task_id,
+            "task-0018-handoff-review",
+            ReviewVerdict::ChangesRequested,
+        );
+        let snapshot = repository.management_handoff_snapshot().unwrap();
+        crate::management_handoffs::validate_sequential_handoffs(&snapshot.handoffs).unwrap();
+        assert_eq!(
+            snapshot
+                .handoffs
+                .iter()
+                .map(|handoff| handoff.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                ManagementHandoffKind::TaskPlan,
+                ManagementHandoffKind::Assignment,
+                ManagementHandoffKind::ExecutionEvidence,
+                ManagementHandoffKind::RevisionRequest,
+            ]
+        );
+        let execution_handoff = snapshot
+            .handoffs
+            .iter()
+            .find(|handoff| handoff.kind == ManagementHandoffKind::ExecutionEvidence)
+            .unwrap();
+        assert_eq!(execution_handoff.run_attempt_id, Some(execution.id));
+        assert!(execution_handoff.payload["runEvidence"].is_object());
+        assert_eq!(
+            execution_handoff.payload["runEvidence"]["workspaceEvidenceSha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(
+            execution_handoff.payload["memoryBundleSha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        let revision = snapshot.handoffs.last().unwrap();
+        assert_eq!(
+            revision.source,
+            ManagementHandoffSource::ReviewOrchestration
+        );
+        assert_eq!(revision.revision_round, 0);
+        assert!(revision.review_flow_id.is_some());
+        assert!(revision.review_stage_attempt_id.is_some());
+    }
+
+    #[test]
+    fn task_0018_large_run_evidence_cannot_block_terminal_handoff_projection() {
+        let (mut repository, task_id) = task_0011_repository();
+        let intent = ActionIntent::RunTask {
+            agent_id: 2,
+            task_owner_agent_id: 2,
+            task_id,
+            run_mode: RunMode::Execute,
+            review_context: None,
+        };
+        approve_authorization(&mut repository, &intent);
+        let admitted = repository
+            .admit_run("task-0018-large-handoff", &intent)
+            .unwrap();
+        repository
+            .prepare_run_attempt(
+                admitted.attempt.id,
+                "Ollama",
+                "qwen2.5-coder:7b",
+                Some("workspace-1"),
+            )
+            .unwrap();
+        repository
+            .mark_run_dispatching(admitted.attempt.id)
+            .unwrap();
+        repository.mark_run_started(admitted.attempt.id).unwrap();
+
+        let oversized_summary = "x".repeat(MAX_HANDOFF_SUMMARY_BYTES + 1_024);
+        let completed = repository
+            .complete_run(
+                admitted.attempt.id,
+                &successful_completion(&oversized_summary),
+            )
+            .unwrap();
+        assert_eq!(completed.status, RunAttemptStatus::Succeeded);
+
+        let snapshot = repository.management_handoff_snapshot().unwrap();
+        let handoff = snapshot.handoffs.last().unwrap();
+        assert_eq!(handoff.kind, ManagementHandoffKind::ExecutionEvidence);
+        assert_eq!(handoff.summary.len(), MAX_HANDOFF_SUMMARY_BYTES);
+        assert_eq!(handoff.payload["summaryTruncatedForHandoff"], true);
+        assert!(handoff.payload.get("workspaceEvidence").is_none());
+        assert_eq!(
+            handoff.payload["runEvidence"]["fullEvidenceLocation"],
+            "run_attempt"
+        );
     }
 
     #[test]

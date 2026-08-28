@@ -36,10 +36,16 @@ The current checkout contains:
 - schema-v10 typed Coding, Debugging, Browser Research, and Financial Analysis
   requests, immutable run tool contracts, backend-validated structured
   results, and exact stable-template routing;
+- a schema-v11 passive reminder/event scheduler with IANA time-zone and DST
+  resolution, deterministic recurrence/restart handling, app-owned timer/tray
+  integration, and privacy-bounded XDG notification portal delivery;
+- scoped agent/project/task/team memory with provenance, revision, retention,
+  inspection/deletion, and an exact bounded per-run prompt bundle, plus
+  explicit sequential task/run/review/human management-handoff evidence;
 - a feature-modular React renderer with a typed desktop client, accessible
   navigation/dialog/tab/card primitives, and narrow-screen provider controls;
 - schema-v8 lifecycle timestamps and durable bounded retention evidence,
-  strict sanitized portable backup v3, and revision-bound backend monitoring
+  strict sanitized portable backup v4, and revision-bound backend monitoring
   with explicitly non-authoritative browser previews;
 - one backend-owned canonical voice/system-action gateway with exact XDG/KWin
   target resolution, capability and one-use approval enforcement, normal
@@ -73,6 +79,18 @@ always needs one-use approval; Debugging is read-only; Browser Research uses
 hosted search plus disposable private scratch; Financial Analysis has no web,
 shell, user-workspace, account, credential, or transaction authority and uses
 backend fixed-point calculations.
+Due reminders are discovered by a non-AI backend timer and become in-app or
+portal delivery evidence without creating a task or provider run. Portal
+delivery is app-session behavior, not a persisted notification grant. The
+backend resolves local civil time and recurrence, records missed/restart and
+delivery outcomes, and exposes explicit needs-attention evidence when a
+schedule cannot be resolved.
+Structured memory is no longer granted by the legacy free-text agent field:
+dedicated compare-and-swap commands own scoped records, and run admission
+persists the exact bounded memory bundle and SHA-256 used by that attempt.
+Management handoffs are derived transactionally from task, run, review, and
+trusted human transitions; they remain sequential inspectable evidence rather
+than an autonomous agent messaging channel.
 Agent identity, lifecycle, role-derived authority, reporting relationships,
 and template restoration are backend-authoritative; dashboard, agent, routing,
 review, voice, reminder, approval, and settings projections consume active
@@ -132,9 +150,9 @@ Run the deterministic fast characterization gate from the repository root:
 npm run verify:fast
 ```
 
-It runs 63 frontend characterization, interaction, accessibility, persistence,
+It runs 69 frontend characterization, interaction, accessibility, persistence,
 coordinator, provider, registry, and orchestration tests, the TypeScript check,
-7 Python voice-runtime tests, the Rust format check, and 167 locked/offline Rust
+7 Python voice-runtime tests, the Rust format check, and 207 locked/offline Rust
 tests.
 The full gate adds the
 frontend build, Clippy, shell/Python/JSON checks, dependency-tree checks, and

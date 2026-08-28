@@ -378,7 +378,7 @@ export function SettingsPage({
         const backup = await onExportBackup();
         downloadBackup(backup.backupJson, backup.fileName);
         setBackupMessage(
-          `Exported ${backup.byteLength.toLocaleString()} bytes from the authoritative backend. Runtime authority and provider credentials were omitted.`,
+          `Exported ${backup.byteLength.toLocaleString()} bytes from the authoritative backend with ${backup.counts.reminders} reminder/event schedule(s) and ${backup.counts.memoryRecords} structured memory record(s). Runtime authority, portal delivery evidence, management handoffs, and provider credentials were omitted.`,
         );
         return;
       }
@@ -1494,7 +1494,7 @@ export function SettingsPage({
             <h2>Export and import</h2>
             <p className="page-message">
               {isDesktopRuntime()
-                ? "Version 3 portable backups are strictly validated and sanitized by the backend. Provider credentials, active authority, and run/review runtime history are excluded."
+                ? "Version 4 portable backups are strictly validated and sanitized by the backend. Reminder/event schedules and structured memory are portable; provider credentials, portal grants and delivery evidence, management handoffs, and run/review runtime history are excluded."
                 : "Browser preview only: export and import use the non-authoritative legacy version 2 shape."}
             </p>
           </div>
@@ -1533,11 +1533,15 @@ export function SettingsPage({
           <div className="runtime-message" role="status">
             Validated backup v{backupPreview.preview.formatVersion}:{" "}
             {backupPreview.preview.counts.tasks} tasks, {" "}
-            {backupPreview.preview.counts.activity} activity entries, and {" "}
+            {backupPreview.preview.counts.activity} activity entries, {" "}
+            {backupPreview.preview.counts.reminders} reminder/event schedules, {" "}
+            {backupPreview.preview.counts.memoryRecords} memory records, and {" "}
             {backupPreview.preview.counts.approvalHistory} approval-history
             records. {backupPreview.preview.sanitizations.heldTasks} task(s)
             will be held and {backupPreview.preview.sanitizations.expiredApprovals}{" "}
-            approval(s) expired. Current run/review history will be cleared.
+            approval(s) expired. {backupPreview.preview.sanitizations.portalDeliveriesDisabled}{" "}
+            portal delivery setting(s) will become in-app only. Current run,
+            review, handoff, and notification-delivery history will be cleared.
             <div className="button-row">
               <button
                 className="danger-button"

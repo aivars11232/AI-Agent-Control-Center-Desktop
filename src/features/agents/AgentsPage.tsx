@@ -31,8 +31,21 @@ import {
   type SpecialistTaskDraft,
   type WorkspaceMutationClass,
 } from "../../specialistCapabilities";
+import {
+  describeMemoryScope,
+  type MemoryRecord,
+  type MemoryRecordKind,
+  type MemoryRetention,
+  type MemoryScopeKind,
+  type StructuredMemoryCommand,
+  type StructuredMemorySnapshot,
+} from "../../structuredMemory";
+import {
+  handoffsForAgent,
+  type ManagementHandoffSnapshot,
+} from "../../managementHandoffs";
 
-type WorkspaceTab = "Overview" | "Capabilities" | "Memory" | "Tasks" | "Activity";
+type WorkspaceTab = "Overview" | "Capabilities" | "Memory" | "Tasks" | "Handoffs" | "Activity";
 
 type CapabilityKey = keyof Agent["capabilities"];
 
@@ -43,6 +56,7 @@ const workspaceTabs = [
   { value: "Capabilities", label: "Capabilities" },
   { value: "Memory", label: "Memory" },
   { value: "Tasks", label: "Tasks" },
+  { value: "Handoffs", label: "Handoffs" },
   { value: "Activity", label: "Activity" },
 ] as const satisfies ReadonlyArray<{ value: WorkspaceTab; label: string }>;
 
@@ -314,6 +328,10 @@ export function AgentsPage({
   approvalRequests,
   setApprovalRequests,
   onOpenApprovals,
+  structuredMemory,
+  managementHandoffs,
+  authoritativeMemory,
+  onMemoryMutation,
 }: {
   agents: Agent[];
   setAgents: React.Dispatch<React.SetStateAction<Agent[]>>;
@@ -340,6 +358,13 @@ export function AgentsPage({
     React.SetStateAction<ApprovalRequest[]>
   >;
   onOpenApprovals: () => void;
+  structuredMemory: StructuredMemorySnapshot;
+  managementHandoffs: ManagementHandoffSnapshot;
+  authoritativeMemory: boolean;
+  onMemoryMutation: (
+    command: StructuredMemoryCommand,
+    request: Record<string, unknown>,
+  ) => Promise<void>;
 }) {
   const [isCreating, setIsCreating] = useState(false);
   const [editingAgentId, setEditingAgentId] = useState<number | null>(null);
@@ -371,9 +396,22 @@ export function AgentsPage({
   const [runtimeError, setRuntimeError] = useState("");
   const [systemCapabilityMessage, setSystemCapabilityMessage] = useState("");
   const [taskMutationBusy, setTaskMutationBusy] = useState(false);
+  const [memoryScopeKind, setMemoryScopeKind] = useState<MemoryScopeKind>("agent");
+  const [memoryKind, setMemoryKind] = useState<MemoryRecordKind>("instruction");
+  const [memoryRetention, setMemoryRetention] = useState<MemoryRetention>("manual");
+  const [memoryContent, setMemoryContent] = useState("");
+  const [memoryWorkspaceId, setMemoryWorkspaceId] = useState<string | null>(
+    preferences.activeWorkspaceId,
+  );
+  const [memoryTaskId, setMemoryTaskId] = useState<number | null>(null);
+  const [editingMemoryId, setEditingMemoryId] = useState<number | null>(null);
+  const [memoryBusy, setMemoryBusy] = useState(false);
+  const [memoryMessage, setMemoryMessage] = useState("");
 
   const selectedAgent =
     agents.find((agent) => agent.id === selectedAgentId) ?? null;
+  const selectedAgentCanOwnTeamMemory = selectedAgent !== null &&
+    ["Supervisor", "Team Leader", "Senior Agent"].includes(selectedAgent.role);
   const selectedSpecialistProfile = specialistProfileForTemplate(
     selectedAgent?.templateKey,
   );
@@ -416,7 +454,50 @@ export function AgentsPage({
     selectedAgentTasks.find((task) => task.status === "Pending") ??
     null;
   const latestActivity = selectedAgent?.activity[0] ?? null;
-  const memoryCharacterCount = selectedAgent?.memory.trim().length ?? 0;
+  const reportingManagerIds = (() => {
+    const managers = new Set<number>();
+    let managerId = selectedAgent?.reportsTo ?? null;
+    while (managerId !== null && !managers.has(managerId)) {
+      managers.add(managerId);
+      managerId = agents.find((agent) => agent.id === managerId)?.reportsTo ?? null;
+    }
+    return managers;
+  })();
+  const selectedMemoryRecords = structuredMemory.records.filter((record) =>
+    record.scope.agentId === selectedAgentId ||
+    record.scope.teamLeaderAgentId === selectedAgentId ||
+    (record.scope.teamLeaderAgentId !== null &&
+      reportingManagerIds.has(record.scope.teamLeaderAgentId)) ||
+    record.scope.taskOwnerAgentId === selectedAgentId ||
+    record.scope.workspaceId === preferences.activeWorkspaceId,
+  );
+  const memoryCharacterCount = selectedMemoryRecords.reduce(
+    (total, record) => total + record.content.length,
+    0,
+  );
+  const managedAgentIds = (() => {
+    if (selectedAgentId === null) return [] as number[];
+    const managed = new Set<number>();
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const agent of agents) {
+        if (
+          agent.reportsTo === selectedAgentId ||
+          (agent.reportsTo !== null && managed.has(agent.reportsTo))
+        ) {
+          if (!managed.has(agent.id)) {
+            managed.add(agent.id);
+            grew = true;
+          }
+        }
+      }
+    }
+    return [...managed];
+  })();
+  const selectedHandoffs = selectedAgentId === null
+    ? []
+    : handoffsForAgent(managementHandoffs, selectedAgentId, managedAgentIds);
 
   const isEditing = editingAgentId !== null;
   const isModalOpen = isCreating || isEditing;
@@ -753,16 +834,101 @@ export function AgentsPage({
     );
   }
 
-  function updateMemory(memory: string) {
-    if (selectedAgentId === null) {
+  function resetMemoryComposer() {
+    setEditingMemoryId(null);
+    setMemoryScopeKind("agent");
+    setMemoryKind("instruction");
+    setMemoryRetention("manual");
+    setMemoryContent("");
+    setMemoryWorkspaceId(preferences.activeWorkspaceId);
+    setMemoryTaskId(null);
+  }
+
+  function editMemoryRecord(record: MemoryRecord) {
+    setEditingMemoryId(record.id);
+    setMemoryScopeKind(record.scope.kind);
+    setMemoryKind(record.kind);
+    setMemoryRetention(record.retention);
+    setMemoryContent(record.content);
+    setMemoryWorkspaceId(record.scope.workspaceId);
+    setMemoryTaskId(record.scope.taskId);
+    setMemoryMessage("");
+  }
+
+  async function saveMemoryRecord() {
+    if (selectedAgentId === null || !memoryContent.trim()) return;
+    const existing = editingMemoryId === null
+      ? null
+      : structuredMemory.records.find((record) => record.id === editingMemoryId) ?? null;
+    if (editingMemoryId !== null && !existing) {
+      setMemoryMessage("This memory record changed. Refresh before editing it.");
       return;
     }
+    const scope = {
+      kind: memoryScopeKind,
+      agentId: memoryScopeKind === "agent" ? selectedAgentId : null,
+      workspaceId: memoryScopeKind === "project" ? memoryWorkspaceId : null,
+      taskOwnerAgentId: memoryScopeKind === "task" ? selectedAgentId : null,
+      taskId: memoryScopeKind === "task" ? memoryTaskId : null,
+      teamLeaderAgentId: memoryScopeKind === "team" ? selectedAgentId : null,
+    };
+    if (
+      (memoryScopeKind === "project" && !memoryWorkspaceId) ||
+      (memoryScopeKind === "task" && memoryTaskId === null)
+    ) {
+      setMemoryMessage("Select the exact project or task scope.");
+      return;
+    }
+    setMemoryBusy(true);
+    setMemoryMessage("");
+    try {
+      if (existing) {
+        await onMemoryMutation("update_memory_record", {
+          expectedRevision: structuredMemory.revision,
+          expectedRecordRevision: existing.revision,
+          requestId: `memory-update-${Date.now()}-${existing.id}`,
+          recordId: existing.id,
+          kind: memoryKind,
+          content: memoryContent.trim(),
+          retention: memoryRetention,
+        });
+      } else {
+        await onMemoryMutation("create_memory_record", {
+          expectedRevision: structuredMemory.revision,
+          requestId: `memory-create-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          scope,
+          kind: memoryKind,
+          content: memoryContent.trim(),
+          retention: memoryRetention,
+        });
+      }
+      resetMemoryComposer();
+    } catch (error) {
+      setMemoryMessage(persistenceErrorMessage(error));
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
 
-    setAgents((currentAgents) =>
-      currentAgents.map((agent) =>
-        agent.id === selectedAgentId ? { ...agent, memory } : agent,
-      ),
-    );
+  async function deleteMemoryRecord(record: MemoryRecord) {
+    if (!window.confirm("Delete this structured memory record and retain only its audit event?")) {
+      return;
+    }
+    setMemoryBusy(true);
+    setMemoryMessage("");
+    try {
+      await onMemoryMutation("delete_memory_record", {
+        expectedRevision: structuredMemory.revision,
+        expectedRecordRevision: record.revision,
+        requestId: `memory-delete-${Date.now()}-${record.id}`,
+        recordId: record.id,
+      });
+      if (editingMemoryId === record.id) resetMemoryComposer();
+    } catch (error) {
+      setMemoryMessage(persistenceErrorMessage(error));
+    } finally {
+      setMemoryBusy(false);
+    }
   }
 
   async function addTask() {
@@ -1635,31 +1801,44 @@ export function AgentsPage({
             </div>
           </section>
         ) : activeWorkspaceTab === "Memory" ? (
-          <section className="panel">
-            <div className="panel-heading">
-              <div>
-                <span className="eyebrow">MEMORY</span>
-                <h2>Agent memory</h2>
-                <p className="page-message">
-                  Store durable instructions, context, and facts this agent
-                  should remember.
-                </p>
+          <div className="workspace-stack">
+            <section className="panel">
+              <div className="panel-heading">
+                <div>
+                  <span className="eyebrow">STRUCTURED MEMORY</span>
+                  <h2>{editingMemoryId === null ? "Add scoped memory" : "Edit memory record"}</h2>
+                  <p className="page-message">
+                    Every record has an exact agent, project, task, or team scope. Run admission selects and hashes only matching, unexpired records.
+                  </p>
+                </div>
+                {editingMemoryId !== null && <button className="secondary-button" onClick={resetMemoryComposer}>Cancel edit</button>}
               </div>
-            </div>
+              {!authoritativeMemory && <p className="inline-notice">Structured-memory editing requires the installed desktop app.</p>}
+              {memoryMessage && <p className="inline-error" role="alert">{memoryMessage}</p>}
+              <div className="form-grid">
+                <label className="form-field">
+                  <span>Scope</span>
+                  <select value={memoryScopeKind} disabled={editingMemoryId !== null} onChange={(event) => { const next = event.target.value as MemoryScopeKind; setMemoryScopeKind(next); setMemoryRetention(next === "task" ? "task_lifetime" : "manual"); }}>
+                    <option value="agent">This agent</option>
+                    <option value="project">Project</option>
+                    <option value="task">Task</option>
+                    <option value="team" disabled={!selectedAgentCanOwnTeamMemory}>Team led by this agent</option>
+                  </select>
+                </label>
+                {editingMemoryId === null && memoryScopeKind === "project" && <label className="form-field"><span>Project</span><select value={memoryWorkspaceId ?? ""} onChange={(event) => setMemoryWorkspaceId(event.target.value || null)}><option value="">Select project</option>{preferences.workspaces.map((workspace) => <option value={workspace.id} key={workspace.id}>{workspace.name}</option>)}</select></label>}
+                {editingMemoryId === null && memoryScopeKind === "task" && <label className="form-field"><span>Task</span><select value={memoryTaskId ?? ""} onChange={(event) => setMemoryTaskId(event.target.value ? Number(event.target.value) : null)}><option value="">Select task</option>{selectedAgentTasks.map((task) => <option value={task.id} key={task.id}>{task.title}</option>)}</select></label>}
+                <label className="form-field"><span>Record kind</span><select value={memoryKind} onChange={(event) => setMemoryKind(event.target.value as MemoryRecordKind)}><option value="instruction">Instruction</option><option value="fact">Fact</option><option value="decision">Decision</option><option value="summary">Summary</option></select></label>
+                <label className="form-field"><span>Retention</span><select value={memoryRetention} onChange={(event) => setMemoryRetention(event.target.value as MemoryRetention)}><option value="manual">Until manually deleted</option><option value="7d">7 days</option><option value="30d">30 days</option><option value="90d">90 days</option>{memoryScopeKind === "task" && <option value="task_lifetime">Task lifetime</option>}</select></label>
+              </div>
+              <label className="form-field"><span>Memory content</span><textarea rows={6} maxLength={32768} value={memoryContent} onChange={(event) => setMemoryContent(event.target.value)} placeholder="One inspectable instruction, fact, decision, or summary" /><small>{memoryContent.length} / 32768 characters</small></label>
+              <div className="task-card-actions"><button className="primary-button" disabled={memoryBusy || !authoritativeMemory} onClick={() => void saveMemoryRecord()}>{editingMemoryId === null ? "Add record" : "Save revision"}</button></div>
+            </section>
 
-            <label className="form-field">
-              <span>Persistent memory</span>
-              <textarea
-                rows={14}
-                value={selectedAgent.memory}
-                onChange={(event) => updateMemory(event.target.value)}
-                placeholder="Example: This project uses React, TypeScript, and Tauri. Prefer small, testable changes and explain risky actions before running them."
-              />
-              <small>
-                Changes are saved automatically for this agent.
-              </small>
-            </label>
-          </section>
+            <section className="panel">
+              <div className="panel-heading"><div><span className="eyebrow">INSPECTION</span><h2>Relevant memory records</h2><p className="page-message">Agent, reporting-chain team, owned-task, and active-project records remain inspectable with provenance and expiry. Backend run selection still enforces exact scope isolation.</p></div></div>
+              {selectedMemoryRecords.length === 0 ? <p className="page-message">No scoped memory records are linked to this workspace.</p> : <div className="agent-list">{selectedMemoryRecords.map((record) => <article className="agent-card" key={record.id}><div><div className="agent-result-heading"><strong>{record.kind} · {describeMemoryScope(record.scope)}</strong><span className="agent-status waiting">revision {record.revision}</span></div><p>{record.content}</p><small>Provenance: {record.provenance.split("_").join(" ")}{record.provenanceRef ? ` · ${record.provenanceRef}` : ""}</small><small>Retention: {record.retention.replace("d", " days")}{record.expiresAtUnixMs ? ` · expires ${new Date(record.expiresAtUnixMs).toLocaleString()}` : ""}</small></div><div className="task-card-actions"><button className="secondary-button" disabled={memoryBusy || !authoritativeMemory} onClick={() => editMemoryRecord(record)}>Edit</button><button className="danger-button" disabled={memoryBusy || !authoritativeMemory} onClick={() => void deleteMemoryRecord(record)}>Delete</button></div></article>)}</div>}
+            </section>
+          </div>
         ) : activeWorkspaceTab === "Tasks" ? (
           <section className="panel">
             <div className="panel-heading">
@@ -2359,6 +2538,30 @@ export function AgentsPage({
                 })}
               </div>
             )}
+          </section>
+        ) : activeWorkspaceTab === "Handoffs" ? (
+          <section className="panel">
+            <div className="panel-heading">
+              <div>
+                <span className="eyebrow">MANAGEMENT WORKSPACE</span>
+                <h2>Sequential task handoffs</h2>
+                <p className="page-message">
+                  Plans, assignments, execution evidence, review decisions, revisions, failures, recovery, and human overrides are retained as ordered backend records. This is an evidence workspace, not free-form agent chat.
+                </p>
+              </div>
+            </div>
+            <div className="summary-grid">
+              <article className="summary-card"><span>Visible handoffs</span><strong>{selectedHandoffs.length}</strong><small>Direct and managed reporting chain</small></article>
+              <article className="summary-card"><span>Workspace owner</span><strong>{selectedAgent.role}</strong><small>Authority level {selectedAgent.authorityLevel}</small></article>
+              <article className="summary-card"><span>Ledger revision</span><strong>{managementHandoffs.revision}</strong><small>Backend-authoritative projection</small></article>
+            </div>
+            {selectedHandoffs.length === 0 ? <p className="page-message">No management handoffs are visible for this workspace.</p> : <div className="agent-list">{selectedHandoffs.map((handoff) => {
+              const owner = agents.find((agent) => agent.id === handoff.taskOwnerAgentId);
+              const task = owner?.tasks.find((candidate) => candidate.id === handoff.taskId);
+              const from = agents.find((agent) => agent.id === handoff.fromAgentId);
+              const to = agents.find((agent) => agent.id === handoff.toAgentId);
+              return <article className="agent-card" key={handoff.id}><div><div className="agent-result-heading"><strong>{handoff.kind.split("_").join(" ")}</strong><span className="agent-status waiting">{handoff.ownerRole.split("_").join(" ")}</span></div><h3>{task?.title ?? `Task ${handoff.taskOwnerAgentId}/${handoff.taskId}`}</h3><p>{handoff.summary}</p><small>{from?.name ?? "Human / system"} → {to?.name ?? "Human / system"} · revision round {handoff.revisionRound}</small><small>Source: {handoff.source.split("_").join(" ")}{handoff.runAttemptId ? ` · run ${handoff.runAttemptId}` : ""}{handoff.reviewFlowId ? ` · review flow ${handoff.reviewFlowId}` : ""}</small><details><summary>Inspect structured evidence</summary><pre className="evidence-json">{JSON.stringify(handoff.payload, null, 2)}</pre></details></div></article>;
+            })}</div>}
           </section>
         ) : activeWorkspaceTab === "Activity" ? (
           <section className="panel">
