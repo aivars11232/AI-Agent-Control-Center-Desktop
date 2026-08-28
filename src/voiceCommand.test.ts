@@ -7,80 +7,88 @@ const options = {
   replacements: "fire fox = firefox\nvisual studio = visual studio code",
 };
 
-describe("voice command characterization", () => {
-  it("keeps wake-word requests on the coding path", () => {
+describe("canonical voice command interpretation", () => {
+  it("keeps wake-word requests on the coding-task path", () => {
     expect(interpretVoiceCommand("Lucy refactor the parser", options)).toEqual({
-      intent: "coding_request",
-      entity: "refactor the parser",
+      intent: {
+        kind: "createCodingTask",
+        request: "refactor the parser",
+      },
       transcript: "lucy refactor the parser",
     });
   });
 
-  it("strips conversational wording and applies configured replacements", () => {
+  it("strips conversational wording and resolves known apps to exact desktop IDs", () => {
     expect(
       interpretVoiceCommand(
         "Could you please launch fire fox for me",
         options,
       ),
     ).toEqual({
-      intent: "open_application",
-      entity: "firefox",
+      intent: {
+        kind: "launchApplication",
+        application: "firefox.desktop",
+      },
       transcript: "could you please launch fire fox for me",
     });
   });
 
-  it("recognizes close, folder, pointer, desktop, and named-window actions", () => {
-    expect(
-      interpretVoiceCommand("Would you close visual studio for me", options),
-    ).toMatchObject({
-      intent: "close_application",
-      entity: "visual studio code",
+  it("emits canonical folder, pointer, keyboard, and window actions", () => {
+    expect(interpretVoiceCommand("open documents", options).intent).toEqual({
+      kind: "openStandardFolder",
+      folder: "documents",
     });
-    expect(interpretVoiceCommand("open documents", options)).toMatchObject({
-      intent: "open_folder",
-      entity: "Documents",
+    expect(interpretVoiceCommand("double click", options).intent).toEqual({
+      kind: "pointerAction",
+      action: "doubleClick",
     });
-    expect(interpretVoiceCommand("double click", options)).toMatchObject({
-      intent: "pointer_action",
-      entity: "double-click",
+    expect(interpretVoiceCommand("show app launcher", options).intent).toEqual({
+      kind: "keyboardAction",
+      action: "openLauncher",
     });
-    expect(interpretVoiceCommand("show app launcher", options)).toMatchObject({
-      intent: "desktop_action",
-      entity: "open-launcher",
+    expect(interpretVoiceCommand("maximize window", options).intent).toEqual({
+      kind: "activeWindowAction",
+      action: "maximize",
     });
-    expect(interpretVoiceCommand("maximize firefox", options)).toMatchObject({
-      intent: "application_window_action",
-      entity: "firefox",
+    expect(interpretVoiceCommand("maximize firefox", options).intent).toEqual({
+      kind: "namedWindowAction",
+      application: "firefox.desktop",
       action: "maximize",
     });
   });
 
-  it("normalizes bounded dictation commands", () => {
+  it("normalizes bounded dictation into the canonical text intent", () => {
     expect(
       interpretVoiceCommand("type first line new line second line", options),
     ).toEqual({
-      intent: "text_input",
-      entity: "first line\nsecond line",
+      intent: {
+        kind: "typeText",
+        text: "first line\nsecond line",
+      },
       transcript: "type first line new line second line",
     });
   });
 
-  it("treats safe bare names as open requests", () => {
-    expect(interpretVoiceCommand("firefox", options)).toEqual({
-      intent: "open_application",
-      entity: "firefox",
-      transcript: "firefox",
+  it("never turns an unknown named close into an active-window close", () => {
+    expect(interpretVoiceCommand("close imaginary editor", options).intent).toEqual({
+      kind: "closeApplication",
+      application: "imaginary editor",
     });
+    expect(interpretVoiceCommand("close active window", options).intent).toEqual({
+      kind: "closeActiveWindow",
+    });
+    expect(interpretVoiceCommand("close", options).intent).toBeNull();
   });
 
-  it("rejects empty and destructive bare requests", () => {
-    expect(interpretVoiceCommand("", options)).toMatchObject({
-      intent: "unsupported",
-      entity: "",
+  it("treats safe bare names as launches and rejects unsupported destructive phrases", () => {
+    expect(interpretVoiceCommand("firefox", options)).toEqual({
+      intent: {
+        kind: "launchApplication",
+        application: "firefox.desktop",
+      },
+      transcript: "firefox",
     });
-    expect(interpretVoiceCommand("delete files", options)).toMatchObject({
-      intent: "unsupported",
-      entity: "",
-    });
+    expect(interpretVoiceCommand("", options).intent).toBeNull();
+    expect(interpretVoiceCommand("delete files", options).intent).toBeNull();
   });
 });

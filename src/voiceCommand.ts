@@ -1,18 +1,68 @@
-export type VoiceIntent =
-  | "open_application"
-  | "close_application"
-  | "open_folder"
-  | "pointer_action"
-  | "desktop_action"
-  | "application_window_action"
-  | "text_input"
-  | "coding_request"
-  | "unsupported";
+export type StandardFolder = "home" | "desktop" | "documents" | "downloads";
+
+export type PointerAction =
+  | "moveLeft"
+  | "moveRight"
+  | "moveUp"
+  | "moveDown"
+  | "click"
+  | "doubleClick"
+  | "scrollUp"
+  | "scrollDown";
+
+export type KeyboardAction =
+  | "openLauncher"
+  | "volumeUp"
+  | "volumeDown"
+  | "toggleMute"
+  | "nextWindow"
+  | "previousWindow"
+  | "left"
+  | "right"
+  | "up"
+  | "down"
+  | "home"
+  | "end"
+  | "pageUp"
+  | "pageDown"
+  | "tab"
+  | "shiftTab"
+  | "enter"
+  | "escape"
+  | "backspace"
+  | "delete"
+  | "selectAll"
+  | "copy"
+  | "cut"
+  | "paste"
+  | "undo"
+  | "redo";
+
+export type WindowAction =
+  | "restore"
+  | "minimize"
+  | "maximize"
+  | "snapLeft"
+  | "snapRight";
+
+export type CanonicalVoiceIntent =
+  | { kind: "createCodingTask"; request: string }
+  | { kind: "launchApplication"; application: string }
+  | { kind: "openStandardFolder"; folder: StandardFolder }
+  | { kind: "closeApplication"; application: string }
+  | { kind: "closeActiveWindow" }
+  | { kind: "pointerAction"; action: PointerAction }
+  | { kind: "keyboardAction"; action: KeyboardAction }
+  | { kind: "activeWindowAction"; action: WindowAction }
+  | {
+      kind: "namedWindowAction";
+      application: string;
+      action: WindowAction;
+    }
+  | { kind: "typeText"; text: string };
 
 export type VoiceCommand = {
-  intent: VoiceIntent;
-  entity: string;
-  action?: string;
+  intent: CanonicalVoiceIntent | null;
   transcript: string;
 };
 
@@ -22,80 +72,86 @@ type InterpreterOptions = {
   replacements: string;
 };
 
-const folderAliases: Record<string, string> = {
-  downloads: "Downloads",
-  "download folder": "Downloads",
-  documents: "Documents",
-  "document folder": "Documents",
-  desktop: "Desktop",
-  home: "Home",
-  "home folder": "Home",
+const applicationAliases: Record<string, string> = {
+  firefox: "firefox.desktop",
+  dolphin: "org.kde.dolphin.desktop",
+  "system settings": "systemsettings.desktop",
+  settings: "systemsettings.desktop",
+  terminal: "org.kde.konsole.desktop",
+  konsole: "org.kde.konsole.desktop",
+  code: "code.desktop",
+  "visual studio code": "code.desktop",
 };
 
-const pointerAliases: Record<string, string> = {
-  "move mouse left": "move-left",
-  "move cursor left": "move-left",
-  "go left": "move-left",
-  "move left": "move-left",
-  "move mouse right": "move-right",
-  "move cursor right": "move-right",
-  "go right": "move-right",
-  "move right": "move-right",
-  "move mouse up": "move-up",
-  "move cursor up": "move-up",
-  "move up": "move-up",
-  "move mouse down": "move-down",
-  "move cursor down": "move-down",
-  "move down": "move-down",
+const folderAliases: Record<string, StandardFolder> = {
+  downloads: "downloads",
+  "download folder": "downloads",
+  documents: "documents",
+  "document folder": "documents",
+  desktop: "desktop",
+  home: "home",
+  "home folder": "home",
+};
+
+const pointerAliases: Record<string, PointerAction> = {
+  "move mouse left": "moveLeft",
+  "move cursor left": "moveLeft",
+  "go left": "moveLeft",
+  "move left": "moveLeft",
+  "move mouse right": "moveRight",
+  "move cursor right": "moveRight",
+  "go right": "moveRight",
+  "move right": "moveRight",
+  "move mouse up": "moveUp",
+  "move cursor up": "moveUp",
+  "move up": "moveUp",
+  "move mouse down": "moveDown",
+  "move cursor down": "moveDown",
+  "move down": "moveDown",
   "left click": "click",
   "click it": "click",
   "press it": "click",
   click: "click",
-  "double click": "double-click",
-  "double click it": "double-click",
-  "scroll up": "scroll-up",
-  "scroll down": "scroll-down",
+  "double click": "doubleClick",
+  "double click it": "doubleClick",
+  "scroll up": "scrollUp",
+  "scroll down": "scrollDown",
 };
 
-const desktopActionAliases: Record<string, string> = {
-  "app launcher": "open-launcher",
-  "application launcher": "open-launcher",
-  "open launcher": "open-launcher",
-  "open app launcher": "open-launcher",
-  "open application launcher": "open-launcher",
-  "show launcher": "open-launcher",
-  "show app launcher": "open-launcher",
-  "show application launcher": "open-launcher",
-  "volume up": "volume-up",
-  "increase volume": "volume-up",
-  "raise volume": "volume-up",
-  "turn volume up": "volume-up",
-  louder: "volume-up",
-  "volume down": "volume-down",
-  "decrease volume": "volume-down",
-  "lower volume": "volume-down",
-  "turn volume down": "volume-down",
-  quieter: "volume-down",
-  mute: "toggle-mute",
-  "toggle mute": "toggle-mute",
-  "minimize window": "minimize-window",
-  "maximize window": "maximize-window",
-  "restore window": "restore-window",
-  "next window": "next-window",
-  "previous window": "previous-window",
-  "switch window": "next-window",
-  "snap window left": "snap-left",
-  "snap window right": "snap-right",
+const keyboardAliases: Record<string, KeyboardAction> = {
+  "app launcher": "openLauncher",
+  "application launcher": "openLauncher",
+  "open launcher": "openLauncher",
+  "open app launcher": "openLauncher",
+  "open application launcher": "openLauncher",
+  "show launcher": "openLauncher",
+  "show app launcher": "openLauncher",
+  "show application launcher": "openLauncher",
+  "volume up": "volumeUp",
+  "increase volume": "volumeUp",
+  "raise volume": "volumeUp",
+  "turn volume up": "volumeUp",
+  louder: "volumeUp",
+  "volume down": "volumeDown",
+  "decrease volume": "volumeDown",
+  "lower volume": "volumeDown",
+  "turn volume down": "volumeDown",
+  quieter: "volumeDown",
+  mute: "toggleMute",
+  "toggle mute": "toggleMute",
+  "next window": "nextWindow",
+  "previous window": "previousWindow",
+  "switch window": "nextWindow",
   "left arrow": "left",
   "right arrow": "right",
   "up arrow": "up",
   "down arrow": "down",
   home: "home",
   end: "end",
-  "page up": "page-up",
-  "page down": "page-down",
+  "page up": "pageUp",
+  "page down": "pageDown",
   tab: "tab",
-  "shift tab": "shift-tab",
+  "shift tab": "shiftTab",
   enter: "enter",
   return: "enter",
   "new line": "enter",
@@ -103,7 +159,7 @@ const desktopActionAliases: Record<string, string> = {
   cancel: "escape",
   backspace: "backspace",
   delete: "delete",
-  "select all": "select-all",
+  "select all": "selectAll",
   copy: "copy",
   cut: "cut",
   paste: "paste",
@@ -111,21 +167,32 @@ const desktopActionAliases: Record<string, string> = {
   redo: "redo",
 };
 
-const focusedWindowActionPrefixes: Record<string, string> = {
-  minimize: "minimize-window",
-  minimise: "minimize-window",
-  maximize: "maximize-window",
-  maximise: "maximize-window",
-  restore: "restore-window",
+const activeWindowAliases: Record<string, WindowAction> = {
+  "minimize window": "minimize",
+  "minimise window": "minimize",
+  "maximize window": "maximize",
+  "maximise window": "maximize",
+  "restore window": "restore",
+  "snap window left": "snapLeft",
+  "snap window right": "snapRight",
 };
 
-const namedWindowActionPrefixes: Record<string, string> = {
+const namedWindowActionPrefixes: Record<string, WindowAction> = {
   minimize: "minimize",
   minimise: "minimize",
   maximize: "maximize",
   maximise: "maximize",
   restore: "restore",
 };
+
+const activeClosePhrases = new Set([
+  "close active window",
+  "close current window",
+  "close focused window",
+  "dismiss active window",
+  "dismiss current window",
+  "dismiss focused window",
+]);
 
 function normalizedText(value: string) {
   return value
@@ -151,7 +218,10 @@ function applyReplacements(value: string, replacements: string) {
 function stripConversation(value: string) {
   return value
     .replace(/^(?:hey\s+)?lucy\s+/, "")
-    .replace(/^(?:(?:can|could|would|will)\s+you\s+|i\s+(?:want|need)\s+you\s+to\s+|please\s+)+/, "")
+    .replace(
+      /^(?:(?:can|could|would|will)\s+you\s+|i\s+(?:want|need)\s+you\s+to\s+|please\s+)+/,
+      "",
+    )
     .replace(/\s+(?:please|for me)$/, "")
     .trim();
 }
@@ -184,6 +254,10 @@ function normalizeDictation(value: string) {
     .trim();
 }
 
+function canonicalApplication(value: string) {
+  return applicationAliases[value] ?? value;
+}
+
 export function interpretVoiceCommand(
   transcript: string,
   options: InterpreterOptions,
@@ -193,88 +267,139 @@ export function interpretVoiceCommand(
 
   if (replaced.startsWith("lucy ")) {
     const request = replaced.replace(/^lucy\s+/, "").trim();
-    return request
-      ? { intent: "coding_request", entity: request, transcript: original }
-      : { intent: "unsupported", entity: "", transcript: original };
+    return {
+      intent: request ? { kind: "createCodingTask", request } : null,
+      transcript: original,
+    };
   }
 
   const command = stripConversation(replaced);
-
   const textPrefix = matchingPrefix(command, ["type", "write", "dictate"]);
   if (textPrefix) {
     const text = normalizeDictation(command.slice(textPrefix.length));
-    return text
-      ? { intent: "text_input", entity: text, transcript: original }
-      : { intent: "unsupported", entity: "", transcript: original };
-  }
-
-  if (desktopActionAliases[command]) {
     return {
-      intent: "desktop_action",
-      entity: desktopActionAliases[command],
+      intent: text ? { kind: "typeText", text } : null,
       transcript: original,
     };
   }
 
-  const focusedWindowAction = matchingPrefix(
+  if (activeClosePhrases.has(command)) {
+    return { intent: { kind: "closeActiveWindow" }, transcript: original };
+  }
+
+  if (activeWindowAliases[command]) {
+    return {
+      intent: {
+        kind: "activeWindowAction",
+        action: activeWindowAliases[command],
+      },
+      transcript: original,
+    };
+  }
+
+  if (keyboardAliases[command]) {
+    return {
+      intent: { kind: "keyboardAction", action: keyboardAliases[command] },
+      transcript: original,
+    };
+  }
+
+  const namedWindowPrefix = matchingPrefix(
     command,
-    Object.keys(focusedWindowActionPrefixes),
+    Object.keys(namedWindowActionPrefixes),
   );
-  if (focusedWindowAction) {
-    const application = command.slice(focusedWindowAction.length).trim();
+  if (namedWindowPrefix) {
+    const application = command.slice(namedWindowPrefix.length).trim();
     if (application) {
       return {
-        intent: "application_window_action",
-        entity: application,
-        action: namedWindowActionPrefixes[focusedWindowAction],
+        intent: {
+          kind: "namedWindowAction",
+          application: canonicalApplication(application),
+          action: namedWindowActionPrefixes[namedWindowPrefix],
+        },
         transcript: original,
       };
     }
-    return {
-      intent: "desktop_action",
-      entity: focusedWindowActionPrefixes[focusedWindowAction],
-      transcript: original,
-    };
   }
 
-  const closePhrases = [...options.closePhrases, "shut", "shut down", "dismiss"];
-  const openPhrases = [...options.openPhrases, "run", "bring up", "show", "take me to", "go to"];
-  const closePrefix = matchingPrefix(command, closePhrases);
+  const closePrefix = matchingPrefix(command, [
+    ...options.closePhrases,
+    "shut",
+    "shut down",
+    "dismiss",
+  ]);
   if (closePrefix) {
+    const application = command.slice(closePrefix.length).trim();
     return {
-      intent: "close_application",
-      entity: command.slice(closePrefix.length).trim(),
+      intent: application
+        ? {
+            kind: "closeApplication",
+            application: canonicalApplication(application),
+          }
+        : null,
       transcript: original,
     };
   }
 
-  const openPrefix = matchingPrefix(command, openPhrases);
+  const openPrefix = matchingPrefix(command, [
+    ...options.openPhrases,
+    "run",
+    "bring up",
+    "show",
+    "take me to",
+    "go to",
+  ]);
   if (openPrefix) {
-    const entity = command.slice(openPrefix.length).trim();
-    if (desktopActionAliases[`${openPrefix} ${entity}`] || desktopActionAliases[entity]) {
+    const target = command.slice(openPrefix.length).trim();
+    if (!target) return { intent: null, transcript: original };
+    if (keyboardAliases[`${openPrefix} ${target}`] || keyboardAliases[target]) {
       return {
-        intent: "desktop_action",
-        entity: desktopActionAliases[`${openPrefix} ${entity}`] ?? desktopActionAliases[entity],
+        intent: {
+          kind: "keyboardAction",
+          action:
+            keyboardAliases[`${openPrefix} ${target}`] ??
+            keyboardAliases[target],
+        },
         transcript: original,
       };
     }
-    return folderAliases[entity]
-      ? { intent: "open_folder", entity: folderAliases[entity], transcript: original }
-      : { intent: "open_application", entity, transcript: original };
+    return {
+      intent: folderAliases[target]
+        ? { kind: "openStandardFolder", folder: folderAliases[target] }
+        : {
+            kind: "launchApplication",
+            application: canonicalApplication(target),
+          },
+      transcript: original,
+    };
   }
 
   if (folderAliases[command]) {
-    return { intent: "open_folder", entity: folderAliases[command], transcript: original };
+    return {
+      intent: { kind: "openStandardFolder", folder: folderAliases[command] },
+      transcript: original,
+    };
   }
 
   if (pointerAliases[command]) {
-    return { intent: "pointer_action", entity: pointerAliases[command], transcript: original };
+    return {
+      intent: { kind: "pointerAction", action: pointerAliases[command] },
+      transcript: original,
+    };
   }
 
-  // A bare name can only mean open; it can never imply close or a destructive action.
-  if (command && !/\b(delete|remove|shutdown|restart|sign out|uninstall)\b/.test(command)) {
-    return { intent: "open_application", entity: command, transcript: original };
+  if (
+    command &&
+    !/\b(delete|remove|shutdown|restart|sign out|uninstall)\b/.test(command)
+  ) {
+    return {
+      intent: {
+        kind: "launchApplication",
+        application: canonicalApplication(command),
+      },
+      transcript: original,
+    };
   }
 
-  return { intent: "unsupported", entity: "", transcript: original };
+  return { intent: null, transcript: original };
 }

@@ -35,8 +35,8 @@ ready merely because its predecessor's code was edited.
 | TASK-0011 | TASK-0010 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Structured multi-level review, revisions, and recovery |
 | TASK-0012 | TASK-0011 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Complete workspace change evidence and Git/non-Git inspection |
 | TASK-0013 | TASK-0012 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Frontend modularization, accessibility, and responsive operation |
-| TASK-0014 | TASK-0013 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Data lifecycle, strict backup, retention, and truthful monitoring |
-| TASK-0015 | TASK-0014 | NOT STARTED | NO | NOT STARTED | — | — | Unified voice intent and system-action policy gateway |
+| TASK-0014 | TASK-0013 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Data lifecycle, strict backup, retention, and truthful monitoring |
+| TASK-0015 | TASK-0014 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Unified voice intent and system-action policy gateway |
 | TASK-0016 | TASK-0015 | NOT STARTED | NO | NOT STARTED | — | — | Offline voice runtime, KDE portal control, and XDG integration |
 | TASK-0017 | TASK-0016 | NOT STARTED | NO | NOT STARTED | — | — | Bounded Coding, Debugging, Browser, and Financial agent capabilities |
 | TASK-0018 | TASK-0017 | NOT STARTED | NO | NOT STARTED | — | — | Reminder scheduler, structured memory, and management handoff workspaces |
@@ -981,6 +981,92 @@ ready merely because its predecessor's code was edited.
   belong to TASK-0019; packaged/live upgrade, native dialog, provider, and
   platform acceptance remain TASK-0020 work. <code>cargo-audit</code> remains
   unavailable and therefore indeterminate
+- Git closure: implementation commit
+  <code>2d19e7862d97c7f2c46080981b43c4cefc29c64b</code>
+  (<code>task14</code>) was identified from actual history at the TASK-0015
+  preflight. It was checked-out <code>main</code> HEAD, reachable from
+  <code>origin/main</code>, and both refs matched with zero ahead/behind and a
+  clean tree. Its actual 22-file scope (4,725 insertions, 324 deletions)
+  matched the reported TASK-0014 implementation with no unexplained
+  intervening state; all seven successor-preflight closure conditions passed.
+
+## TASK-0015 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>2d19e7862d97c7f2c46080981b43c4cefc29c64b</code>
+  (<code>task14</code>)
+- Starting status: clean; <code>main</code> matched <code>origin/main</code>
+  with zero ahead/behind
+- Dependency: TASK-0014 satisfied every successor-preflight condition. Its
+  implementation commit was actual checked-out/reachable history, its 22-file
+  scope matched retained evidence, and the tracker lag was backfilled above
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0015 AS PLANNED.</code>
+- Added schema-v9 <code>system_action_audits</code> with a 10,000-row cap,
+  exact request/intent/target/agent/risk/authorization bindings, legal
+  transitions, terminal activity retention, restart reconciliation from
+  <code>dispatched</code> to <code>uncertain</code>, and lifecycle totals.
+  Portable backup v3 remains unchanged and explicitly omits this authority
+  domain; legacy desktop-text approvals are expired and redacted
+- Added a closed canonical voice-intent contract for coding tasks, exact
+  application/folder/window targets, explicit active-window actions,
+  pointer/keyboard/clipboard input, and bounded text. The backend resolves one
+  active Coding or PC Control template, current workspace, capability level,
+  scopes, risk, and approval policy. Close, Cut, and Delete force one-use
+  approval; changed targets invalidate the original retry
+- Replaced direct renderer desktop commands with
+  <code>submit_voice_intent</code> and a read-only audit query. Voice-created
+  coding work uses <code>create_routed_task</code> and the normal global
+  sequential queue with a SHA-256 binding for the configured workspace path.
+  The UI reuses one request ID after approval, displays
+  backend outcomes/audits, and never mutates agent capability or automatically
+  requests KDE desktop-input permission
+- Removed the obsolete fuzzy desktop-entry lookup, caption/substring KWin
+  matching, broad <code>pkill</code> close, and implicit Alt+F4 fallback.
+  Launch/folder resolution uses exact XDG desktop metadata, configured user
+  directories, absolute base paths, and bounded registry/config traversal.
+  Configured folder targets bind a SHA-256 path digest without storing the raw
+  user path.
+  Window actions run only KWin's returned per-script object and accept a
+  token-bound acknowledgement only from KWin's current D-Bus owner; portal
+  input rechecks the active window
+- Security/privacy/recovery effects: action audit is written before dispatch;
+  terminal, failed, rejected, and uncertain outcomes are explicit; interrupted
+  dispatch is never auto-replayed; raw transcript, dictated/coding content,
+  KWin caption, and user folder path are absent from audit storage. Content
+  requiring binding is represented by SHA-256 plus length
+- Focused verification passed on 2026-08-28: 15 TASK-0015 Rust tests and 3
+  frontend files/11 tests, plus TypeScript. Coverage includes parser,
+  capability/policy, destructive approval, paused agent, unknown/ambiguous
+  target, wrong-target retry, unsafe close removal, audit transition/privacy,
+  restart uncertainty, coding-queue routing call, and narrowed IPC/client
+  surfaces
+- Complete fast gate: <code>npm run verify:fast</code> passed on 2026-08-28
+  with 19 frontend files/62 tests, TypeScript, rustfmt, and 153 locked/offline
+  Rust tests
+- Full non-live gate: <code>npm run verify:full</code> passed on 2026-08-28 with
+  the same fast checks, a 66-module production build, Clippy with warnings
+  denied, shell/Python/strict-JSON checks, npm/Cargo dependency trees, and
+  production plus full npm audits reporting zero vulnerabilities
+- Rust advisory result: **indeterminate** because <code>cargo-audit</code> is
+  unavailable; the full route recorded the skip explicitly and this
+  environmental limitation is not a pass
+- No dependency, Cargo/npm manifest/lock, provider/model protocol, microphone
+  runtime, voice installer, portal-session lifecycle, package, or release
+  version change was required
+- Live Codex/Ollama generation, provider authentication, microphone/listener,
+  KDE portal authorization, trusted KDialog approval, install/remove, desktop
+  package, and application desktop-control actions: not run
+- Remaining limits: deterministic tests establish checked-in XDG/KWin/portal
+  contracts, not live compositor, portal, microphone, restored-session, or
+  packaged behavior. TASK-0016 owns offline voice/KDE integration reliability;
+  TASK-0020 owns sequential live acceptance. Rust advisory status is
+  indeterminate in this environment because <code>cargo-audit</code> is
+  unavailable
 - Git closure: **PENDING USER** review, commit, push, and clean-tree evidence
 
 ## Successor-preflight closure rule

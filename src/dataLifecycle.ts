@@ -15,6 +15,7 @@ export type RetentionPruneCounts = {
   activity: number;
   approvals: number;
   reminders: number;
+  systemActionAudits: number;
 };
 
 export type RetentionMaintenanceResult = {
@@ -156,6 +157,7 @@ const zeroPruned: RetentionPruneCounts = {
   activity: 0,
   approvals: 0,
   reminders: 0,
+  systemActionAudits: 0,
 };
 
 export function previewMonitoringSnapshot(

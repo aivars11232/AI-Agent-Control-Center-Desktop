@@ -611,6 +611,24 @@ export function AppController() {
     return snapshot;
   }, [desktopRuntime]);
 
+  async function refreshAfterVoiceGatewayMutation() {
+    if (!desktopRuntime) return;
+    try {
+      const envelope = await desktopClient.loadApplicationState();
+      if (envelope) {
+        persistenceWriter.current?.adoptRevision(envelope.revision);
+        applyAuthoritativeApplicationState(envelope.state);
+      }
+      await refreshTaskOrchestrationSnapshot();
+      await refreshReviewOrchestrationSnapshot();
+      await refreshMonitoringSnapshot();
+    } catch (error) {
+      setPersistenceMessage(
+        `The voice action completed, but authoritative projections could not be refreshed: ${persistenceErrorMessage(error)}`,
+      );
+    }
+  }
+
   async function adoptReviewOrchestrationSnapshot(
     snapshot: ReviewOrchestrationSnapshot,
   ) {
@@ -1311,8 +1329,7 @@ export function AppController() {
         ) : activePage === "Voice Control" ? (
           <VoiceControlPage
             agents={operationalAgents}
-            setAgents={setAgents}
-            onTaskMutation={mutateTaskOrchestration}
+            onGatewayMutation={refreshAfterVoiceGatewayMutation}
             setApprovalRequests={setBackendApprovalRequests}
             preferences={preferences}
             setPreferences={setPreferences}
@@ -1396,8 +1413,7 @@ export function AppController() {
         {activePage !== "Voice Control" && (
           <VoiceControlPage
             agents={operationalAgents}
-            setAgents={setAgents}
-            onTaskMutation={mutateTaskOrchestration}
+            onGatewayMutation={refreshAfterVoiceGatewayMutation}
             setApprovalRequests={setBackendApprovalRequests}
             preferences={preferences}
             setPreferences={setPreferences}

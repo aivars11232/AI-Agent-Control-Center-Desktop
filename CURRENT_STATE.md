@@ -1,13 +1,13 @@
 # Current State
 
 > **Classification: Current static and fresh non-live evidence.** This snapshot
-> was refreshed for TASK-0014 on 2026-08-26 from starting commit
-> <code>572be762a38490f6a83076514686973e9c674c23</code>
-> (<code>task13</code>) on branch <code>main</code>. At the TASK-0014 preflight,
+> was refreshed for TASK-0015 on 2026-08-28 from starting commit
+> <code>2d19e7862d97c7f2c46080981b43c4cefc29c64b</code>
+> (<code>task14</code>) on branch <code>main</code>. At the TASK-0015 preflight,
 > checked-out <code>main</code> and <code>origin/main</code> both resolved to that
-> commit, with zero ahead/behind and a clean working tree. Its actual scope
-> matched the retained TASK-0012 implementation evidence. Reverify later
-> implementation facts when they may have drifted.
+> commit, with zero ahead/behind and a clean working tree. Its 22-file actual
+> scope matched retained TASK-0014 evidence. Reverify later implementation
+> facts when they may have drifted.
 
 This document owns statements about what is implemented now. Planned behavior
 belongs in [ARCHITECTURE.md](ARCHITECTURE.md) and
@@ -53,8 +53,15 @@ backend monitoring pages; scoped local-activity deletion; truthful desktop
 versus browser-preview labels; and explicit reset-versus-physical-purge
 wording. Fresh deterministic checks establish these non-live behaviors; they
 do not establish packaged or live runtime readiness.
+TASK-0015 adds schema-v9 canonical voice intents, backend-owned agent/workspace
+and exact Linux target resolution, action-specific capability/approval policy,
+one-use destructive confirmation, a single renderer submission surface,
+normal sequential coding-task routing, and a bounded redacted system-action
+audit with idempotent restart-safe outcomes. Exact XDG desktop entries and user
+directories plus exact KWin internal-window IDs replace fuzzy application,
+caption, broad-process, and accidental active-window fallbacks.
 
-TASK-0014 did **not** run a live Codex task, Ollama, or another model/provider.
+TASK-0015 did **not** run a live Codex task, Ollama, or another model/provider.
 It also did not capture microphone input; import or start the Python listener;
 authorize a KDE/XDG portal; execute install/remove scripts; build a desktop
 package; or perform a desktop/system-control action. The retained TASK-0008
@@ -98,8 +105,8 @@ remain historical unless this document identifies a fresh result.
 | <code>src/dataLifecycle.ts</code> | Typed portable-backup, retention-evidence, monitoring-revision, task-page, and activity-page projections plus explicit browser-preview monitoring |
 | <code>src/persistence.ts</code> | Typed desktop bootstrap, one-time legacy cleanup, serialized writes, strict backup preview/import, and reset adapter |
 | <code>src/App.css</code> / <code>src/styles/</code> / feature CSS | Ordered style entry, tokens, shell/shared/workflow/evidence/responsive rules, and feature-owned Dashboard/Settings rules |
-| <code>src/voiceCommand.ts</code> | Renderer voice-command interpretation |
-| <code>src-tauri/src/lib.rs</code> | Tauri command/startup composition, provider tool-loop orchestration, workspace evidence, native desktop control, and voice process management |
+| <code>src/voiceCommand.ts</code> | Canonical renderer voice-intent interpretation with explicit active-window semantics |
+| <code>src-tauri/src/lib.rs</code> | Tauri command/startup composition, provider tool-loop orchestration, unified voice/system-action gateway, workspace evidence, native adapters, and voice process management |
 | <code>src-tauri/src/provider_runtime.rs</code> | Provider-neutral identity, capability, request, event, cancellation, result, error, adapter, registry, and fake-test contracts |
 | <code>src-tauri/src/codex_runtime.rs</code> | Linux Codex compatibility probing, isolated command construction, bounded JSONL protocol handling, lifecycle containment, cancellation, timeout, and evidence capture |
 | <code>src-tauri/src/ollama_runtime.rs</code> | Fixed-loopback Ollama discovery, per-model metadata, bounded async HTTP, task-deadline cancellation, and chat transport |
@@ -112,6 +119,8 @@ remain historical unless this document identifies a fresh result.
 | <code>src-tauri/src/policy.rs</code> / <code>src-tauri/src/authorization.rs</code> | Normalized action intents, capability evaluation, native confirmation, and approval IPC contracts |
 | <code>src-tauri/src/run_coordinator.rs</code> | Run states, legal transitions, ledger projections, and explicit evidence/retention bounds |
 | <code>src-tauri/src/data_lifecycle.rs</code> | Strict duplicate-free bounded backup parsing, portable-state sanitization, backup/monitoring DTOs, and lifecycle constants |
+| <code>src-tauri/src/system_actions.rs</code> | Closed canonical voice/system-action types, validation, exact-target authorization contract, risk classes, and redacted audit DTOs |
+| <code>src-tauri/src/linux_desktop.rs</code> | Exact XDG desktop-entry/user-directory resolution and strict KWin target/action adapter |
 | <code>src-tauri/src/persistence.rs</code> / <code>src-tauri/migrations/</code> | SQLite repository/service, schema migration, crash-safe transactions, and persistence tests |
 | <code>src-tauri/src/main.rs</code> | Desktop entry point |
 | <code>src-tauri/tauri.conf.json</code> | Tauri window, security, bundle, and resource configuration |
@@ -238,6 +247,15 @@ review history; activity retention governs local activity, resolved/consumed
 approval history, and resolved reminders. <code>never</code> disables the
 age-based policy but does not remove the existing hard aggregate/ledger caps.
 
+Migration 0009 adds a maximum-10,000 system-action audit, lifecycle retention
+columns, policy-v5/intent-v3 evidence, and conservative expiry/redaction of
+legacy desktop-text approval intents. Audit transitions bind one request ID to
+one intent fingerprint, exact target, agent, risk class, authorization
+evidence, and redacted content digest. Terminal records follow activity
+retention; pending approval and dispatched records remain protected. Startup
+turns an interrupted dispatched record into <code>uncertain</code> without
+repeating the action.
+
 Portable backup v3 is capped at 16 MiB and 128 JSON levels, rejects duplicate
 keys, unknown fields, trailing content, unsupported versions, and future
 schemas, and sanitizes active tasks/approvals/runtime evidence before export or
@@ -245,7 +263,8 @@ import. Import preview and apply use the same backend candidate, compare the
 application revision, require an idle run boundary and trusted native
 confirmation, clear mismatched run/review history, and commit atomically.
 Provider credentials, authorization intents, run/review ledgers, portal
-sessions, and voice-runtime sessions are not portable backup domains.
+sessions, voice-runtime sessions, and the system-action audit are not portable
+backup domains.
 
 Dashboard, Tasks, Activity, and Settings consume backend monitoring snapshots
 and pages bound to one application/task/run/review/lifecycle revision tuple.
@@ -392,7 +411,7 @@ duplicate identities, rejects unsupported provider labels, and rejects a model
 whose adapter does not match the active provider. It does not silently switch
 providers or fall back. The policy and intent fingerprints collectively bind
 catalog model ID, catalog provider, runtime provider, active provider, and any
-exact review-stage context under <code>policy-v4</code>/<code>intent-v2</code>;
+exact review-stage context under <code>policy-v5</code>/<code>intent-v3</code>;
 an older or stale approval therefore fails exact matching rather than
 authorizing a changed provider or review decision.
 
@@ -529,24 +548,35 @@ explicit continuation cursor/offset and truncation flag.
 
 ## Native desktop and voice behavior
 
-The Tauri invoke surface includes workspace selection/opening, application and
-window control, keyboard/pointer/text actions, desktop-control status,
-Codex/Ollama execution and cancellation, and voice-runtime setup/listener
-commands. The Python voice runtime and its setup scripts are bundled as a
-resource.
+The renderer submits task, application, standard-folder, explicit active/named
+window, pointer, keyboard/clipboard, and bounded typing requests through
+<code>submit_voice_intent</code>. It cannot invoke the former direct privileged
+application/window/input commands. The backend resolves the one active Coding
+or PC Control template and active workspace, evaluates current persisted
+capability/approval policy, records an exact audit transition before dispatch,
+and returns one user-visible outcome. Close, Cut, and Delete always require a
+one-use trusted approval even when policy otherwise allows system actions.
+Approval retry reuses the same request ID and refuses a changed exact target.
+Voice-created coding work also binds the active workspace ID and a SHA-256 of
+its configured path without writing the raw workspace path to the action audit.
 
-Every current privileged workspace-open, application/window,
-keyboard/clipboard, pointer/text, voice-install, microphone-start, and portal
-command constructs a typed backend intent and consumes authorization before
-its first side effect. Provider runs reserve authorization during atomic
-admission and consume it at the successful startup boundary described above.
-Voice listener configuration is derived from persisted backend preferences
-rather than a renderer-supplied config IPC. Safe stop and status commands
-remain directly available.
+Application launch uses an exact XDG desktop-entry ID or unique exact desktop
+name. Standard folders use <code>user-dirs.dirs</code> rather than guessed
+paths. Named KWin actions require one exact desktop-entry match and one exact
+normal window; active-window actions require explicit wording and recheck the
+KWin internal ID before portal input. Broad <code>pkill</code>, caption/
+substring matching, and implicit Alt+F4 fallback are absent. KWin operations
+use create-new private temporary scripts, execute only the returned per-script
+D-Bus object, and accept strict token-bound acknowledgements only from KWin's
+current D-Bus owner. Relative XDG base-directory and PATH entries are ignored,
+registry/config traversal is bounded, and configured folder-path drift is
+detected through a SHA-256 binding without persisting the raw path. Timeout
+after dispatch is recorded as <code>uncertain</code>.
 
-These paths exist in source, but TASK-0005 did not exercise them. TASK-0015
-retains structured voice-intent behavior and TASK-0016 retains offline voice
-and KDE/XDG live integration acceptance.
+The Python voice runtime and setup scripts remain bundled. Voice-runtime
+installation, microphone behavior, restored portal sessions, and live
+KDE/Wayland/XDG compatibility were not exercised; TASK-0016 and TASK-0020 own
+those later runtime and acceptance gates.
 
 ## Current safety enforcement
 
@@ -563,6 +593,11 @@ The backend currently:
   from renderer overwrites;
 - derives maximum capabilities and approval modes from backend state;
 - rejects paused, missing, wrong-task, and ineligible review agents;
+- resolves voice coding and PC-control identities only from one active backend
+  template, and routes coding requests through the normal global queue;
+- refuses unknown/ambiguous XDG or KWin targets and exact-target drift, forces
+  one-use approval for destructive actions, and audits dispatch/outcome without
+  raw transcript, dictated text, coding request, caption, or user path;
 - rejects administrator terminal access and forces review runs to be
   read-only with no elevated authorization;
 - requires an exact backend-issued review flow/stage/round/fingerprint binding,
@@ -592,7 +627,7 @@ and WebSocket endpoints.
 
 ## Verification inventory
 
-Eighteen Vitest files contain 61 deterministic frontend tests for renderer
+Nineteen Vitest files contain 62 deterministic frontend tests for renderer
 domain characterization, voice, persistence, revision/fail-closed writer
 behavior, authoritative run/provider/registry/queue/review projections, exact
 desktop command/event mappings, native-dialog focus and cancellation, APG tab
@@ -600,7 +635,7 @@ keyboard behavior, keyboard agent-card activation, skip navigation, page-focus
 transfer, deterministic axe checks, and responsive provider/reduced-motion
 style contracts.
 
-The Rust library contains 138 passing tests. They add Codex compatibility,
+The Rust library contains 153 passing tests. They add Codex compatibility,
 command-isolation, bounded protocol, fake-process descendant cleanup, provider
 registry, fake-adapter dispatch, exact identity, typed failure, run-state,
 concurrent admission, idempotency, approval-boundary, cancellation, timeout,
@@ -659,6 +694,18 @@ writer/browser-preview/typed-client tests, TypeScript, and a 66-module
 production build. The complete fast and full gate results are recorded in
 [planning/TASK_STATUS.md](planning/TASK_STATUS.md).
 
+TASK-0015 focused checks passed on 2026-08-28: 15 Rust tests cover canonical
+redaction/bounds, exact XDG/KWin targets, policy, destructive approval,
+paused-agent rejection, schema/audit transitions, restart uncertainty,
+wrong-target retry refusal, and the narrowed IPC surface. Three frontend
+files/11 tests cover canonical parsing, unknown-close safety, exact typed
+client payloads, one backend submission, explicit portal enablement, and
+same-ID approval retry. TypeScript passed, and the complete fast gate passed
+with 19 frontend files/62 tests and 153 locked/offline Rust tests. The complete
+full gate also passed with a 66-module production build, Clippy warnings denied,
+shell/Python/strict-JSON checks, npm/Cargo dependency trees, and production plus
+full npm audits reporting zero vulnerabilities.
+
 <code>cargo-audit</code> is not installed in the inspected environment. The
 full route therefore reports the Rust advisory result as **indeterminate** and
 does not represent the skip as a pass. Mandatory installed/CI security tooling
@@ -673,7 +720,7 @@ belongs to TASK-0019.
 | Live Ollama connectivity, installed-model behavior, cancellation, and packaged-platform acceptance | TASK-0020 |
 | Physical database/file purge and installed removal evidence | TASK-0019 |
 | Installed WebView, packaged accessibility, and live platform acceptance | TASK-0020 |
-| Voice/system policy and KDE/XDG integration | TASK-0015–TASK-0016 |
+| Offline voice-runtime reliability and live KDE/portal/XDG acceptance | TASK-0016 and TASK-0020 |
 | Bounded specialist capabilities and management handoffs | TASK-0017–TASK-0018 |
 | Packaging, CI, live acceptance, and production gate | TASK-0019–TASK-0020 |
 

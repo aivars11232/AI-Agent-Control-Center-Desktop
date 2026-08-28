@@ -19,7 +19,7 @@ pub const MAINTENANCE_INTERVAL_SECONDS: u64 = 15 * 60;
 pub const MAINTENANCE_BACKLOG_INTERVAL_SECONDS: u64 = 60;
 pub const MONITORING_PAGE_LIMIT: i64 = 100;
 
-const OMITTED_DOMAINS: [&str; 7] = [
+const OMITTED_DOMAINS: [&str; 8] = [
     "providerCredentials",
     "authorizationIntents",
     "runReservations",
@@ -27,6 +27,7 @@ const OMITTED_DOMAINS: [&str; 7] = [
     "reviewFlows",
     "portalSessions",
     "voiceRuntimeSessions",
+    "systemActionAudit",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -94,6 +95,7 @@ pub struct RetentionPruneCounts {
     pub activity: i64,
     pub approvals: i64,
     pub reminders: i64,
+    pub system_action_audits: i64,
 }
 
 impl RetentionPruneCounts {

@@ -39,7 +39,7 @@ function clientHarness() {
 }
 
 describe("typed desktop client command contracts", () => {
-  it("maps authorization, run, review, workspace, and desktop actions exactly", async () => {
+  it("maps authorization, run, review, workspace, and the unified gateway exactly", async () => {
     const { calls, client } = clientHarness();
     const reviewContext = {
       flowId: 31,
@@ -86,15 +86,14 @@ describe("typed desktop client command contracts", () => {
       itemPath: "src/main.ts",
     });
     await client.enableDesktopControl(4);
-    await client.launchAllowedApplication(4, "firefox");
-    await client.closeAllowedApplication(4, "firefox");
-    await client.sendDesktopPointerAction(4, "left-click");
-    await client.sendDesktopKeyboardAction(4, "ctrl+l");
-    await client.controlNamedDesktopWindow(4, "firefox", "maximize");
-    await client.typeDesktopText(4, "bounded text");
-    await client.launchDesktopApplication(4, "org.kde.dolphin");
-    await client.openStandardFolder(4, "Documents");
-    await client.closeActiveDesktopApplication(4);
+    await client.submitVoiceIntent({
+      requestId: "voice:gateway-12",
+      intent: {
+        kind: "closeApplication",
+        application: "firefox.desktop",
+      },
+    });
+    await client.querySystemActionAudits(25);
 
     expect(calls).toEqual([
       {
@@ -163,41 +162,18 @@ describe("typed desktop client command contracts", () => {
       },
       { command: "enable_desktop_control", args: { agentId: 4 } },
       {
-        command: "launch_allowed_application",
-        args: { agentId: 4, application: "firefox" },
+        command: "submit_voice_intent",
+        args: {
+          request: {
+            requestId: "voice:gateway-12",
+            intent: {
+              kind: "closeApplication",
+              application: "firefox.desktop",
+            },
+          },
+        },
       },
-      {
-        command: "close_allowed_application",
-        args: { agentId: 4, application: "firefox" },
-      },
-      {
-        command: "send_desktop_pointer_action",
-        args: { agentId: 4, action: "left-click" },
-      },
-      {
-        command: "send_desktop_keyboard_action",
-        args: { agentId: 4, action: "ctrl+l" },
-      },
-      {
-        command: "control_named_desktop_window",
-        args: { agentId: 4, application: "firefox", action: "maximize" },
-      },
-      {
-        command: "type_desktop_text",
-        args: { agentId: 4, text: "bounded text" },
-      },
-      {
-        command: "launch_desktop_application",
-        args: { agentId: 4, application: "org.kde.dolphin" },
-      },
-      {
-        command: "open_standard_folder",
-        args: { agentId: 4, folder: "Documents" },
-      },
-      {
-        command: "close_active_desktop_application",
-        args: { agentId: 4 },
-      },
+      { command: "query_system_action_audits", args: { limit: 25 } },
     ]);
   });
 

@@ -143,9 +143,11 @@ platform acceptance remains part of TASK-0020.
 
 ### M5 — Make voice and KDE safe
 
-TASK-0015 routes voice and system intents through the authoritative policy
-gateway. TASK-0016 implements and verifies the offline runtime plus native
-KDE/Wayland/XDG mechanisms and bounded workarounds.
+TASK-0015 now routes canonical voice/system intents through one authoritative
+policy, approval, exact-target, dispatch, and redacted-audit gateway; coding
+requests enter the existing sequential queue. TASK-0016 remains responsible
+for offline runtime reliability plus live native KDE/Wayland/XDG mechanisms
+and bounded workarounds.
 
 ### M6 — Complete bounded core agents
 

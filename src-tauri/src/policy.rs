@@ -2,12 +2,13 @@ use crate::{
     app_state::{Agent, AgentTask, ApplicationState, WorkspaceDefinition},
     provider_runtime::resolve_model_identity,
     review_orchestration::ReviewIntentContext,
+    system_actions::{AuthorizedSystemAction, KeyboardAction},
 };
 use serde::{Deserialize, Serialize};
 
 const MAX_INTENT_TEXT: usize = 4 * 1024;
-const POLICY_FINGERPRINT_VERSION: &str = "policy-v4";
-const INTENT_FINGERPRINT_VERSION: &str = "intent-v2";
+const POLICY_FINGERPRINT_VERSION: &str = "policy-v5";
+const INTENT_FINGERPRINT_VERSION: &str = "intent-v3";
 const WORKSPACE_FINGERPRINT_VERSION: &str = "workspace-v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +38,16 @@ pub enum ActionIntent {
         agent_id: i64,
         workspace_id: String,
         item_path: String,
+    },
+    CreateCodingTask {
+        agent_id: i64,
+        workspace_id: String,
+        request_sha256: String,
+        request_length: usize,
+    },
+    SystemAction {
+        agent_id: i64,
+        action: AuthorizedSystemAction,
     },
     LaunchAllowedApplication {
         agent_id: i64,
@@ -68,7 +79,8 @@ pub enum ActionIntent {
     },
     TypeDesktopText {
         agent_id: i64,
-        text: String,
+        text_sha256: String,
+        text_length: usize,
     },
     EnableDesktopControl {
         agent_id: i64,
@@ -93,6 +105,8 @@ impl ActionIntent {
         match self {
             Self::RunTask { agent_id, .. }
             | Self::OpenWorkspaceItem { agent_id, .. }
+            | Self::CreateCodingTask { agent_id, .. }
+            | Self::SystemAction { agent_id, .. }
             | Self::LaunchAllowedApplication { agent_id, .. }
             | Self::LaunchDesktopApplication { agent_id, .. }
             | Self::OpenStandardFolder { agent_id, .. }
@@ -113,6 +127,8 @@ impl ActionIntent {
         match self {
             Self::RunTask { .. } => "runTask",
             Self::OpenWorkspaceItem { .. } => "openWorkspaceItem",
+            Self::CreateCodingTask { .. } => "createCodingTask",
+            Self::SystemAction { .. } => "systemAction",
             Self::LaunchAllowedApplication { .. } => "launchAllowedApplication",
             Self::LaunchDesktopApplication { .. } => "launchDesktopApplication",
             Self::OpenStandardFolder { .. } => "openStandardFolder",
@@ -171,6 +187,25 @@ impl ActionIntent {
                 validate_text("workspace identifier", workspace_id, 256)?;
                 validate_text("workspace item path", item_path, MAX_INTENT_TEXT)
             }
+            Self::CreateCodingTask {
+                workspace_id,
+                request_sha256,
+                request_length,
+                ..
+            } => {
+                validate_text("workspace identifier", workspace_id, 256)?;
+                validate_sha256(request_sha256)?;
+                if *request_length == 0 || *request_length > MAX_INTENT_TEXT {
+                    return Err(PolicyDenial::new(
+                        "INVALID_INTENT",
+                        "The coding-request authorization has an invalid length.",
+                    ));
+                }
+                Ok(())
+            }
+            Self::SystemAction { action, .. } => action
+                .validate()
+                .map_err(|error| PolicyDenial::new(error.code, error.message)),
             Self::LaunchAllowedApplication { application, .. }
             | Self::LaunchDesktopApplication { application, .. }
             | Self::CloseAllowedApplication { application, .. } => {
@@ -190,20 +225,19 @@ impl ActionIntent {
                 validate_text("application", application, 256)?;
                 validate_text("window action", action, 128)
             }
-            Self::TypeDesktopText { text, .. } => {
-                if text.trim().is_empty()
-                    || text.len() > MAX_INTENT_TEXT
-                    || text
-                        .chars()
-                        .any(|character| character.is_control() && character != '\n')
-                {
-                    Err(PolicyDenial::new(
+            Self::TypeDesktopText {
+                text_sha256,
+                text_length,
+                ..
+            } => {
+                validate_sha256(text_sha256)?;
+                if *text_length == 0 || *text_length > MAX_INTENT_TEXT {
+                    return Err(PolicyDenial::new(
                         "INVALID_INTENT",
-                        "The desktop text is empty, too long, or contains unsupported control characters.",
-                    ))
-                } else {
-                    Ok(())
+                        "The desktop-text authorization has an invalid length.",
+                    ));
                 }
+                Ok(())
             }
             _ => Ok(()),
         }
@@ -215,6 +249,16 @@ fn validate_text(label: &str, value: &str, maximum: usize) -> Result<(), PolicyD
         return Err(PolicyDenial::new(
             "INVALID_INTENT",
             format!("The {label} is empty, too long, or contains control characters."),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str) -> Result<(), PolicyDenial> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(PolicyDenial::new(
+            "INVALID_INTENT",
+            "The authorization intent has an invalid content digest.",
         ));
     }
     Ok(())
@@ -372,6 +416,9 @@ impl<'a> EvaluationContext<'a> {
             ActionIntent::OpenWorkspaceItem { workspace_id, .. } => {
                 (None, Some(find_workspace(state, workspace_id)?))
             }
+            ActionIntent::CreateCodingTask { workspace_id, .. } => {
+                (None, Some(find_workspace(state, workspace_id)?))
+            }
             _ => (None, None),
         };
 
@@ -397,6 +444,17 @@ impl<'a> EvaluationContext<'a> {
                 self.title = "Open workspace item".to_string();
                 self.risk_level = "Low";
                 self.require_scope(Scope::Files, 1)
+            }
+            ActionIntent::CreateCodingTask { .. } => {
+                self.title = "Create coding task".to_string();
+                self.risk_level = "Medium";
+                self.reason =
+                    "A backend-routed coding task can modify the selected workspace when it runs."
+                        .to_string();
+                self.require_scope(Scope::Files, 2)
+            }
+            ActionIntent::SystemAction { action, .. } => {
+                self.evaluate_authorized_system_action(action)
             }
             ActionIntent::DesktopKeyboard { action, .. } => {
                 self.evaluate_system_action("Send desktop keyboard input", true)?;
@@ -649,6 +707,48 @@ impl<'a> EvaluationContext<'a> {
         self.risk_level = "High";
         self.force_approval = force_approval;
         self.require_scope(Scope::System, 3)
+    }
+
+    fn evaluate_authorized_system_action(
+        &mut self,
+        action: &AuthorizedSystemAction,
+    ) -> Result<(), PolicyDenial> {
+        self.title = match action {
+            AuthorizedSystemAction::LaunchApplication { .. } => "Launch desktop application",
+            AuthorizedSystemAction::OpenStandardFolder { .. } => "Open standard folder",
+            AuthorizedSystemAction::CloseWindow { .. } => "Close exact desktop window",
+            AuthorizedSystemAction::Pointer { .. } => "Send desktop pointer input",
+            AuthorizedSystemAction::Keyboard { .. } => "Send desktop keyboard input",
+            AuthorizedSystemAction::Window { .. } => "Control exact desktop window",
+            AuthorizedSystemAction::TypeText { .. } => "Type redacted desktop text",
+        }
+        .to_string();
+        self.risk_level = match action.risk_class() {
+            "destructive" => "High",
+            "meaningful" => "Medium",
+            _ => "Low",
+        };
+        self.force_approval = action.force_approval();
+        let minimum_system_level = match action {
+            AuthorizedSystemAction::LaunchApplication { .. }
+            | AuthorizedSystemAction::OpenStandardFolder { .. } => 1,
+            _ => 3,
+        };
+        self.require_scope(Scope::System, minimum_system_level)?;
+        if let AuthorizedSystemAction::Keyboard { action, .. } = action {
+            match action {
+                KeyboardAction::Copy => self.require_scope(Scope::Clipboard, 1)?,
+                KeyboardAction::Cut | KeyboardAction::Paste => {
+                    self.require_scope(Scope::Clipboard, 2)?
+                }
+                _ => {}
+            }
+        }
+        self.reason = format!(
+            "{} desktop action is bound to an exact backend-resolved target.",
+            action.risk_class()
+        );
+        Ok(())
     }
 
     fn replace_scope_requirement(
@@ -1043,8 +1143,8 @@ mod tests {
         assert_eq!(evaluation.task_id, Some(41));
         assert_eq!(evaluation.workspace_id.as_deref(), Some("workspace-1"));
         assert!(evaluation.scopes.contains(&Scope::Files));
-        assert!(evaluation.policy_fingerprint.starts_with("policy-v4|"));
-        assert!(evaluation.intent_fingerprint.starts_with("intent-v2|"));
+        assert!(evaluation.policy_fingerprint.starts_with("policy-v5|"));
+        assert!(evaluation.intent_fingerprint.starts_with("intent-v3|"));
     }
 
     #[test]
@@ -1176,7 +1276,9 @@ mod tests {
             },
             ActionIntent::TypeDesktopText {
                 agent_id: 7,
-                text: "safe text".to_string(),
+                text_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+                text_length: 9,
             },
             ActionIntent::EnableDesktopControl { agent_id: 7 },
             ActionIntent::DesktopPointer {
@@ -1232,5 +1334,87 @@ mod tests {
             evaluate_policy(&state, &missing).unwrap_err().code,
             "WORKSPACE_NOT_FOUND"
         );
+    }
+
+    #[test]
+    fn task_0015_system_policy_uses_backend_agent_state_and_risk_class() {
+        let mut state = state_with_task();
+        let pc_agent = state
+            .agents
+            .iter_mut()
+            .find(|agent| agent.template_key.as_deref() == Some("pc-control"))
+            .unwrap();
+        pc_agent.status = "Working".to_string();
+        pc_agent.capabilities.system = "full".to_string();
+        pc_agent.capabilities.clipboard = "full".to_string();
+        pc_agent.approvals.system = "allow".to_string();
+        pc_agent.approvals.clipboard = "allow".to_string();
+        let launch = ActionIntent::SystemAction {
+            agent_id: pc_agent.id,
+            action: AuthorizedSystemAction::LaunchApplication {
+                desktop_id: "org.example.Editor.desktop".to_string(),
+            },
+        };
+        let close = ActionIntent::SystemAction {
+            agent_id: pc_agent.id,
+            action: AuthorizedSystemAction::CloseWindow {
+                window_id: "exact-window-id".to_string(),
+                desktop_id: "org.example.Editor.desktop".to_string(),
+            },
+        };
+        let cut = ActionIntent::SystemAction {
+            agent_id: pc_agent.id,
+            action: AuthorizedSystemAction::Keyboard {
+                action: KeyboardAction::Cut,
+                window_id: Some("exact-window-id".to_string()),
+            },
+        };
+
+        assert_eq!(
+            evaluate_policy(&state, &launch).unwrap().disposition,
+            PolicyDisposition::Allow
+        );
+        assert_eq!(
+            evaluate_policy(&state, &close).unwrap().disposition,
+            PolicyDisposition::ApprovalRequired
+        );
+        let cut_policy = evaluate_policy(&state, &cut).unwrap();
+        assert_eq!(cut_policy.disposition, PolicyDisposition::ApprovalRequired);
+        assert!(cut_policy.scopes.contains(&Scope::Clipboard));
+
+        state
+            .agents
+            .iter_mut()
+            .find(|agent| agent.template_key.as_deref() == Some("pc-control"))
+            .unwrap()
+            .status = "Paused".to_string();
+        assert_eq!(
+            evaluate_policy(&state, &launch).unwrap_err().code,
+            "AGENT_PAUSED"
+        );
+    }
+
+    #[test]
+    fn task_0015_coding_task_policy_binds_backend_workspace_without_raw_request() {
+        let mut state = state_with_task();
+        let coding = state
+            .agents
+            .iter_mut()
+            .find(|agent| agent.template_key.as_deref() == Some("coding"))
+            .unwrap();
+        coding.status = "Working".to_string();
+        coding.capabilities.files = "full".to_string();
+        coding.approvals.files = "allow".to_string();
+        let intent = ActionIntent::CreateCodingTask {
+            agent_id: coding.id,
+            workspace_id: "workspace-1".to_string(),
+            request_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            request_length: 24,
+        };
+        let policy = evaluate_policy(&state, &intent).unwrap();
+        assert_eq!(policy.workspace_id.as_deref(), Some("workspace-1"));
+        assert_eq!(policy.risk_level, "Medium");
+        assert!(!policy.intent_fingerprint.contains("refactor the parser"));
     }
 }

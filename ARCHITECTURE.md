@@ -41,6 +41,7 @@ The binding decision record is
       |-- structured review-flow projection (src/reviewOrchestration.ts)
       |-- run snapshot/event projection (src/runCoordinator.ts)
       |-- structured workspace-evidence projection (src/workspaceEvidence.ts)
+      |-- canonical voice-intent interpretation (src/voiceCommand.ts)
       |-- browser-preview localStorage (non-authoritative compatibility only)
       |-- renderer presentation: review controls and task view state
       |
@@ -58,7 +59,8 @@ The binding decision record is
       |     |-- bounded Ollama HTTP runtime (ollama_runtime.rs)
       |     |-- descriptor-confined workspace tools (workspace_tools.rs)
       |-- versioned filesystem/Git evidence collector (workspace_evidence.rs)
-      |-- application/window/input control
+      |-- canonical system-action contract/audit (system_actions.rs)
+      |-- exact XDG/KWin adapter (linux_desktop.rs)
       |-- Python voice listener process
       v
     Selected workspaces and local desktop environment
@@ -72,8 +74,9 @@ coordination, event subscriptions, and feature composition, while
 skip navigation, page-focus transfer, and the global-run banner. Page UI lives
 under <code>src/features/</code>; accessible dialog, tabs, live status, and
 keyboard action primitives live under <code>src/components/</code>. The typed
-<code>src/services/desktopClient.ts</code> facade preserves the existing Tauri
-command names, payloads, and event channels.
+<code>src/services/desktopClient.ts</code> facade centralizes Tauri commands,
+payloads, and event channels. Voice Control exposes one canonical submission
+and one read-only audit query rather than direct privileged desktop methods.
 Persisted renderer types and the canonical seed are separated into
 <code>src/applicationState.ts</code> and
 <code>src/application-state-seed.json</code>. The desktop renderer gates the UI
@@ -109,7 +112,9 @@ also composes <code>app_state.rs</code>, <code>policy.rs</code>,
 <code>authorization.rs</code>, <code>run_coordinator.rs</code>,
 <code>provider_runtime.rs</code>, <code>codex_runtime.rs</code>,
 <code>ollama_runtime.rs</code>, <code>workspace_tools.rs</code>,
-<code>workspace_evidence.rs</code>, and <code>persistence.rs</code>. Those modules
+<code>workspace_evidence.rs</code>, <code>data_lifecycle.rs</code>,
+<code>system_actions.rs</code>, <code>linux_desktop.rs</code>, and
+<code>persistence.rs</code>. Those modules
 own the versioned state contract, normalized action intents, fail-closed
 capability evaluation, authoritative approval lifecycle, legal run transitions
 and evidence bounds, provider identity/contracts/dispatch, isolated Codex
@@ -118,8 +123,9 @@ transport/discovery, descriptor-confined conflict-safe workspace edits and
 before/after evidence capture, hardened Git inspection,
 validated agent identity/lifecycle/hierarchy operations, deterministic routing
 and queue evidence, structured reporting-chain review and verdict validation,
-SQLite
-schema/repository, legacy migration, and typed state IPC. The provider registry
+canonical voice/system-action contracts, exact Linux desktop target
+resolution, bounded redacted action audit, SQLite schema/repository, legacy
+migration, and typed state IPC. The provider registry
 exposes only Codex and Ollama adapters and rejects provider/model mismatch
 without fallback. Non-run
 privileged command handlers consume backend authorization before their first
@@ -129,8 +135,8 @@ provider startup.
 ### Persistence and migration
 
 The desktop database is <code>application-state.sqlite3</code> below Tauri's
-platform application-data directory. Migrations 0001 through 0008 establish
-schema version 8 plus a migration ledger. Repository writes replace one
+platform application-data directory. Migrations 0001 through 0009 establish
+schema version 9 plus a migration ledger. Repository writes replace one
 validated aggregate inside an immediate transaction and use a monotonically
 increasing revision to reject stale writers. Startup refuses corrupt or
 unsupported newer databases and retains the typed error for the renderer
@@ -209,6 +215,13 @@ task, run, review, and lifecycle revisions that its exact deletions affect.
 Normalized timestamps survive unrelated aggregate-state saves, so an inferred
 legacy age cannot silently move forward on each renderer mutation.
 
+Schema v9 adds an immutable-binding system-action audit capped at 10,000 rows,
+plus lifecycle totals/run counts for terminal audit retention. Request IDs bind
+canonical intent fingerprints to exact targets and authorization evidence.
+Restart reconciliation changes a pre-crash <code>dispatched</code> action to
+<code>uncertain</code> and never repeats it. Portable backup v3 intentionally
+omits this local authority/evidence domain.
+
 Monitoring reads the application, task-orchestration, run-coordinator,
 review-orchestration, and lifecycle revisions in one transaction. Task and
 activity page queries require that exact tuple, reject stale callers, and cap
@@ -223,9 +236,39 @@ query is loading rather than falling back to renderer estimates.
 ### Voice runtime
 
 <code>voice-runtime/listener.py</code> is a bundled local Python listener. Setup
-scripts prepare its runtime and optional higher-accuracy support. Renderer
-voice interpretation also exists. Installation, microphone, and portal
-behavior were not exercised in TASK-0001.
+scripts prepare its runtime and optional higher-accuracy support.
+<code>src/voiceCommand.ts</code> maps local transcripts or typed commands to a
+closed canonical intent union. The backend—not the renderer—selects the current
+agent/workspace, resolves exact XDG/KWin targets, derives risk and scopes,
+issues/consumes approval, writes audit transitions, and dispatches.
+Voice-created coding tasks use the existing routed-task transaction and global
+sequential queue. Raw transcripts are not sent to the gateway; dictated and
+coding content are represented in the action audit only by SHA-256 and length,
+while configured workspace paths are bound by SHA-256 without storing the raw
+path.
+
+The existing offline listener, microphone, and RemoteDesktop-session lifecycle
+remain separate native boundaries. TASK-0015 did not execute them; TASK-0016
+owns their runtime reliability and TASK-0020 owns live/package acceptance.
+
+### Current voice/system-action flow
+
+1. The renderer interprets untrusted local input into one bounded typed intent
+   and assigns an idempotency key.
+2. The backend loads current state and resolves one active Coding or PC Control
+   template plus the selected workspace or exact native target.
+3. Policy derives scopes/risk from backend state. Close, Cut, and Delete force
+   one-use approval; other actions follow the persisted approval mode.
+4. Approval-required retries retain the same request and target binding.
+   Target drift terminates the request without dispatch.
+5. The backend records <code>dispatched</code> before the platform/task side
+   effect, then records <code>applied</code>, <code>taskCreated</code>,
+   <code>failed</code>, or <code>uncertain</code>.
+6. XDG launch/folder actions use exact native metadata, bind configured folder
+   paths by SHA-256, and ignore relative base-directory values. KWin runs only its returned
+   <code>/Scripting/Script{id}</code> object and reports through a token-bound
+   callback authenticated to KWin's current D-Bus owner. Portal input rechecks
+   the active window, and coding work enters the normal queue.
 
 ### External and operating-system boundaries
 
@@ -322,6 +365,9 @@ they carry behavior; TASK-0001 intentionally creates no empty placeholders.
 TASK-0013 implements the modular renderer boundaries. TASK-0014 connects its
 Dashboard, Tasks, Activity, and Settings projections to revision-bound backend
 monitoring and data-lifecycle commands without moving authority into the UI.
+TASK-0015 connects Voice Control to the typed backend gateway and audit without
+moving agent selection, capability decisions, target resolution, or dispatch
+authority into the UI.
 
 The renderer may request actions and display decisions. It must not mint
 authorization, decide durable run truth, or become the sole owner of domain
@@ -436,8 +482,9 @@ establishes structured review/revision/recovery; TASK-0012 establishes complete
 bounded workspace evidence orchestration; TASK-0013 establishes the modular,
 accessible, responsive renderer; TASK-0014 establishes strict portable backup,
 bounded continuous retention, and truthful revision-bound monitoring.
-TASK-0015 and TASK-0016 own system actions and
-KDE/voice integration. TASK-0017 through TASK-0020 complete bounded roles,
+TASK-0015 establishes the unified system-action policy/audit gateway;
+TASK-0016 retains offline voice and live KDE/portal/XDG integration work.
+TASK-0017 through TASK-0020 complete bounded roles,
 packaging, acceptance, and release.
 
 Exact dependencies and gates are authoritative in

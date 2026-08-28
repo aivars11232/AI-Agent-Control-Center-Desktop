@@ -1,5 +1,5 @@
 use crate::app_state::ApprovalRequest;
-use crate::policy::{ActionIntent, RunMode};
+use crate::policy::{ActionIntent, PolicyEvaluation, RunMode};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
@@ -15,20 +15,43 @@ pub enum AuthorizationDecision {
 pub struct AuthorizationOutcome {
     pub decision: AuthorizationDecision,
     pub approval: Option<ApprovalRequest>,
+    pub evidence: AuthorizationEvidence,
 }
 
 impl AuthorizationOutcome {
-    pub fn allowed() -> Self {
+    pub fn allowed(evaluation: &PolicyEvaluation) -> Self {
         Self {
             decision: AuthorizationDecision::Allowed,
             approval: None,
+            evidence: AuthorizationEvidence::from(evaluation),
         }
     }
 
-    pub fn approval_required(approval: ApprovalRequest) -> Self {
+    pub fn approval_required(approval: ApprovalRequest, evaluation: &PolicyEvaluation) -> Self {
         Self {
             decision: AuthorizationDecision::ApprovalRequired,
             approval: Some(approval),
+            evidence: AuthorizationEvidence::from(evaluation),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthorizationEvidence {
+    pub agent_id: i64,
+    pub intent_fingerprint: String,
+    pub policy_fingerprint: String,
+    pub risk_level: String,
+}
+
+impl From<&PolicyEvaluation> for AuthorizationEvidence {
+    fn from(evaluation: &PolicyEvaluation) -> Self {
+        Self {
+            agent_id: evaluation.agent_id,
+            intent_fingerprint: evaluation.intent_fingerprint.clone(),
+            policy_fingerprint: evaluation.policy_fingerprint.clone(),
+            risk_level: evaluation.risk_level.clone(),
         }
     }
 }
@@ -37,16 +60,28 @@ impl AuthorizationOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizationGrant {
     pub approval: Option<ApprovalRequest>,
+    pub evidence: Option<AuthorizationEvidence>,
 }
 
 impl AuthorizationGrant {
     pub fn policy_allowed() -> Self {
-        Self { approval: None }
+        Self {
+            approval: None,
+            evidence: None,
+        }
     }
 
-    pub fn consumed(approval: ApprovalRequest) -> Self {
+    pub fn policy_allowed_with_evidence(evaluation: &PolicyEvaluation) -> Self {
+        Self {
+            approval: None,
+            evidence: Some(AuthorizationEvidence::from(evaluation)),
+        }
+    }
+
+    pub fn consumed(approval: ApprovalRequest, evaluation: &PolicyEvaluation) -> Self {
         Self {
             approval: Some(approval),
+            evidence: Some(AuthorizationEvidence::from(evaluation)),
         }
     }
 }
@@ -97,6 +132,25 @@ pub fn build_approval_confirmation(
             dialog_literal(item_path),
             dialog_literal(workspace_id)
         ),
+        ActionIntent::CreateCodingTask {
+            workspace_id,
+            request_sha256,
+            request_length,
+            ..
+        } => format!(
+            "Create a coding task in workspace {} for {request_length} bytes matching SHA-256 {}",
+            dialog_literal(workspace_id),
+            dialog_literal(request_sha256)
+        ),
+        ActionIntent::SystemAction { action, .. } => {
+            let (target_kind, target_id) = action.target();
+            format!(
+                "Perform {} desktop action on exact {} target {}",
+                action.risk_class(),
+                dialog_literal(&target_kind),
+                dialog_literal(&target_id)
+            )
+        }
         ActionIntent::LaunchAllowedApplication { application, .. }
         | ActionIntent::LaunchDesktopApplication { application, .. } => {
             format!("Launch application {}", dialog_literal(application))
@@ -122,8 +176,15 @@ pub fn build_approval_confirmation(
             dialog_literal(action),
             dialog_literal(application)
         ),
-        ActionIntent::TypeDesktopText { text, .. } => {
-            format!("Type desktop text exactly as {}", dialog_literal(text))
+        ActionIntent::TypeDesktopText {
+            text_sha256,
+            text_length,
+            ..
+        } => {
+            format!(
+                "Type {text_length} bytes of desktop text matching SHA-256 {}",
+                dialog_literal(text_sha256)
+            )
         }
         ActionIntent::EnableDesktopControl { .. } => {
             "Request KDE keyboard and pointer control".to_string()
@@ -264,11 +325,50 @@ mod tests {
             &approval,
             &ActionIntent::TypeDesktopText {
                 agent_id: 7,
-                text: "literal <text>".to_string(),
+                text_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+                text_length: 14,
             },
         );
-        assert!(confirmation.message.contains("literal \\u003ctext\\u003e"));
+        assert!(!confirmation.message.contains("literal"));
+        assert!(confirmation.message.contains("14 bytes"));
+        assert!(confirmation.message.contains("0123456789abcdef"));
         assert!(confirmation.message.contains("Agent ID: 7"));
         assert!(confirmation.message.contains("Scopes: system"));
+    }
+
+    #[test]
+    fn task_0015_system_confirmation_binds_exact_target_and_risk() {
+        let approval = ApprovalRequest {
+            id: 2,
+            agent_id: 7,
+            task_id: None,
+            title: "Close exact window".to_string(),
+            reason: "Destructive system action.".to_string(),
+            status: "Pending".to_string(),
+            created_at: "2026-08-28T10:00:00.000Z".to_string(),
+            resolved_at: None,
+            risk_level: "High".to_string(),
+            scopes: vec!["system".to_string()],
+            workspace_id: None,
+            task_snapshot: String::new(),
+            expires_at: "2026-08-28T10:10:00.000Z".to_string(),
+            consumed_at: None,
+        };
+        let confirmation = build_approval_confirmation(
+            &approval,
+            &ActionIntent::SystemAction {
+                agent_id: 7,
+                action: crate::system_actions::AuthorizedSystemAction::CloseWindow {
+                    window_id: "exact-window-id".to_string(),
+                    desktop_id: "org.example.Editor.desktop".to_string(),
+                },
+            },
+        );
+
+        assert!(confirmation.message.contains("destructive desktop action"));
+        assert!(confirmation.message.contains("exact \"kwinWindow\" target"));
+        assert!(confirmation.message.contains("exact-window-id"));
+        assert!(!confirmation.message.contains("Editor caption"));
     }
 }

@@ -29,6 +29,7 @@ import type {
   MonitoringSnapshot,
   MonitoringTaskPage,
 } from "../dataLifecycle";
+import type { CanonicalVoiceIntent } from "../voiceCommand";
 
 export type AgentRunResult = {
   providerId: RuntimeProviderId | null;
@@ -71,6 +72,57 @@ export type DesktopControlStatus = {
   message: string;
 };
 
+export type SubmitVoiceIntentRequest = {
+  requestId: string;
+  intent: CanonicalVoiceIntent;
+};
+
+export type SystemActionAuditRecord = {
+  id: number;
+  requestId: string;
+  requestFingerprint: string;
+  intentKind: string;
+  riskClass: string;
+  targetKind: string;
+  targetId: string;
+  agentId: number;
+  taskOwnerAgentId: number | null;
+  taskId: number | null;
+  approvalId: number | null;
+  authorizationKind: string;
+  intentFingerprintSha256: string;
+  policyFingerprintSha256: string;
+  status:
+    | "approvalRequired"
+    | "taskCreated"
+    | "applied"
+    | "dispatched"
+    | "rejected"
+    | "failed"
+    | "uncertain";
+  detailCode: string | null;
+  detailMessage: string | null;
+  contentSha256: string | null;
+  contentLength: number | null;
+  createdAtUnixMs: number;
+  updatedAtUnixMs: number;
+};
+
+export type SystemActionAuditPage = {
+  records: SystemActionAuditRecord[];
+  limit: number;
+};
+
+export type VoiceIntentResult = {
+  requestId: string;
+  status: SystemActionAuditRecord["status"];
+  message: string;
+  approval: ApprovalRequest | null;
+  taskOwnerAgentId: number | null;
+  taskId: number | null;
+  audit: SystemActionAuditRecord;
+};
+
 export type BackendActionIntent =
   | {
       kind: "runTask";
@@ -86,21 +138,7 @@ export type BackendActionIntent =
       workspaceId: string;
       itemPath: string;
     }
-  | { kind: "launchAllowedApplication"; agentId: number; application: string }
-  | { kind: "launchDesktopApplication"; agentId: number; application: string }
-  | { kind: "openStandardFolder"; agentId: number; folder: string }
-  | { kind: "closeAllowedApplication"; agentId: number; application: string }
-  | { kind: "closeActiveApplication"; agentId: number }
-  | { kind: "desktopKeyboard"; agentId: number; action: string }
-  | {
-      kind: "desktopWindow";
-      agentId: number;
-      application: string;
-      action: string;
-    }
-  | { kind: "typeDesktopText"; agentId: number; text: string }
   | { kind: "enableDesktopControl"; agentId: number }
-  | { kind: "desktopPointer"; agentId: number; action: string }
   | { kind: "installVoiceRuntime"; agentId: number }
   | { kind: "installHighAccuracyVoiceRuntime"; agentId: number }
   | { kind: "startVoiceListener"; agentId: number };
@@ -108,6 +146,12 @@ export type BackendActionIntent =
 export type AuthorizationOutcome = {
   decision: "allowed" | "approvalRequired";
   approval: ApprovalRequest | null;
+  evidence: {
+    agentId: number;
+    intentFingerprint: string;
+    policyFingerprint: string;
+    riskLevel: string;
+  };
 };
 
 export type RunAgentTaskRequest = {
@@ -166,6 +210,16 @@ export function createDesktopClient(
       return invokeFn<DesktopControlStatus>("desktop_control_status");
     },
 
+    submitVoiceIntent(request: SubmitVoiceIntentRequest) {
+      return invokeFn<VoiceIntentResult>("submit_voice_intent", { request });
+    },
+
+    querySystemActionAudits(limit = 50) {
+      return invokeFn<SystemActionAuditPage>("query_system_action_audits", {
+        limit,
+      });
+    },
+
     reviewOrchestrationSnapshot() {
       return invokeFn<ReviewOrchestrationSnapshot>(
         "review_orchestration_snapshot",
@@ -208,65 +262,6 @@ export function createDesktopClient(
       itemPath: string;
     }) {
       return invokeFn<void>("open_workspace_item", { request });
-    },
-
-    launchAllowedApplication(agentId: number, application: string) {
-      return invokeFn<void>("launch_allowed_application", {
-        agentId,
-        application,
-      });
-    },
-
-    closeAllowedApplication(agentId: number, application: string) {
-      return invokeFn<void>("close_allowed_application", {
-        agentId,
-        application,
-      });
-    },
-
-    sendDesktopPointerAction(agentId: number, action: string) {
-      return invokeFn<void>("send_desktop_pointer_action", {
-        agentId,
-        action,
-      });
-    },
-
-    sendDesktopKeyboardAction(agentId: number, action: string) {
-      return invokeFn<void>("send_desktop_keyboard_action", {
-        agentId,
-        action,
-      });
-    },
-
-    controlNamedDesktopWindow(
-      agentId: number,
-      application: string,
-      action: string,
-    ) {
-      return invokeFn<void>("control_named_desktop_window", {
-        agentId,
-        application,
-        action,
-      });
-    },
-
-    typeDesktopText(agentId: number, text: string) {
-      return invokeFn<void>("type_desktop_text", { agentId, text });
-    },
-
-    launchDesktopApplication(agentId: number, application: string) {
-      return invokeFn<void>("launch_desktop_application", {
-        agentId,
-        application,
-      });
-    },
-
-    openStandardFolder(agentId: number, folder: string) {
-      return invokeFn<void>("open_standard_folder", { agentId, folder });
-    },
-
-    closeActiveDesktopApplication(agentId: number) {
-      return invokeFn<void>("close_active_desktop_application", { agentId });
     },
 
     voiceRuntimeStatus() {

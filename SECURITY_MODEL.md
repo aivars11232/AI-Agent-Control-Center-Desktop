@@ -19,8 +19,11 @@
 > descriptor-confined Git/non-Git evidence, redaction, immutable persistence,
 > and fail-closed review eligibility. TASK-0013 adds a typed renderer desktop
 > client and accessible feature boundaries without moving any authorization or
-> durable-state authority into the WebView; later tasks still own voice
-> semantics, packaging, and live acceptance.
+> durable-state authority into the WebView. TASK-0014 adds strict portable
+> backup, bounded retention, and revision-bound monitoring. TASK-0015 adds the
+> canonical backend voice/system-action policy, exact-target, approval, and
+> redacted-audit boundary; later tasks still own offline/runtime integration,
+> packaging, and live acceptance.
 
 ## Security objective
 
@@ -49,7 +52,7 @@ when stored locally.
 | React renderer/WebView | Untrusted for authorization; may be compromised or hold stale/tampered state |
 | Imported backup and <code>localStorage</code> | Untrusted serialized input requiring validation and migration |
 | Tauri IPC | Untrusted request boundary; backend must authenticate semantics, not just types |
-| Rust backend | Authoritative agent registry, task routing/queue, structured review/revision, workspace evidence, approval/action-policy, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
+| Rust backend | Authoritative agent registry, task routing/queue, structured review/revision, workspace evidence, approval/action-policy, canonical system-action gateway/audit, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
 | Codex/Ollama output | Untrusted content and action proposals |
 | Selected workspace | Sensitive bounded filesystem root |
 | External/local provider process | Separate process/service with its own failure and trust model |
@@ -72,7 +75,8 @@ Static inspection and deterministic tests found these implemented controls:
   capability, and error contract implemented by the Codex and Ollama adapters;
 - one provider-registry status projection whose catalog bindings explicitly
   mark Anthropic, Google, and Custom as non-executable;
-- policy-v4/intent-v2 fingerprints that bind provider/model identity and any
+- policy-v5/intent-v3 fingerprints that bind provider/model identity, canonical
+  exact system actions and any
   exact review flow/stage/round/level/request context, invalidating older or
   mismatched approvals instead of inheriting authority across a decision;
 - a schema-v2 request/approve/deny/expire/validate/consume lifecycle bound to
@@ -191,6 +195,17 @@ Static inspection and deterministic tests found these implemented controls:
   malformed input without partial state;
 - downgrade of pending/approved legacy approvals to expired records whose
   database rows remain <code>authoritative = 0</code> after schema upgrade;
+- one renderer voice submission surface whose backend resolves the active
+  agent/workspace and exact XDG desktop-entry, XDG user-directory, or KWin
+  internal-window target before policy evaluation;
+- exact-target approval retry binding, forced one-use confirmation for Close,
+  Cut, and Delete, and refusal of unknown, ambiguous, changed, or disappeared
+  targets without fuzzy, caption, broad-process, or implicit active-window
+  fallback;
+- a maximum-10,000 schema-v9 action audit that records hashed intent/policy
+  evidence and exact safe target identifiers before dispatch, records terminal
+  or uncertain outcome, protects nonterminal rows, and stores dictated/coding
+  content only as SHA-256 and length;
 - authorization before provider, workspace-open, application/window,
   keyboard, clipboard-via-keyboard, pointer, text-input, microphone, portal,
   and voice-installer side effects;
@@ -203,8 +218,9 @@ run-coordination boundary, TASK-0006 provider-identity boundary, TASK-0007
 Codex process/protocol boundary, TASK-0008 Ollama transport/workspace-tool
 boundary, TASK-0009 agent-registry boundary, and TASK-0010 routing/queue
 boundary, the TASK-0011 structured-review boundary, the TASK-0012 workspace
-evidence boundary, and the TASK-0014 backup/retention/monitoring boundary. They do not establish
-production readiness or the later live provider/platform guarantees.
+evidence boundary, the TASK-0014 backup/retention/monitoring boundary, and the
+TASK-0015 voice/system-action boundary. They do not establish production
+readiness or the later live provider/platform guarantees.
 
 ## Known current gaps
 
@@ -232,12 +248,17 @@ installed removal evidence, mandatory advisory tooling, and live upgrade or
 packaged recovery acceptance under TASK-0019–TASK-0020.
 
 Exact approval binding stores normalized intent JSON in the local database.
-For text-input actions, that record includes the exact text to be typed and may
-therefore contain sensitive user content. Unix database permissions restrict
-the file to the current user. Resolved/consumed approval history follows the
-activity-retention policy, while pending/current/reserved authority is
-protected. Export omits authorization intents entirely. Pattern redaction and
-retention reduce exposure but do not prove all sensitive content absent.
+Canonical text-input and coding-task approvals contain SHA-256 plus byte length,
+not the raw content; migration 0009 expires and redacts earlier desktop-text
+approval intents. Raw typed/coding content remains transiently present in the
+validated submission/task-creation path, and a successfully created coding
+task intentionally persists its title in normal task state. Unix database
+permissions restrict local state to the current user. Resolved/consumed
+approval and terminal action-audit history follow activity retention, while
+pending/current/dispatched authority is protected. Portable backup omits
+authorization intents and the system-action audit.
+Configured standard-folder and coding-workspace paths are represented in that
+audit only by SHA-256 target bindings, not raw local paths.
 
 ### Residual IPC and web content work
 
@@ -245,7 +266,9 @@ The current privileged invoke surface is policy-gated and production CSP plus
 Tauri core permissions are narrowed. TASK-0013 centralizes renderer invokes and
 event listeners behind a typed desktop client, but the backend remains the
 authority and persistence keeps its revision-aware injected invoke boundary.
-TASK-0015 owns structured voice-intent semantics; TASK-0019 owns mandatory
+TASK-0015 removes the direct renderer application/window/input command surface
+and exposes one typed gateway plus a read-only redacted audit query. TASK-0016
+owns offline listener/portal integration reliability; TASK-0019 owns mandatory
 dependency/CI gates; TASK-0020 owns installed and packaged platform acceptance.
 Current source tests do not replace those later live gates.
 
@@ -299,14 +322,16 @@ indeterminate when <code>cargo-audit</code> is unavailable.
 
 ## Target security invariants
 
-The agent-registry and task-orchestration subsets of invariant 1, the
+The agent-registry, task-orchestration, and voice/system-action subsets of
+invariant 1, the
 approval/action subset of invariants 2 through 5, the typed-routing-input
 subset of invariant 2, the queue/coordinator subset
 of invariant 6, the structured-review binding and recovery subsets of
 invariants 2, 3, 6, and 9, the Ollama workspace and TASK-0012 evidence subsets
 of invariants 7 and 11, and the
 provider-identity/no-substitution plus Codex/Ollama adapter subsets of invariant
-8 are implemented for the current command surface. The full integrated
+8, and the canonical intent/exact-target/redacted-audit subsets of invariants
+9 through 11 are implemented for the current command surface. The full integrated
 invariants remain the release target:
 
 1. The backend is the sole authority for durable domain state and action
@@ -368,16 +393,26 @@ desktop-control workarounds:
   [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir/0.8/)
   for launch metadata and user-local data/config placement.
 
-These references establish available native paths; they do not prove the
-current app uses them correctly. TASK-0015, TASK-0016, and TASK-0019 own
-implementation and acceptance. If a native mechanism cannot satisfy a bounded
-requirement, the owning Phase A plan must document the constraint and compare
-least-privilege workarounds before any code change.
+TASK-0015 now uses XDG desktop-entry/base-directory data, configured
+<code>user-dirs.dirs</code>, KWin scripts with exact IDs, and the existing
+RemoteDesktop portal session for bounded input. Relative XDG/PATH inputs are
+ignored and configured folder paths are target-bound only by SHA-256; KWin
+executes only the returned per-script object and reports through
+a token-bound callback authenticated to KWin's current D-Bus owner, rather
+than the broad all-scripts start method or journal/log parsing.
+Deterministic tests establish the checked-in fail-closed contracts, not live
+KDE compatibility. TASK-0016 and TASK-0020 retain runtime and packaged
+acceptance. If a native mechanism cannot satisfy a bounded requirement, the
+owning Phase A plan must document the constraint and compare least-privilege
+workarounds before any code change.
 
 ## Failure and recovery direction
 
 - Reject invalid or unauthorized input without starting a provider or native
   action.
+- Record an exact system-action dispatch before its side effect; after an
+  acknowledgement gap or restart, mark the request uncertain and never replay
+  it automatically.
 - Persist terminal run/approval state before releasing authority.
 - Make cancellation idempotent and distinguish user cancellation, timeout,
   provider failure, policy denial, and application restart.

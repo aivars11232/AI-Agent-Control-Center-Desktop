@@ -36,6 +36,10 @@ use crate::run_coordinator::{
     MAX_PROGRESS_EVENTS, MAX_PROGRESS_MESSAGE_BYTES, MAX_RECENT_ATTEMPTS, MAX_RETAINED_ATTEMPTS,
     MAX_RETAINED_PAYLOAD_BYTES, MAX_STDERR_CAPTURE_BYTES, MAX_SUMMARY_BYTES,
 };
+use crate::system_actions::{
+    validate_audit_write, AuditWrite, SystemActionAuditPage, SystemActionAuditRecord,
+    MAX_SYSTEM_ACTION_AUDITS, MAX_SYSTEM_ACTION_AUDIT_PAGE,
+};
 use crate::task_orchestration::{
     route_task, CreateRoutedTaskRequest, QueueDisposition, RerouteTaskRequest, RoutingTaskInput,
     SetTaskQueueDispositionRequest, TaskOrchestrationSnapshot, TaskQueueEntry,
@@ -65,6 +69,8 @@ const REVIEW_ORCHESTRATION_MIGRATION: &str =
 const WORKSPACE_EVIDENCE_MIGRATION: &str =
     include_str!("../migrations/0007_workspace_evidence.sql");
 const DATA_LIFECYCLE_MIGRATION: &str = include_str!("../migrations/0008_data_lifecycle.sql");
+const SYSTEM_ACTION_GATEWAY_MIGRATION: &str =
+    include_str!("../migrations/0009_system_action_gateway.sql");
 const MAX_AUTHORIZATION_RECORDS: i64 = 10_000;
 
 #[derive(Debug, Clone)]
@@ -371,6 +377,30 @@ impl PersistenceService {
             .await
     }
 
+    pub async fn write_system_action_audit(
+        &self,
+        write: AuditWrite,
+    ) -> PersistenceResult<SystemActionAuditRecord> {
+        self.run(move |repository| repository.write_system_action_audit(&write))
+            .await
+    }
+
+    pub async fn system_action_audit(
+        &self,
+        request_id: String,
+    ) -> PersistenceResult<Option<SystemActionAuditRecord>> {
+        self.run(move |repository| repository.system_action_audit(&request_id))
+            .await
+    }
+
+    pub async fn query_system_action_audits(
+        &self,
+        limit: i64,
+    ) -> PersistenceResult<SystemActionAuditPage> {
+        self.run(move |repository| repository.query_system_action_audits(limit))
+            .await
+    }
+
     pub async fn resolve_approval(
         &self,
         approval_id: i64,
@@ -590,6 +620,7 @@ impl StateRepository {
         repository.configure_write_durability(false)?;
         repository.apply_migrations()?;
         repository.reconcile_interrupted_runs()?;
+        repository.reconcile_dispatched_system_actions()?;
         let timestamp = now_unix_ms()?;
         if let Err(error) = repository.run_data_lifecycle_maintenance("startup", timestamp) {
             log::warn!("data lifecycle startup maintenance failed: {}", error.code);
@@ -607,6 +638,7 @@ impl StateRepository {
         repository.configure_write_durability(true)?;
         repository.apply_migrations()?;
         repository.reconcile_interrupted_runs()?;
+        repository.reconcile_dispatched_system_actions()?;
         Ok(repository)
     }
 
@@ -2166,7 +2198,9 @@ impl StateRepository {
                      total_pruned_review_flows = total_pruned_review_flows + ?8,
                      total_pruned_activity = total_pruned_activity + ?9,
                      total_pruned_approvals = total_pruned_approvals + ?10,
-                     total_pruned_reminders = total_pruned_reminders + ?11
+                     total_pruned_reminders = total_pruned_reminders + ?11,
+                     total_pruned_system_action_audits =
+                         total_pruned_system_action_audits + ?12
                  WHERE singleton = 1",
                 params![
                     next_lifecycle_revision,
@@ -2179,7 +2213,8 @@ impl StateRepository {
                     pruned.review_flows,
                     pruned.activity,
                     pruned.approvals,
-                    pruned.reminders
+                    pruned.reminders,
+                    pruned.system_action_audits
                 ],
             )
             .map_err(PersistenceError::database)?;
@@ -2776,7 +2811,7 @@ impl StateRepository {
         let evaluation = evaluate_policy(&state, intent).map_err(policy_denial)?;
         if evaluation.disposition == PolicyDisposition::Allow {
             transaction.commit().map_err(PersistenceError::database)?;
-            return Ok(AuthorizationOutcome::allowed());
+            return Ok(AuthorizationOutcome::allowed(&evaluation));
         }
 
         if let Some(approval_id) =
@@ -2784,12 +2819,159 @@ impl StateRepository {
         {
             let approval = read_approval_request(&transaction, approval_id)?;
             transaction.commit().map_err(PersistenceError::database)?;
-            return Ok(AuthorizationOutcome::approval_required(approval));
+            return Ok(AuthorizationOutcome::approval_required(
+                approval,
+                &evaluation,
+            ));
         }
 
         let approval = insert_authoritative_approval(&transaction, intent, &evaluation, timestamp)?;
         transaction.commit().map_err(PersistenceError::database)?;
-        Ok(AuthorizationOutcome::approval_required(approval))
+        Ok(AuthorizationOutcome::approval_required(
+            approval,
+            &evaluation,
+        ))
+    }
+
+    pub fn system_action_audit(
+        &mut self,
+        request_id: &str,
+    ) -> PersistenceResult<Option<SystemActionAuditRecord>> {
+        if request_id.is_empty() || request_id.len() > 128 {
+            return Err(PersistenceError::new(
+                "INVALID_VOICE_REQUEST_ID",
+                "The voice request identifier is empty or malformed.",
+                true,
+            ));
+        }
+        self.connection
+            .query_row(
+                SYSTEM_ACTION_AUDIT_SELECT_BY_REQUEST,
+                [request_id],
+                read_system_action_audit_row,
+            )
+            .optional()
+            .map_err(PersistenceError::database)
+    }
+
+    pub fn query_system_action_audits(
+        &mut self,
+        limit: i64,
+    ) -> PersistenceResult<SystemActionAuditPage> {
+        if !(1..=MAX_SYSTEM_ACTION_AUDIT_PAGE).contains(&limit) {
+            return Err(PersistenceError::new(
+                "SYSTEM_ACTION_AUDIT_LIMIT_INVALID",
+                format!(
+                    "System-action audit queries require a limit from 1 to {MAX_SYSTEM_ACTION_AUDIT_PAGE}."
+                ),
+                true,
+            ));
+        }
+        let mut statement = self
+            .connection
+            .prepare(SYSTEM_ACTION_AUDIT_SELECT_RECENT)
+            .map_err(PersistenceError::database)?;
+        let records = collect_rows(statement.query_map([limit], read_system_action_audit_row))?;
+        Ok(SystemActionAuditPage { records, limit })
+    }
+
+    pub fn write_system_action_audit(
+        &mut self,
+        write: &AuditWrite,
+    ) -> PersistenceResult<SystemActionAuditRecord> {
+        validate_audit_write(write)
+            .map_err(|error| PersistenceError::new(&error.code, error.message, true))?;
+        let timestamp = now_unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(PersistenceError::database)?;
+        ensure_state_initialized(&transaction)?;
+        let existing = transaction
+            .query_row(
+                SYSTEM_ACTION_AUDIT_SELECT_BY_REQUEST,
+                [write.request_id.as_str()],
+                read_system_action_audit_row,
+            )
+            .optional()
+            .map_err(PersistenceError::database)?;
+
+        let audit_id = if let Some(existing) = existing {
+            ensure_system_action_audit_binding(&existing, write)?;
+            if existing.status != write.status {
+                ensure_system_action_audit_transition(&existing.status, &write.status)?;
+            }
+            transaction
+                .execute(
+                    "UPDATE system_action_audits
+                     SET task_owner_agent_id = ?1, task_id = ?2, approval_id = ?3,
+                         authorization_kind = ?4, intent_fingerprint_sha256 = ?5,
+                         policy_fingerprint_sha256 = ?6, status = ?7,
+                         detail_code = ?8, detail_message = ?9,
+                         updated_at_unix_ms = ?10
+                     WHERE id = ?11",
+                    params![
+                        write.task_owner_agent_id,
+                        write.task_id,
+                        write.approval_id,
+                        write.authorization_kind,
+                        write.intent_fingerprint_sha256,
+                        write.policy_fingerprint_sha256,
+                        write.status,
+                        write.detail_code,
+                        write.detail_message,
+                        timestamp,
+                        existing.id,
+                    ],
+                )
+                .map_err(PersistenceError::database)?;
+            existing.id
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO system_action_audits
+                     (request_id, request_fingerprint, intent_kind, risk_class,
+                      target_kind, target_id, agent_id, task_owner_agent_id, task_id,
+                      approval_id, authorization_kind, intent_fingerprint_sha256,
+                      policy_fingerprint_sha256, status, detail_code, detail_message,
+                      content_sha256, content_length, created_at_unix_ms, updated_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                             ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19)",
+                    params![
+                        write.request_id,
+                        write.request_fingerprint,
+                        write.intent_kind,
+                        write.risk_class,
+                        write.target_kind,
+                        write.target_id,
+                        write.agent_id,
+                        write.task_owner_agent_id,
+                        write.task_id,
+                        write.approval_id,
+                        write.authorization_kind,
+                        write.intent_fingerprint_sha256,
+                        write.policy_fingerprint_sha256,
+                        write.status,
+                        write.detail_code,
+                        write.detail_message,
+                        write.content_sha256,
+                        write.content_length,
+                        timestamp,
+                    ],
+                )
+                .map_err(PersistenceError::database)?;
+            transaction.last_insert_rowid()
+        };
+        enforce_system_action_audit_cap(&transaction, audit_id, timestamp)?;
+        let record = transaction
+            .query_row(
+                SYSTEM_ACTION_AUDIT_SELECT_BY_ID,
+                [audit_id],
+                read_system_action_audit_row,
+            )
+            .map_err(PersistenceError::database)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        Ok(record)
     }
 
     pub fn resolve_approval(
@@ -2921,7 +3103,10 @@ impl StateRepository {
         let evaluation = evaluate_policy(&state, intent).map_err(policy_denial)?;
         if evaluation.disposition == PolicyDisposition::Allow {
             transaction.commit().map_err(PersistenceError::database)?;
-            return Ok((AuthorizationGrant::policy_allowed(), state));
+            return Ok((
+                AuthorizationGrant::policy_allowed_with_evidence(&evaluation),
+                state,
+            ));
         }
 
         let Some(approval_id) =
@@ -2959,7 +3144,7 @@ impl StateRepository {
         }
         let approval = read_approval_request(&transaction, approval_id)?;
         transaction.commit().map_err(PersistenceError::database)?;
-        Ok((AuthorizationGrant::consumed(approval), state))
+        Ok((AuthorizationGrant::consumed(approval, &evaluation), state))
     }
 
     pub fn run_snapshot(&mut self) -> PersistenceResult<RunCoordinatorSnapshot> {
@@ -3070,6 +3255,7 @@ impl StateRepository {
                 .transpose()?
                 .map(|approval| AuthorizationGrant {
                     approval: Some(approval),
+                    evidence: None,
                 });
             let review_request_json = attempt
                 .review_stage_attempt_id
@@ -3250,6 +3436,9 @@ impl StateRepository {
             .transpose()?
             .map(|approval| AuthorizationGrant {
                 approval: Some(approval),
+                evidence: Some(crate::authorization::AuthorizationEvidence::from(
+                    &evaluation,
+                )),
             });
         let application_state = read_application_state(&transaction)?;
         let review_request_json = review_context
@@ -3897,6 +4086,11 @@ impl StateRepository {
                     "data_lifecycle_and_monitoring",
                     DATA_LIFECYCLE_MIGRATION,
                 )?,
+                8 => self.apply_migration(
+                    9,
+                    "system_action_policy_gateway",
+                    SYSTEM_ACTION_GATEWAY_MIGRATION,
+                )?,
                 version => {
                     return Err(PersistenceError::new(
                         "MIGRATION_PATH_MISSING",
@@ -4303,6 +4497,22 @@ impl StateRepository {
             refresh_run_retention_meta(&transaction)?;
         }
         transaction.commit().map_err(PersistenceError::database)
+    }
+
+    fn reconcile_dispatched_system_actions(&mut self) -> PersistenceResult<()> {
+        let timestamp = now_unix_ms()?;
+        self.connection
+            .execute(
+                "UPDATE system_action_audits
+                 SET status = 'uncertain',
+                     detail_code = 'SYSTEM_ACTION_DISPATCH_INTERRUPTED',
+                     detail_message = 'The application restarted after dispatch; the action was not retried.',
+                     updated_at_unix_ms = ?1
+                 WHERE status = 'dispatched'",
+                [timestamp],
+            )
+            .map_err(PersistenceError::database)?;
+        Ok(())
     }
 }
 
@@ -6802,6 +7012,18 @@ fn prune_retention_rows(
                 params![cutoff, MAX_MAINTENANCE_ROWS_PER_DOMAIN],
             )
             .map_err(PersistenceError::database)? as i64;
+        counts.system_action_audits = transaction
+            .execute(
+                "DELETE FROM system_action_audits WHERE id IN (
+                     SELECT id FROM system_action_audits
+                     WHERE status IN ('taskCreated', 'applied', 'rejected', 'failed', 'uncertain')
+                       AND updated_at_unix_ms < ?1
+                     ORDER BY updated_at_unix_ms, id
+                     LIMIT ?2
+                 )",
+                params![cutoff, MAX_MAINTENANCE_ROWS_PER_DOMAIN],
+            )
+            .map_err(PersistenceError::database)? as i64;
     }
     Ok(counts)
 }
@@ -6906,6 +7128,10 @@ fn retention_backlog_exists(
                      WHERE status IN ('Completed', 'Dismissed')
                        AND resolved_at_unix_ms IS NOT NULL
                        AND resolved_at_unix_ms < ?1
+                     UNION ALL
+                     SELECT 1 FROM system_action_audits
+                     WHERE status IN ('taskCreated', 'applied', 'rejected', 'failed', 'uncertain')
+                       AND updated_at_unix_ms < ?1
                  )",
                 [cutoff],
                 |row| row.get(0),
@@ -6967,10 +7193,10 @@ fn insert_data_lifecycle_run(
               started_at_unix_ms, completed_at_unix_ms,
               task_cutoff_unix_ms, activity_cutoff_unix_ms, pruned_tasks,
               pruned_attempts, pruned_review_flows, pruned_activity, pruned_approvals,
-              pruned_reminders, skipped_protected, backlog_remaining, error_code,
-              error_message)
+              pruned_reminders, pruned_system_action_audits, skipped_protected,
+              backlog_remaining, error_code, error_message)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, ?15, ?16, ?17, ?18)",
+                     ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 lifecycle_revision,
                 application_state_revision,
@@ -6986,6 +7212,7 @@ fn insert_data_lifecycle_run(
                 pruned.activity,
                 pruned.approvals,
                 pruned.reminders,
+                pruned.system_action_audits,
                 skipped_protected,
                 backlog_remaining as i64,
                 error_code,
@@ -7135,6 +7362,7 @@ fn read_monitoring_snapshot(
                     total_pruned_tasks, total_pruned_attempts,
                     total_pruned_review_flows, total_pruned_activity,
                     total_pruned_approvals, total_pruned_reminders,
+                    total_pruned_system_action_audits,
                     inferred_timestamp_count
              FROM data_lifecycle_meta WHERE singleton = 1",
             [],
@@ -7154,8 +7382,9 @@ fn read_monitoring_snapshot(
                         activity: row.get(8)?,
                         approvals: row.get(9)?,
                         reminders: row.get(10)?,
+                        system_action_audits: row.get(11)?,
                     },
-                    inferred_timestamp_count: row.get(11)?,
+                    inferred_timestamp_count: row.get(12)?,
                     latest_run: None,
                 })
             },
@@ -7167,7 +7396,8 @@ fn read_monitoring_snapshot(
                     started_at_unix_ms, completed_at_unix_ms, task_cutoff_unix_ms,
                     activity_cutoff_unix_ms, pruned_tasks, pruned_attempts,
                     pruned_review_flows, pruned_activity, pruned_approvals,
-                    pruned_reminders, skipped_protected, backlog_remaining,
+                    pruned_reminders, pruned_system_action_audits,
+                    skipped_protected, backlog_remaining,
                     error_code, error_message
              FROM data_lifecycle_runs ORDER BY id DESC LIMIT 1",
             [],
@@ -7188,11 +7418,12 @@ fn read_monitoring_snapshot(
                         activity: row.get(11)?,
                         approvals: row.get(12)?,
                         reminders: row.get(13)?,
+                        system_action_audits: row.get(14)?,
                     },
-                    skipped_protected: row.get(14)?,
-                    backlog_remaining: row.get::<_, i64>(15)? != 0,
-                    error_code: row.get(16)?,
-                    error_message: row.get(17)?,
+                    skipped_protected: row.get(15)?,
+                    backlog_remaining: row.get::<_, i64>(16)? != 0,
+                    error_code: row.get(17)?,
+                    error_message: row.get(18)?,
                 })
             },
         )
@@ -9542,6 +9773,147 @@ fn read_reminders(connection: &Connection) -> PersistenceResult<Vec<Reminder>> {
     }))
 }
 
+const SYSTEM_ACTION_AUDIT_SELECT_BY_REQUEST: &str =
+    "SELECT id, request_id, request_fingerprint, intent_kind, risk_class, target_kind,
+            target_id, agent_id, task_owner_agent_id, task_id, approval_id,
+            authorization_kind, intent_fingerprint_sha256, policy_fingerprint_sha256,
+            status, detail_code, detail_message, content_sha256, content_length,
+            created_at_unix_ms, updated_at_unix_ms
+     FROM system_action_audits WHERE request_id = ?1";
+
+const SYSTEM_ACTION_AUDIT_SELECT_BY_ID: &str =
+    "SELECT id, request_id, request_fingerprint, intent_kind, risk_class, target_kind,
+            target_id, agent_id, task_owner_agent_id, task_id, approval_id,
+            authorization_kind, intent_fingerprint_sha256, policy_fingerprint_sha256,
+            status, detail_code, detail_message, content_sha256, content_length,
+            created_at_unix_ms, updated_at_unix_ms
+     FROM system_action_audits WHERE id = ?1";
+
+const SYSTEM_ACTION_AUDIT_SELECT_RECENT: &str =
+    "SELECT id, request_id, request_fingerprint, intent_kind, risk_class, target_kind,
+            target_id, agent_id, task_owner_agent_id, task_id, approval_id,
+            authorization_kind, intent_fingerprint_sha256, policy_fingerprint_sha256,
+            status, detail_code, detail_message, content_sha256, content_length,
+            created_at_unix_ms, updated_at_unix_ms
+     FROM system_action_audits ORDER BY id DESC LIMIT ?1";
+
+fn read_system_action_audit_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SystemActionAuditRecord> {
+    Ok(SystemActionAuditRecord {
+        id: row.get(0)?,
+        request_id: row.get(1)?,
+        request_fingerprint: row.get(2)?,
+        intent_kind: row.get(3)?,
+        risk_class: row.get(4)?,
+        target_kind: row.get(5)?,
+        target_id: row.get(6)?,
+        agent_id: row.get(7)?,
+        task_owner_agent_id: row.get(8)?,
+        task_id: row.get(9)?,
+        approval_id: row.get(10)?,
+        authorization_kind: row.get(11)?,
+        intent_fingerprint_sha256: row.get(12)?,
+        policy_fingerprint_sha256: row.get(13)?,
+        status: row.get(14)?,
+        detail_code: row.get(15)?,
+        detail_message: row.get(16)?,
+        content_sha256: row.get(17)?,
+        content_length: row.get(18)?,
+        created_at_unix_ms: row.get(19)?,
+        updated_at_unix_ms: row.get(20)?,
+    })
+}
+
+fn ensure_system_action_audit_binding(
+    existing: &SystemActionAuditRecord,
+    write: &AuditWrite,
+) -> PersistenceResult<()> {
+    if existing.request_fingerprint != write.request_fingerprint
+        || existing.intent_kind != write.intent_kind
+        || existing.risk_class != write.risk_class
+        || existing.target_kind != write.target_kind
+        || existing.target_id != write.target_id
+        || existing.agent_id != write.agent_id
+        || existing.content_sha256 != write.content_sha256
+        || existing.content_length != write.content_length
+    {
+        return Err(PersistenceError::new(
+            "SYSTEM_ACTION_IDEMPOTENCY_CONFLICT",
+            "The voice request identifier is already bound to a different exact action.",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_system_action_audit_transition(current: &str, next: &str) -> PersistenceResult<()> {
+    let allowed = matches!(
+        (current, next),
+        ("approvalRequired", "dispatched" | "rejected" | "failed")
+            | (
+                "dispatched",
+                "applied" | "taskCreated" | "failed" | "uncertain"
+            )
+    );
+    if !allowed {
+        return Err(PersistenceError::new(
+            "SYSTEM_ACTION_TERMINAL",
+            "The idempotent system-action request is already terminal and was not repeated.",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_system_action_audit_cap(
+    transaction: &Transaction<'_>,
+    current_id: i64,
+    timestamp: i64,
+) -> PersistenceResult<()> {
+    let count: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM system_action_audits", [], |row| {
+            row.get(0)
+        })
+        .map_err(PersistenceError::database)?;
+    let excess = count.saturating_sub(MAX_SYSTEM_ACTION_AUDITS).max(0);
+    if excess == 0 {
+        return Ok(());
+    }
+    let pruned = transaction
+        .execute(
+            "DELETE FROM system_action_audits WHERE id IN (
+                 SELECT id FROM system_action_audits
+                 WHERE id != ?1
+                   AND status IN ('taskCreated', 'applied', 'rejected', 'failed', 'uncertain')
+                 ORDER BY updated_at_unix_ms, id
+                 LIMIT ?2
+             )",
+            params![current_id, excess],
+        )
+        .map_err(PersistenceError::database)? as i64;
+    if pruned != excess {
+        return Err(PersistenceError::new(
+            "SYSTEM_ACTION_AUDIT_CAPACITY",
+            "The bounded system-action audit is full of non-terminal requests; no action was dispatched.",
+            true,
+        ));
+    }
+    transaction
+        .execute(
+            "UPDATE data_lifecycle_meta
+             SET revision = revision + 1,
+                 last_observed_at_unix_ms = CASE
+                     WHEN last_observed_at_unix_ms IS NULL OR last_observed_at_unix_ms < ?1
+                         THEN ?1 ELSE last_observed_at_unix_ms END,
+                 total_pruned_system_action_audits = total_pruned_system_action_audits + ?2
+             WHERE singleton = 1",
+            params![timestamp, pruned],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
 fn collect_rows<'statement, T, F>(
     rows: rusqlite::Result<rusqlite::MappedRows<'statement, F>>,
 ) -> PersistenceResult<Vec<T>>
@@ -9681,6 +10053,122 @@ mod tests {
             .expect("task should exist")
     }
 
+    fn task_0015_audit_write(request_id: &str, status: &str) -> AuditWrite {
+        AuditWrite {
+            request_id: request_id.to_string(),
+            request_fingerprint: "voice-intent-v1|fixture".to_string(),
+            intent_kind: "launchApplication".to_string(),
+            risk_class: "reversible".to_string(),
+            target_kind: "desktopEntry".to_string(),
+            target_id: "org.example.Editor.desktop".to_string(),
+            agent_id: 7,
+            task_owner_agent_id: None,
+            task_id: None,
+            approval_id: None,
+            authorization_kind: if status == "approvalRequired" {
+                "approvalRequired".to_string()
+            } else {
+                "policyAllowed".to_string()
+            },
+            intent_fingerprint_sha256:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            policy_fingerprint_sha256:
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            status: status.to_string(),
+            detail_code: None,
+            detail_message: None,
+            content_sha256: None,
+            content_length: None,
+        }
+    }
+
+    #[test]
+    fn task_0015_schema_nine_has_private_bounded_system_action_audit() {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        repository.initialize_fresh().unwrap();
+        assert_eq!(repository.schema_version().unwrap(), 9);
+        let table_sql: String = repository
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'system_action_audits'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(table_sql.contains("request_id TEXT NOT NULL UNIQUE"));
+        assert!(table_sql.contains("content_sha256 TEXT"));
+        assert!(!table_sql.contains("transcript"));
+        assert!(!table_sql.contains("caption"));
+        assert!(!table_sql.contains("user_path"));
+    }
+
+    #[test]
+    fn task_0015_audit_is_idempotent_transitioned_and_content_redacted() {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        repository.initialize_fresh().unwrap();
+        let first = repository
+            .write_system_action_audit(&task_0015_audit_write("voice:audit:1", "approvalRequired"))
+            .unwrap();
+        let duplicate = repository
+            .write_system_action_audit(&task_0015_audit_write("voice:audit:1", "approvalRequired"))
+            .unwrap();
+        assert_eq!(first.id, duplicate.id);
+
+        let dispatched = repository
+            .write_system_action_audit(&task_0015_audit_write("voice:audit:1", "dispatched"))
+            .unwrap();
+        let applied = repository
+            .write_system_action_audit(&task_0015_audit_write("voice:audit:1", "applied"))
+            .unwrap();
+        assert_eq!(dispatched.id, applied.id);
+        assert_eq!(applied.status, "applied");
+        assert!(applied.content_sha256.is_none());
+
+        let mut conflict = task_0015_audit_write("voice:audit:1", "applied");
+        conflict.target_id = "org.example.Other.desktop".to_string();
+        assert_eq!(
+            repository
+                .write_system_action_audit(&conflict)
+                .unwrap_err()
+                .code,
+            "SYSTEM_ACTION_IDEMPOTENCY_CONFLICT"
+        );
+        assert_eq!(
+            repository
+                .write_system_action_audit(&task_0015_audit_write("voice:audit:1", "dispatched",))
+                .unwrap_err()
+                .code,
+            "SYSTEM_ACTION_TERMINAL"
+        );
+        assert_eq!(
+            repository
+                .query_system_action_audits(100)
+                .unwrap()
+                .records
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn task_0015_restart_marks_dispatched_action_uncertain_without_retry() {
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        repository.initialize_fresh().unwrap();
+        repository
+            .write_system_action_audit(&task_0015_audit_write("voice:restart:1", "dispatched"))
+            .unwrap();
+        repository.reconcile_dispatched_system_actions().unwrap();
+        let audit = repository
+            .system_action_audit("voice:restart:1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(audit.status, "uncertain");
+        assert_eq!(
+            audit.detail_code.as_deref(),
+            Some("SYSTEM_ACTION_DISPATCH_INTERRUPTED")
+        );
+    }
+
     #[test]
     fn fresh_state_has_exact_schema_and_survives_reopen() {
         let directory = TestDirectory::new();
@@ -9707,7 +10195,8 @@ mod tests {
                     (5, "authoritative_task_orchestration".to_string()),
                     (6, "structured_review_orchestration".to_string()),
                     (7, "structured_workspace_evidence".to_string()),
-                    (8, "data_lifecycle_and_monitoring".to_string())
+                    (8, "data_lifecycle_and_monitoring".to_string()),
+                    (9, "system_action_policy_gateway".to_string())
                 ]
             );
             let journal_mode: String = repository

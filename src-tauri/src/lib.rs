@@ -3,12 +3,14 @@ mod app_state;
 mod authorization;
 mod codex_runtime;
 mod data_lifecycle;
+mod linux_desktop;
 mod ollama_runtime;
 mod persistence;
 mod policy;
 mod provider_runtime;
 mod review_orchestration;
 mod run_coordinator;
+mod system_actions;
 mod task_orchestration;
 mod workspace_evidence;
 mod workspace_tools;
@@ -26,8 +28,8 @@ use ashpd::desktop::{
     PersistMode, Session,
 };
 use authorization::{
-    request_native_confirmation, ApprovalResolution, AuthorizationGrant, AuthorizationOutcome,
-    ResolveApprovalRequest,
+    request_native_confirmation, ApprovalResolution, AuthorizationDecision, AuthorizationEvidence,
+    AuthorizationGrant, AuthorizationOutcome, ResolveApprovalRequest,
 };
 use codex_runtime::CodexRunSpec;
 use data_lifecycle::{
@@ -76,6 +78,10 @@ use std::{
     },
     thread,
     time::{Duration, Instant},
+};
+use system_actions::{
+    sha256_hex, AuditWrite, KeyboardAction, PointerAction, SubmitVoiceIntentRequest,
+    SystemActionAuditPage, SystemActionAuditRecord, VoiceIntent, VoiceIntentResult,
 };
 use task_orchestration::{
     CreateRoutedTaskRequest, RerouteTaskRequest, SetTaskQueueDispositionRequest,
@@ -553,69 +559,6 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
             .map(|directory| directory.join(binary))
             .find(|candidate| is_executable_file(candidate))
     })
-}
-
-fn normalized_application_name(value: &str) -> String {
-    value
-        .chars()
-        .filter_map(|character| {
-            if character.is_ascii_alphanumeric() {
-                Some(character.to_ascii_lowercase())
-            } else if character.is_whitespace() || character == '-' || character == '_' {
-                Some(' ')
-            } else {
-                None
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn desktop_application_id(application: &str) -> Result<String, String> {
-    let requested_name = normalized_application_name(application);
-    if requested_name.is_empty() {
-        return Err("Say the name of an installed application to open.".to_string());
-    }
-    let mut partial_match = None;
-    for directory in [
-        PathBuf::from("/usr/share/applications"),
-        env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(".local/share/applications"))
-            .unwrap_or_default(),
-    ] {
-        let Ok(entries) = fs::read_dir(directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("desktop") {
-                continue;
-            }
-            let Ok(contents) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let name = contents
-                .lines()
-                .find_map(|line| line.strip_prefix("Name="))
-                .map(normalized_application_name)
-                .unwrap_or_default();
-            let id = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or_default()
-                .to_string();
-            if name == requested_name || normalized_application_name(&id) == requested_name {
-                return Ok(id);
-            }
-            if name.contains(&requested_name) || requested_name.contains(&name) {
-                partial_match = Some(id);
-            }
-        }
-    }
-    partial_match
-        .ok_or_else(|| format!("I could not find an installed application named {application}."))
 }
 
 fn command_text(output: &[u8]) -> String {
@@ -1738,156 +1681,1048 @@ async fn open_workspace_item(
     Ok(())
 }
 
-#[tauri::command]
-async fn launch_allowed_application(
-    agent_id: i64,
-    application: String,
-    persistence: State<'_, PersistenceService>,
-) -> Result<(), String> {
-    let requested = application.trim().to_ascii_lowercase();
-    if !matches!(
-        requested.as_str(),
-        "terminal" | "firefox" | "dolphin" | "system-settings" | "code"
-    ) {
-        return Err("That application is not approved for voice launch.".to_string());
+#[derive(Debug)]
+struct GatewayAuthorization {
+    kind: &'static str,
+    approval: Option<app_state::ApprovalRequest>,
+    evidence: AuthorizationEvidence,
+}
+
+#[derive(Debug)]
+struct GatewayExecutionError {
+    error: PersistenceError,
+    outcome_uncertain: bool,
+}
+
+fn gateway_persistence_error(
+    code: &str,
+    message: impl Into<String>,
+    recoverable: bool,
+) -> PersistenceError {
+    PersistenceError::new(code, message, recoverable)
+}
+
+fn linux_gateway_error(error: linux_desktop::LinuxDesktopError) -> PersistenceError {
+    gateway_persistence_error(&error.code, error.message, error.recoverable)
+}
+
+fn resolve_active_template_agent<'a>(
+    state: &'a ApplicationState,
+    template_key: &str,
+) -> Result<&'a app_state::Agent, PersistenceError> {
+    let matches = state
+        .agents
+        .iter()
+        .filter(|agent| {
+            agent.registry_state == "active" && agent.template_key.as_deref() == Some(template_key)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [agent] => Ok(*agent),
+        [] => Err(gateway_persistence_error(
+            "VOICE_AGENT_UNAVAILABLE",
+            format!("The active {template_key} agent template is unavailable."),
+            true,
+        )),
+        _ => Err(gateway_persistence_error(
+            "VOICE_AGENT_AMBIGUOUS",
+            format!("More than one active {template_key} agent template exists."),
+            false,
+        )),
     }
-    consume_authorization(
-        persistence.inner(),
-        ActionIntent::LaunchAllowedApplication {
-            agent_id,
-            application: requested.clone(),
-        },
+}
+
+struct GatewayAuditInput<'a> {
+    request_fingerprint: &'a str,
+    risk_class: &'a str,
+    target_kind: &'a str,
+    target_id: &'a str,
+    agent_id: i64,
+    task_owner_agent_id: Option<i64>,
+    task_id: Option<i64>,
+    approval_id: Option<i64>,
+    authorization_kind: &'a str,
+    evidence: Option<&'a AuthorizationEvidence>,
+    status: &'a str,
+    detail_code: Option<&'a str>,
+    detail_message: Option<&'a str>,
+}
+
+fn gateway_audit_write(
+    request: &SubmitVoiceIntentRequest,
+    input: GatewayAuditInput<'_>,
+) -> AuditWrite {
+    let GatewayAuditInput {
+        request_fingerprint,
+        risk_class,
+        target_kind,
+        target_id,
+        agent_id,
+        task_owner_agent_id,
+        task_id,
+        approval_id,
+        authorization_kind,
+        evidence,
+        status,
+        detail_code,
+        detail_message,
+    } = input;
+    let (content_sha256, content_length) = request
+        .intent
+        .content_digest()
+        .map(|(digest, length)| (Some(digest), Some(length as i64)))
+        .unwrap_or((None, None));
+    let (intent_fingerprint_sha256, policy_fingerprint_sha256) = evidence
+        .map(|evidence| {
+            (
+                sha256_hex(evidence.intent_fingerprint.as_bytes()),
+                sha256_hex(evidence.policy_fingerprint.as_bytes()),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                sha256_hex(request_fingerprint.as_bytes()),
+                sha256_hex(
+                    format!("policy-rejected:{}", detail_code.unwrap_or("unknown")).as_bytes(),
+                ),
+            )
+        });
+    AuditWrite {
+        request_id: request.request_id.clone(),
+        request_fingerprint: request_fingerprint.to_string(),
+        intent_kind: request.intent.kind_name().to_string(),
+        risk_class: risk_class.to_string(),
+        target_kind: target_kind.to_string(),
+        target_id: target_id.to_string(),
+        agent_id,
+        task_owner_agent_id,
+        task_id,
+        approval_id,
+        authorization_kind: authorization_kind.to_string(),
+        intent_fingerprint_sha256,
+        policy_fingerprint_sha256,
+        status: status.to_string(),
+        detail_code: detail_code.map(str::to_string),
+        detail_message: detail_message.map(|message| message.chars().take(1024).collect()),
+        content_sha256,
+        content_length,
+    }
+}
+
+fn gateway_audit_from_existing(
+    existing: &SystemActionAuditRecord,
+    status: &str,
+    detail_code: Option<&str>,
+    detail_message: Option<&str>,
+) -> AuditWrite {
+    AuditWrite {
+        request_id: existing.request_id.clone(),
+        request_fingerprint: existing.request_fingerprint.clone(),
+        intent_kind: existing.intent_kind.clone(),
+        risk_class: existing.risk_class.clone(),
+        target_kind: existing.target_kind.clone(),
+        target_id: existing.target_id.clone(),
+        agent_id: existing.agent_id,
+        task_owner_agent_id: existing.task_owner_agent_id,
+        task_id: existing.task_id,
+        approval_id: existing.approval_id,
+        authorization_kind: existing.authorization_kind.clone(),
+        intent_fingerprint_sha256: existing.intent_fingerprint_sha256.clone(),
+        policy_fingerprint_sha256: existing.policy_fingerprint_sha256.clone(),
+        status: status.to_string(),
+        detail_code: detail_code.map(str::to_string),
+        detail_message: detail_message.map(|message| message.chars().take(1024).collect()),
+        content_sha256: existing.content_sha256.clone(),
+        content_length: existing.content_length,
+    }
+}
+
+fn voice_result(
+    audit: SystemActionAuditRecord,
+    message: impl Into<String>,
+    approval: Option<app_state::ApprovalRequest>,
+) -> VoiceIntentResult {
+    VoiceIntentResult {
+        request_id: audit.request_id.clone(),
+        status: audit.status.clone(),
+        message: message.into(),
+        approval,
+        task_owner_agent_id: audit.task_owner_agent_id,
+        task_id: audit.task_id,
+        audit,
+    }
+}
+
+async fn authorize_gateway_intent(
+    persistence: &PersistenceService,
+    intent: ActionIntent,
+) -> Result<Result<GatewayAuthorization, AuthorizationOutcome>, PersistenceError> {
+    let outcome = persistence.request_authorization(intent.clone()).await?;
+    if outcome.decision == AuthorizationDecision::Allowed {
+        return Ok(Ok(GatewayAuthorization {
+            kind: "policyAllowed",
+            approval: None,
+            evidence: outcome.evidence,
+        }));
+    }
+    let approval = outcome.approval.clone().ok_or_else(|| {
+        gateway_persistence_error(
+            "APPROVAL_RECORD_MISSING",
+            "The backend required approval without returning its authoritative record.",
+            false,
+        )
+    })?;
+    if approval.status != "Approved" {
+        return Ok(Err(outcome));
+    }
+    let grant = persistence.authorize_intent(intent).await?;
+    let evidence = grant.evidence.ok_or_else(|| {
+        gateway_persistence_error(
+            "AUTHORIZATION_EVIDENCE_MISSING",
+            "The backend authorization did not return its policy evidence.",
+            false,
+        )
+    })?;
+    Ok(Ok(GatewayAuthorization {
+        kind: "approvalConsumed",
+        approval: grant.approval,
+        evidence,
+    }))
+}
+
+fn unresolved_voice_target(intent: &VoiceIntent) -> (&'static str, String, &'static str) {
+    let risk_class = match intent {
+        VoiceIntent::CloseApplication { .. } | VoiceIntent::CloseActiveWindow => "destructive",
+        VoiceIntent::KeyboardAction { action } if action.is_destructive() => "destructive",
+        VoiceIntent::CreateCodingTask { .. }
+        | VoiceIntent::PointerAction {
+            action: PointerAction::Click | PointerAction::DoubleClick,
+        }
+        | VoiceIntent::KeyboardAction { .. }
+        | VoiceIntent::ActiveWindowAction { .. }
+        | VoiceIntent::NamedWindowAction { .. }
+        | VoiceIntent::TypeText { .. } => "meaningful",
+        _ => "reversible",
+    };
+    let target_source = match intent {
+        VoiceIntent::LaunchApplication { application }
+        | VoiceIntent::CloseApplication { application }
+        | VoiceIntent::NamedWindowAction { application, .. } => application.as_str(),
+        _ => intent.kind_name(),
+    };
+    (
+        "unresolvedTarget",
+        format!("sha256:{}", sha256_hex(target_source.as_bytes())),
+        risk_class,
     )
-    .await?;
-    if requested == "terminal" {
-        let terminal = ["konsole", "kitty", "gnome-terminal", "xterm"]
-            .into_iter()
-            .find_map(find_in_path)
-            .ok_or_else(|| {
-                "No supported terminal application is installed or available in PATH.".to_string()
+}
+
+fn ensure_gateway_retry_target(
+    existing: &SystemActionAuditRecord,
+    risk_class: &str,
+    target_kind: &str,
+    target_id: &str,
+    agent_id: i64,
+) -> Result<(), PersistenceError> {
+    if existing.risk_class != risk_class
+        || existing.target_kind != target_kind
+        || existing.target_id != target_id
+        || existing.agent_id != agent_id
+    {
+        return Err(gateway_persistence_error(
+            "SYSTEM_ACTION_TARGET_CHANGED",
+            "The exact target changed after approval was requested; the original request was refused.",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+async fn record_gateway_rejection(
+    persistence: &PersistenceService,
+    request: &SubmitVoiceIntentRequest,
+    request_fingerprint: &str,
+    agent_id: i64,
+    existing: Option<&SystemActionAuditRecord>,
+    error: &PersistenceError,
+) -> Result<VoiceIntentResult, PersistenceError> {
+    let write = if let Some(existing) = existing {
+        gateway_audit_from_existing(
+            existing,
+            "rejected",
+            Some(&error.code),
+            Some(&error.message),
+        )
+    } else {
+        let (target_kind, target_id, risk_class) = unresolved_voice_target(&request.intent);
+        gateway_audit_write(
+            request,
+            GatewayAuditInput {
+                request_fingerprint,
+                risk_class,
+                target_kind,
+                target_id: &target_id,
+                agent_id,
+                task_owner_agent_id: None,
+                task_id: None,
+                approval_id: None,
+                authorization_kind: "policyRejected",
+                evidence: None,
+                status: "rejected",
+                detail_code: Some(&error.code),
+                detail_message: Some(&error.message),
+            },
+        )
+    };
+    let audit = persistence.write_system_action_audit(write).await?;
+    Ok(voice_result(audit, error.message.clone(), None))
+}
+
+async fn execute_portal_action(
+    runtime_directory: &Path,
+    execution: &linux_desktop::DesktopExecution,
+    desktop_control: &DesktopControl,
+) -> Result<bool, GatewayExecutionError> {
+    use linux_desktop::DesktopExecution;
+    let (window_id, input_kind) = match execution {
+        DesktopExecution::Pointer { window_id, .. } => (Some(window_id.as_str()), "pointer"),
+        DesktopExecution::Keyboard { window_id, .. } => (window_id.as_deref(), "keyboard"),
+        DesktopExecution::TypeText { window_id, .. } => (Some(window_id.as_str()), "keyboard"),
+        _ => return Ok(false),
+    };
+    let active_session = desktop_control
+        .session
+        .lock()
+        .map_err(|_| GatewayExecutionError {
+            error: gateway_persistence_error(
+                "DESKTOP_CONTROL_UNAVAILABLE",
+                "The desktop-control session registry is unavailable.",
+                true,
+            ),
+            outcome_uncertain: false,
+        })?
+        .clone()
+        .ok_or_else(|| GatewayExecutionError {
+            error: gateway_persistence_error(
+                "PORTAL_SESSION_REQUIRED",
+                format!(
+                    "Enable KDE desktop {input_kind} permission explicitly before retrying this action."
+                ),
+                true,
+            ),
+            outcome_uncertain: false,
+        })?;
+    if let Some(window_id) = window_id {
+        linux_desktop::ensure_active_window(runtime_directory, window_id)
+            .await
+            .map_err(|error| GatewayExecutionError {
+                error: linux_gateway_error(error),
+                outcome_uncertain: false,
             })?;
-        Command::new(terminal)
-            .spawn()
-            .map_err(|error| format!("Could not open Terminal: {error}"))?;
+    }
+
+    match execution {
+        DesktopExecution::Pointer { action, .. } => {
+            send_gateway_pointer_action(&active_session, action).await?;
+        }
+        DesktopExecution::Keyboard { action, .. } => {
+            send_gateway_keyboard_action(&active_session, action).await?;
+        }
+        DesktopExecution::TypeText { text, .. } => {
+            for character in text.chars() {
+                let keysym = if character == '\n' {
+                    0xff0d
+                } else {
+                    character as i32
+                };
+                send_gateway_key_events(
+                    &active_session,
+                    &[(keysym, KeyState::Pressed), (keysym, KeyState::Released)],
+                )
+                .await?;
+            }
+        }
+        _ => unreachable!("portal execution is filtered before dispatch"),
+    }
+    Ok(true)
+}
+
+async fn send_gateway_pointer_action(
+    session: &DesktopControlSession,
+    action: &PointerAction,
+) -> Result<(), GatewayExecutionError> {
+    let portal_error = |error: ashpd::Error, uncertain: bool| GatewayExecutionError {
+        error: gateway_persistence_error(
+            "PORTAL_POINTER_FAILED",
+            format!("KDE could not send the exact pointer action: {error}"),
+            true,
+        ),
+        outcome_uncertain: uncertain,
+    };
+    match action {
+        PointerAction::MoveLeft => session
+            .portal
+            .notify_pointer_motion(&session.session, -90.0, 0.0, Default::default())
+            .await
+            .map_err(|error| portal_error(error, false)),
+        PointerAction::MoveRight => session
+            .portal
+            .notify_pointer_motion(&session.session, 90.0, 0.0, Default::default())
+            .await
+            .map_err(|error| portal_error(error, false)),
+        PointerAction::MoveUp => session
+            .portal
+            .notify_pointer_motion(&session.session, 0.0, -90.0, Default::default())
+            .await
+            .map_err(|error| portal_error(error, false)),
+        PointerAction::MoveDown => session
+            .portal
+            .notify_pointer_motion(&session.session, 0.0, 90.0, Default::default())
+            .await
+            .map_err(|error| portal_error(error, false)),
+        PointerAction::ScrollUp | PointerAction::ScrollDown => session
+            .portal
+            .notify_pointer_axis_discrete(
+                &session.session,
+                Axis::Vertical,
+                if action == &PointerAction::ScrollUp {
+                    -3
+                } else {
+                    3
+                },
+                NotifyPointerAxisDiscreteOptions::default(),
+            )
+            .await
+            .map_err(|error| portal_error(error, false)),
+        PointerAction::Click | PointerAction::DoubleClick => {
+            let count = if action == &PointerAction::DoubleClick {
+                2
+            } else {
+                1
+            };
+            for _ in 0..count {
+                session
+                    .portal
+                    .notify_pointer_button(
+                        &session.session,
+                        0x110,
+                        KeyState::Pressed,
+                        NotifyPointerButtonOptions::default(),
+                    )
+                    .await
+                    .map_err(|error| portal_error(error, false))?;
+                if let Err(error) = session
+                    .portal
+                    .notify_pointer_button(
+                        &session.session,
+                        0x110,
+                        KeyState::Released,
+                        NotifyPointerButtonOptions::default(),
+                    )
+                    .await
+                {
+                    let _ = session
+                        .portal
+                        .notify_pointer_button(
+                            &session.session,
+                            0x110,
+                            KeyState::Released,
+                            NotifyPointerButtonOptions::default(),
+                        )
+                        .await;
+                    return Err(portal_error(error, true));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn gateway_keyboard_events(action: &KeyboardAction) -> Vec<(i32, KeyState)> {
+    match action {
+        KeyboardAction::OpenLauncher => vec![
+            (KEYSYM_SUPER, KeyState::Pressed),
+            (KEYSYM_SUPER, KeyState::Released),
+        ],
+        KeyboardAction::VolumeUp => vec![
+            (0x1008ff13, KeyState::Pressed),
+            (0x1008ff13, KeyState::Released),
+        ],
+        KeyboardAction::VolumeDown => vec![
+            (0x1008ff11, KeyState::Pressed),
+            (0x1008ff11, KeyState::Released),
+        ],
+        KeyboardAction::ToggleMute => vec![
+            (0x1008ff12, KeyState::Pressed),
+            (0x1008ff12, KeyState::Released),
+        ],
+        KeyboardAction::NextWindow => vec![
+            (KEYSYM_ALT, KeyState::Pressed),
+            (0xff09, KeyState::Pressed),
+            (0xff09, KeyState::Released),
+            (KEYSYM_ALT, KeyState::Released),
+        ],
+        KeyboardAction::PreviousWindow => vec![
+            (KEYSYM_ALT, KeyState::Pressed),
+            (KEYSYM_SHIFT, KeyState::Pressed),
+            (0xff09, KeyState::Pressed),
+            (0xff09, KeyState::Released),
+            (KEYSYM_SHIFT, KeyState::Released),
+            (KEYSYM_ALT, KeyState::Released),
+        ],
+        KeyboardAction::Left => vec![(0xff51, KeyState::Pressed), (0xff51, KeyState::Released)],
+        KeyboardAction::Right => vec![(0xff53, KeyState::Pressed), (0xff53, KeyState::Released)],
+        KeyboardAction::Up => vec![(0xff52, KeyState::Pressed), (0xff52, KeyState::Released)],
+        KeyboardAction::Down => vec![(0xff54, KeyState::Pressed), (0xff54, KeyState::Released)],
+        KeyboardAction::Home => vec![(0xff50, KeyState::Pressed), (0xff50, KeyState::Released)],
+        KeyboardAction::End => vec![(0xff57, KeyState::Pressed), (0xff57, KeyState::Released)],
+        KeyboardAction::PageUp => vec![(0xff55, KeyState::Pressed), (0xff55, KeyState::Released)],
+        KeyboardAction::PageDown => vec![(0xff56, KeyState::Pressed), (0xff56, KeyState::Released)],
+        KeyboardAction::Tab => vec![(0xff09, KeyState::Pressed), (0xff09, KeyState::Released)],
+        KeyboardAction::ShiftTab => vec![
+            (KEYSYM_SHIFT, KeyState::Pressed),
+            (0xff09, KeyState::Pressed),
+            (0xff09, KeyState::Released),
+            (KEYSYM_SHIFT, KeyState::Released),
+        ],
+        KeyboardAction::Enter => vec![(0xff0d, KeyState::Pressed), (0xff0d, KeyState::Released)],
+        KeyboardAction::Escape => vec![(0xff1b, KeyState::Pressed), (0xff1b, KeyState::Released)],
+        KeyboardAction::Backspace => {
+            vec![(0xff08, KeyState::Pressed), (0xff08, KeyState::Released)]
+        }
+        KeyboardAction::Delete => vec![(0xffff, KeyState::Pressed), (0xffff, KeyState::Released)],
+        KeyboardAction::SelectAll => control_key_events(0x61, false),
+        KeyboardAction::Copy => control_key_events(0x63, false),
+        KeyboardAction::Cut => control_key_events(0x78, false),
+        KeyboardAction::Paste => control_key_events(0x76, false),
+        KeyboardAction::Undo => control_key_events(0x7a, false),
+        KeyboardAction::Redo => control_key_events(0x7a, true),
+    }
+}
+
+fn control_key_events(keysym: i32, shift: bool) -> Vec<(i32, KeyState)> {
+    let mut events = vec![(KEYSYM_CONTROL, KeyState::Pressed)];
+    if shift {
+        events.push((KEYSYM_SHIFT, KeyState::Pressed));
+    }
+    events.push((keysym, KeyState::Pressed));
+    events.push((keysym, KeyState::Released));
+    if shift {
+        events.push((KEYSYM_SHIFT, KeyState::Released));
+    }
+    events.push((KEYSYM_CONTROL, KeyState::Released));
+    events
+}
+
+async fn send_gateway_keyboard_action(
+    session: &DesktopControlSession,
+    action: &KeyboardAction,
+) -> Result<(), GatewayExecutionError> {
+    send_gateway_key_events(session, &gateway_keyboard_events(action)).await
+}
+
+async fn send_gateway_key_events(
+    session: &DesktopControlSession,
+    events: &[(i32, KeyState)],
+) -> Result<(), GatewayExecutionError> {
+    let mut pressed = Vec::<i32>::new();
+    for (keysym, state) in events {
+        if let Err(error) = session
+            .portal
+            .notify_keyboard_keysym(
+                &session.session,
+                *keysym,
+                *state,
+                NotifyKeyboardKeysymOptions::default(),
+            )
+            .await
+        {
+            for pressed_keysym in pressed.iter().rev() {
+                let _ = session
+                    .portal
+                    .notify_keyboard_keysym(
+                        &session.session,
+                        *pressed_keysym,
+                        KeyState::Released,
+                        NotifyKeyboardKeysymOptions::default(),
+                    )
+                    .await;
+            }
+            return Err(GatewayExecutionError {
+                error: gateway_persistence_error(
+                    "PORTAL_KEYBOARD_FAILED",
+                    format!("KDE could not send the exact keyboard action: {error}"),
+                    true,
+                ),
+                outcome_uncertain: !pressed.is_empty(),
+            });
+        }
+        if matches!(state, KeyState::Pressed) {
+            pressed.push(*keysym);
+        } else if let Some(index) = pressed.iter().rposition(|pressed| pressed == keysym) {
+            pressed.remove(index);
+        }
+    }
+    Ok(())
+}
+
+async fn execute_prepared_system_action(
+    runtime_directory: &Path,
+    prepared: &linux_desktop::PreparedSystemAction,
+    desktop_control: &DesktopControl,
+) -> Result<(), GatewayExecutionError> {
+    if linux_desktop::execute_xdg_action(&prepared.execution).map_err(|error| {
+        GatewayExecutionError {
+            error: linux_gateway_error(error),
+            outcome_uncertain: false,
+        }
+    })? {
         return Ok(());
     }
-
-    let (label, executable) = match requested.as_str() {
-        "firefox" => ("Firefox", "firefox"),
-        "dolphin" => ("Dolphin", "dolphin"),
-        "system-settings" => ("System Settings", "systemsettings"),
-        "code" => ("Visual Studio Code", "code"),
-        _ => return Err("That application is not approved for voice launch.".to_string()),
-    };
-
-    let binary = find_in_path(executable)
-        .ok_or_else(|| format!("{label} is not installed or is not available in PATH."))?;
-    Command::new(binary)
-        .spawn()
-        .map_err(|error| format!("Could not open {label}: {error}"))?;
-    Ok(())
-}
-
-#[tauri::command]
-async fn launch_desktop_application(
-    agent_id: i64,
-    application: String,
-    persistence: State<'_, PersistenceService>,
-) -> Result<(), String> {
-    consume_authorization(
-        persistence.inner(),
-        ActionIntent::LaunchDesktopApplication {
-            agent_id,
-            application: application.clone(),
-        },
-    )
-    .await?;
-    let desktop_id = desktop_application_id(&application)?;
-    let launcher = find_in_path("gtk-launch")
-        .ok_or_else(|| "The desktop application launcher is unavailable.".to_string())?;
-    Command::new(launcher)
-        .arg(desktop_id)
-        .spawn()
-        .map_err(|error| format!("Could not open {application}: {error}"))?;
-    Ok(())
-}
-
-#[tauri::command]
-async fn open_standard_folder(
-    agent_id: i64,
-    folder: String,
-    persistence: State<'_, PersistenceService>,
-) -> Result<(), String> {
-    let normalized_folder = folder.trim().to_ascii_lowercase();
-    if !matches!(
-        normalized_folder.as_str(),
-        "downloads" | "documents" | "desktop" | "home"
-    ) {
-        return Err("That folder is not approved for voice control.".to_string());
+    match linux_desktop::execute_kwin_action(runtime_directory, &prepared.execution).await {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(error) => {
+            let uncertain = error.code == "KWIN_RESULT_TIMEOUT";
+            return Err(GatewayExecutionError {
+                error: linux_gateway_error(error),
+                outcome_uncertain: uncertain,
+            });
+        }
     }
-    consume_authorization(
-        persistence.inner(),
-        ActionIntent::OpenStandardFolder {
-            agent_id,
-            folder: normalized_folder.clone(),
-        },
-    )
-    .await?;
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "Could not find the home directory.".to_string())?;
-    let (label, path) = match normalized_folder.as_str() {
-        "downloads" => ("Downloads", home.join("Downloads")),
-        "documents" => ("Documents", home.join("Documents")),
-        "desktop" => ("Desktop", home.join("Desktop")),
-        "home" => ("Home", home),
-        _ => return Err("That folder is not approved for voice control.".to_string()),
-    };
-    if !path.is_dir() {
-        return Err(format!("The {label} folder does not exist."));
+    if execute_portal_action(runtime_directory, &prepared.execution, desktop_control).await? {
+        return Ok(());
     }
-    Command::new("xdg-open")
-        .arg(path)
-        .spawn()
-        .map_err(|error| format!("Could not open {label}: {error}"))?;
-    Ok(())
+    Err(GatewayExecutionError {
+        error: gateway_persistence_error(
+            "SYSTEM_ACTION_UNSUPPORTED",
+            "The prepared system action has no bounded Linux adapter.",
+            false,
+        ),
+        outcome_uncertain: false,
+    })
 }
 
 #[tauri::command]
-async fn close_allowed_application(
-    agent_id: i64,
-    application: String,
+async fn submit_voice_intent(
+    request: SubmitVoiceIntentRequest,
     persistence: State<'_, PersistenceService>,
-) -> Result<(), String> {
-    let normalized_application = application.trim().to_ascii_lowercase();
-    let (label, executable) = match normalized_application.as_str() {
-        "firefox" => ("Firefox", "firefox"),
-        "dolphin" => ("Dolphin", "dolphin"),
-        "system-settings" => ("System Settings", "systemsettings"),
-        "code" => ("Visual Studio Code", "code"),
-        _ => return Err("That application is not approved for voice close.".to_string()),
+    desktop_control: State<'_, DesktopControl>,
+) -> Result<VoiceIntentResult, PersistenceError> {
+    request
+        .validate()
+        .map_err(|error| gateway_persistence_error(&error.code, error.message, true))?;
+    let request_fingerprint = request
+        .fingerprint()
+        .map_err(|error| gateway_persistence_error(&error.code, error.message, false))?;
+    let persistence = persistence.inner();
+    let existing = persistence
+        .system_action_audit(request.request_id.clone())
+        .await?;
+    if let Some(existing) = &existing {
+        if existing.request_fingerprint != request_fingerprint {
+            return Err(gateway_persistence_error(
+                "SYSTEM_ACTION_IDEMPOTENCY_CONFLICT",
+                "The voice request identifier is already bound to different content.",
+                false,
+            ));
+        }
+        if matches!(
+            existing.status.as_str(),
+            "taskCreated" | "applied" | "rejected" | "failed" | "uncertain"
+        ) {
+            return Ok(voice_result(
+                existing.clone(),
+                existing.detail_message.clone().unwrap_or_else(|| {
+                    "This idempotent voice request is already complete.".to_string()
+                }),
+                None,
+            ));
+        }
+        if existing.status == "dispatched" {
+            let audit = persistence
+                .write_system_action_audit(gateway_audit_from_existing(
+                    existing,
+                    "uncertain",
+                    Some("SYSTEM_ACTION_ALREADY_DISPATCHED"),
+                    Some("This idempotent request was already dispatched and was not repeated."),
+                ))
+                .await?;
+            return Ok(voice_result(
+                audit,
+                "This action may already have run; it was not repeated.",
+                None,
+            ));
+        }
+    }
+
+    let envelope = persistence.load().await?.ok_or_else(|| {
+        gateway_persistence_error(
+            "APPLICATION_STATE_UNINITIALIZED",
+            "Application state must be initialized before submitting voice intents.",
+            true,
+        )
+    })?;
+
+    if let VoiceIntent::CreateCodingTask {
+        request: task_request,
+    } = &request.intent
+    {
+        let coding_agent = resolve_active_template_agent(&envelope.state, "coding")?;
+        let active_workspace_id = envelope
+            .state
+            .preferences
+            .active_workspace_id
+            .as_ref()
+            .ok_or_else(|| {
+                gateway_persistence_error(
+                    "WORKSPACE_REQUIRED",
+                    "Select an authoritative active workspace before creating a coding task.",
+                    true,
+                )
+            })?;
+        let workspace = envelope
+            .state
+            .preferences
+            .workspaces
+            .iter()
+            .find(|workspace| &workspace.id == active_workspace_id)
+            .ok_or_else(|| {
+                gateway_persistence_error(
+                    "WORKSPACE_REQUIRED",
+                    "The authoritative active workspace no longer exists.",
+                    true,
+                )
+            })?;
+        let workspace_id = workspace.id.clone();
+        let workspace_target_id = format!(
+            "{}:sha256:{}",
+            workspace.id,
+            sha256_hex(workspace.path.as_bytes())
+        );
+        if let Some(existing) = &existing {
+            if let Err(error) = ensure_gateway_retry_target(
+                existing,
+                "meaningful",
+                "workspace",
+                &workspace_target_id,
+                coding_agent.id,
+            ) {
+                return record_gateway_rejection(
+                    persistence,
+                    &request,
+                    &request_fingerprint,
+                    coding_agent.id,
+                    Some(existing),
+                    &error,
+                )
+                .await;
+            }
+        }
+        let (request_sha256, request_length) =
+            request.intent.content_digest().ok_or_else(|| {
+                gateway_persistence_error(
+                    "INVALID_VOICE_INTENT",
+                    "The coding request could not be bound to redacted authorization evidence.",
+                    false,
+                )
+            })?;
+        let intent = ActionIntent::CreateCodingTask {
+            agent_id: coding_agent.id,
+            workspace_id: workspace_id.clone(),
+            request_sha256,
+            request_length,
+        };
+        let authorization = match authorize_gateway_intent(persistence, intent).await {
+            Ok(Ok(authorization)) => authorization,
+            Ok(Err(outcome)) => {
+                let approval = outcome.approval.clone().ok_or_else(|| {
+                    gateway_persistence_error(
+                        "APPROVAL_RECORD_MISSING",
+                        "The backend did not return the required approval record.",
+                        false,
+                    )
+                })?;
+                let write = gateway_audit_write(
+                    &request,
+                    GatewayAuditInput {
+                        request_fingerprint: &request_fingerprint,
+                        risk_class: "meaningful",
+                        target_kind: "workspace",
+                        target_id: &workspace_target_id,
+                        agent_id: coding_agent.id,
+                        task_owner_agent_id: Some(coding_agent.id),
+                        task_id: None,
+                        approval_id: Some(approval.id),
+                        authorization_kind: "approvalRequired",
+                        evidence: Some(&outcome.evidence),
+                        status: "approvalRequired",
+                        detail_code: Some("APPROVAL_REQUIRED"),
+                        detail_message: Some(
+                            "The coding task is waiting for one-use backend authorization.",
+                        ),
+                    },
+                );
+                let audit = persistence.write_system_action_audit(write).await?;
+                return Ok(voice_result(
+                    audit,
+                    "This coding task is waiting in Approvals; resubmit it after approval.",
+                    Some(approval),
+                ));
+            }
+            Err(error) => {
+                return record_gateway_rejection(
+                    persistence,
+                    &request,
+                    &request_fingerprint,
+                    coding_agent.id,
+                    existing.as_ref(),
+                    &error,
+                )
+                .await;
+            }
+        };
+        let dispatched = gateway_audit_write(
+            &request,
+            GatewayAuditInput {
+                request_fingerprint: &request_fingerprint,
+                risk_class: "meaningful",
+                target_kind: "workspace",
+                target_id: &workspace_target_id,
+                agent_id: coding_agent.id,
+                task_owner_agent_id: Some(coding_agent.id),
+                task_id: None,
+                approval_id: authorization.approval.as_ref().map(|approval| approval.id),
+                authorization_kind: authorization.kind,
+                evidence: Some(&authorization.evidence),
+                status: "dispatched",
+                detail_code: Some("TASK_CREATE_DISPATCHED"),
+                detail_message: Some("The authorized request is entering the normal task queue."),
+            },
+        );
+        let dispatched = persistence.write_system_action_audit(dispatched).await?;
+        let providers = provider_registry_status().await;
+        let created = persistence
+            .create_routed_task(
+                CreateRoutedTaskRequest {
+                    expected_revision: envelope.revision,
+                    task_owner_agent_id: coding_agent.id,
+                    title: task_request.clone(),
+                    category: "Development".to_string(),
+                    priority: envelope.state.preferences.default_task_priority.clone(),
+                    workspace_id,
+                    routing_mode: "selected".to_string(),
+                    preferred_agent_id: Some(coding_agent.id),
+                    selected_agent_id: Some(coding_agent.id),
+                },
+                providers,
+            )
+            .await;
+        let created = match created {
+            Ok(created) => created,
+            Err(error) => {
+                let audit = persistence
+                    .write_system_action_audit(gateway_audit_from_existing(
+                        &dispatched,
+                        "failed",
+                        Some(&error.code),
+                        Some(&error.message),
+                    ))
+                    .await?;
+                return Ok(voice_result(audit, error.message, authorization.approval));
+            }
+        };
+        let task = created
+            .state
+            .agents
+            .iter()
+            .find(|agent| agent.id == coding_agent.id)
+            .and_then(|agent| agent.tasks.iter().max_by_key(|task| task.id))
+            .ok_or_else(|| {
+                gateway_persistence_error(
+                    "TASK_CREATE_EVIDENCE_MISSING",
+                    "The task was committed but its queue evidence could not be loaded.",
+                    false,
+                )
+            })?;
+        let mut completed = gateway_audit_from_existing(
+            &dispatched,
+            "taskCreated",
+            Some("TASK_CREATED"),
+            Some("The coding request entered the normal sequential task queue."),
+        );
+        completed.task_owner_agent_id = Some(coding_agent.id);
+        completed.task_id = Some(task.id);
+        let audit = persistence.write_system_action_audit(completed).await?;
+        return Ok(voice_result(
+            audit,
+            format!("Created queued coding task ID {}.", task.id),
+            authorization.approval,
+        ));
+    }
+
+    let pc_agent = resolve_active_template_agent(&envelope.state, "pc-control")?;
+    let runtime_directory = voice_runtime_data_dir()
+        .map_err(|message| {
+            gateway_persistence_error("VOICE_RUNTIME_PATH_UNAVAILABLE", message, true)
+        })?
+        .join("kwin");
+    let prepared =
+        match linux_desktop::prepare_system_action(&request.intent, &runtime_directory).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let error = linux_gateway_error(error);
+                return record_gateway_rejection(
+                    persistence,
+                    &request,
+                    &request_fingerprint,
+                    pc_agent.id,
+                    existing.as_ref(),
+                    &error,
+                )
+                .await;
+            }
+        };
+    let (target_kind, target_id) = prepared.authorized.target();
+    let risk_class = prepared.authorized.risk_class();
+    if let Some(existing) = &existing {
+        if let Err(error) =
+            ensure_gateway_retry_target(existing, risk_class, &target_kind, &target_id, pc_agent.id)
+        {
+            return record_gateway_rejection(
+                persistence,
+                &request,
+                &request_fingerprint,
+                pc_agent.id,
+                Some(existing),
+                &error,
+            )
+            .await;
+        }
+    }
+    let intent = ActionIntent::SystemAction {
+        agent_id: pc_agent.id,
+        action: prepared.authorized.clone(),
     };
-    consume_authorization(
-        persistence.inner(),
-        ActionIntent::CloseAllowedApplication {
-            agent_id,
-            application: normalized_application,
-        },
-    )
-    .await?;
-    let pkill = find_in_path("pkill")
-        .ok_or_else(|| "The operating-system process controller is unavailable.".to_string())?;
-    let status = Command::new(pkill)
-        .args(["-TERM", "-x", executable])
-        .status()
-        .map_err(|error| format!("Could not request that {label} close: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{label} is not running or did not accept the close request."
+    let authorization = match authorize_gateway_intent(persistence, intent).await {
+        Ok(Ok(authorization)) => authorization,
+        Ok(Err(outcome)) => {
+            let approval = outcome.approval.clone().ok_or_else(|| {
+                gateway_persistence_error(
+                    "APPROVAL_RECORD_MISSING",
+                    "The backend did not return the required approval record.",
+                    false,
+                )
+            })?;
+            let audit = persistence
+                .write_system_action_audit(gateway_audit_write(
+                    &request,
+                    GatewayAuditInput {
+                        request_fingerprint: &request_fingerprint,
+                        risk_class,
+                        target_kind: &target_kind,
+                        target_id: &target_id,
+                        agent_id: pc_agent.id,
+                        task_owner_agent_id: None,
+                        task_id: None,
+                        approval_id: Some(approval.id),
+                        authorization_kind: "approvalRequired",
+                        evidence: Some(&outcome.evidence),
+                        status: "approvalRequired",
+                        detail_code: Some("APPROVAL_REQUIRED"),
+                        detail_message: Some(
+                            "The exact system action is waiting for one-use backend authorization.",
+                        ),
+                    },
+                ))
+                .await?;
+            return Ok(voice_result(
+                audit,
+                "This exact action is waiting in Approvals; resubmit it after approval.",
+                Some(approval),
+            ));
+        }
+        Err(error) => {
+            return record_gateway_rejection(
+                persistence,
+                &request,
+                &request_fingerprint,
+                pc_agent.id,
+                existing.as_ref(),
+                &error,
+            )
+            .await;
+        }
+    };
+    let dispatched = persistence
+        .write_system_action_audit(gateway_audit_write(
+            &request,
+            GatewayAuditInput {
+                request_fingerprint: &request_fingerprint,
+                risk_class,
+                target_kind: &target_kind,
+                target_id: &target_id,
+                agent_id: pc_agent.id,
+                task_owner_agent_id: None,
+                task_id: None,
+                approval_id: authorization.approval.as_ref().map(|approval| approval.id),
+                authorization_kind: authorization.kind,
+                evidence: Some(&authorization.evidence),
+                status: "dispatched",
+                detail_code: Some("SYSTEM_ACTION_DISPATCHED"),
+                detail_message: Some(
+                    "The exact authorized target was recorded before native dispatch.",
+                ),
+            },
         ))
+        .await?;
+    match execute_prepared_system_action(&runtime_directory, &prepared, desktop_control.inner())
+        .await
+    {
+        Ok(()) => {
+            let audit = persistence
+                .write_system_action_audit(gateway_audit_from_existing(
+                    &dispatched,
+                    "applied",
+                    Some("SYSTEM_ACTION_APPLIED"),
+                    Some("The native adapter acknowledged the exact system action."),
+                ))
+                .await?;
+            Ok(voice_result(
+                audit,
+                "The exact system action was applied.",
+                authorization.approval,
+            ))
+        }
+        Err(execution_error) => {
+            let status = if execution_error.outcome_uncertain {
+                "uncertain"
+            } else {
+                "failed"
+            };
+            let audit = persistence
+                .write_system_action_audit(gateway_audit_from_existing(
+                    &dispatched,
+                    status,
+                    Some(&execution_error.error.code),
+                    Some(&execution_error.error.message),
+                ))
+                .await?;
+            Ok(voice_result(
+                audit,
+                execution_error.error.message,
+                authorization.approval,
+            ))
+        }
     }
+}
+
+#[tauri::command]
+async fn query_system_action_audits(
+    limit: i64,
+    persistence: State<'_, PersistenceService>,
+) -> Result<SystemActionAuditPage, PersistenceError> {
+    persistence.inner().query_system_action_audits(limit).await
 }
 
 #[tauri::command]
@@ -1967,639 +2802,6 @@ async fn enable_desktop_control(
         .map_err(|_| "The desktop control registry is unavailable.".to_string())? =
         Some(Arc::new(DesktopControlSession { portal, session }));
     desktop_control_status(state)
-}
-
-#[tauri::command]
-async fn send_desktop_pointer_action(
-    agent_id: i64,
-    action: String,
-    state: State<'_, DesktopControl>,
-    persistence: State<'_, PersistenceService>,
-) -> Result<(), String> {
-    let action = action.trim().to_ascii_lowercase();
-    if !matches!(
-        action.as_str(),
-        "move-left"
-            | "move-right"
-            | "move-up"
-            | "move-down"
-            | "click"
-            | "double-click"
-            | "scroll-up"
-            | "scroll-down"
-    ) {
-        return Err("That pointer action is not approved for voice control.".to_string());
-    }
-    consume_authorization(
-        persistence.inner(),
-        ActionIntent::DesktopPointer {
-            agent_id,
-            action: action.clone(),
-        },
-    )
-    .await?;
-    let active_session = state
-        .session
-        .lock()
-        .map_err(|_| "The desktop control registry is unavailable.".to_string())?
-        .clone()
-        .ok_or_else(|| {
-            "Enable KDE desktop input before using voice pointer commands.".to_string()
-        })?;
-    match action.as_str() {
-        "move-left" => {
-            active_session
-                .portal
-                .notify_pointer_motion(&active_session.session, -90.0, 0.0, Default::default())
-                .await
-        }
-        "move-right" => {
-            active_session
-                .portal
-                .notify_pointer_motion(&active_session.session, 90.0, 0.0, Default::default())
-                .await
-        }
-        "move-up" => {
-            active_session
-                .portal
-                .notify_pointer_motion(&active_session.session, 0.0, -90.0, Default::default())
-                .await
-        }
-        "move-down" => {
-            active_session
-                .portal
-                .notify_pointer_motion(&active_session.session, 0.0, 90.0, Default::default())
-                .await
-        }
-        "click" => {
-            match active_session
-                .portal
-                .notify_pointer_button(
-                    &active_session.session,
-                    0x110,
-                    KeyState::Pressed,
-                    NotifyPointerButtonOptions::default(),
-                )
-                .await
-            {
-                Ok(()) => {
-                    active_session
-                        .portal
-                        .notify_pointer_button(
-                            &active_session.session,
-                            0x110,
-                            KeyState::Released,
-                            NotifyPointerButtonOptions::default(),
-                        )
-                        .await
-                }
-                Err(error) => Err(error),
-            }
-        }
-        "double-click" => {
-            let mut result = Ok(());
-            for _ in 0..2 {
-                result = active_session
-                    .portal
-                    .notify_pointer_button(
-                        &active_session.session,
-                        0x110,
-                        KeyState::Pressed,
-                        NotifyPointerButtonOptions::default(),
-                    )
-                    .await;
-                if result.is_ok() {
-                    result = active_session
-                        .portal
-                        .notify_pointer_button(
-                            &active_session.session,
-                            0x110,
-                            KeyState::Released,
-                            NotifyPointerButtonOptions::default(),
-                        )
-                        .await;
-                }
-                if result.is_err() {
-                    break;
-                }
-            }
-            result
-        }
-        "scroll-up" => {
-            active_session
-                .portal
-                .notify_pointer_axis_discrete(
-                    &active_session.session,
-                    Axis::Vertical,
-                    -3,
-                    NotifyPointerAxisDiscreteOptions::default(),
-                )
-                .await
-        }
-        "scroll-down" => {
-            active_session
-                .portal
-                .notify_pointer_axis_discrete(
-                    &active_session.session,
-                    Axis::Vertical,
-                    3,
-                    NotifyPointerAxisDiscreteOptions::default(),
-                )
-                .await
-        }
-        _ => return Err("That pointer action is not approved for voice control.".to_string()),
-    }
-    .map_err(|error| format!("KDE could not send that pointer action: {error}"))
-}
-
-#[tauri::command]
-async fn close_active_desktop_application(
-    agent_id: i64,
-    state: State<'_, DesktopControl>,
-    persistence: State<'_, PersistenceService>,
-) -> Result<(), String> {
-    consume_authorization(
-        persistence.inner(),
-        ActionIntent::CloseActiveApplication { agent_id },
-    )
-    .await?;
-    let active_session = state
-        .session
-        .lock()
-        .map_err(|_| "The desktop control registry is unavailable.".to_string())?
-        .clone()
-        .ok_or_else(|| {
-            "Enable KDE desktop input before closing the active application by voice.".to_string()
-        })?;
-    let result = async {
-        active_session
-            .portal
-            .notify_keyboard_keysym(
-                &active_session.session,
-                KEYSYM_ALT,
-                KeyState::Pressed,
-                NotifyKeyboardKeysymOptions::default(),
-            )
-            .await?;
-        active_session
-            .portal
-            .notify_keyboard_keysym(
-                &active_session.session,
-                0xffc1,
-                KeyState::Pressed,
-                NotifyKeyboardKeysymOptions::default(),
-            )
-            .await?;
-        active_session
-            .portal
-            .notify_keyboard_keysym(
-                &active_session.session,
-                0xffc1,
-                KeyState::Released,
-                NotifyKeyboardKeysymOptions::default(),
-            )
-            .await?;
-        active_session
-            .portal
-            .notify_keyboard_keysym(
-                &active_session.session,
-                KEYSYM_ALT,
-                KeyState::Released,
-                NotifyKeyboardKeysymOptions::default(),
-            )
-            .await
-    }
-    .await;
-    result.map_err(|error| format!("KDE could not close the active application: {error}"))
-}
-
-fn invoke_kwin_shortcut(shortcut: &str) -> Result<(), String> {
-    let qdbus = find_in_path("qdbus6")
-        .ok_or_else(|| "KDE's D-Bus command-line tool is unavailable.".to_string())?;
-    let output = Command::new(qdbus)
-        .args([
-            "org.kde.kglobalaccel",
-            "/component/kwin",
-            "org.kde.kglobalaccel.Component.invokeShortcut",
-            shortcut,
-        ])
-        .output()
-        .map_err(|error| format!("Could not request KDE window control: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(if detail.is_empty() {
-            format!("KDE could not run the {shortcut} shortcut.")
-        } else {
-            format!("KDE could not run the {shortcut} shortcut: {detail}")
-        })
-    }
-}
-
-fn control_named_kwin_window(application: &str, action: &str) -> Result<(), String> {
-    let application = normalized_application_name(application);
-    if application.is_empty() || application.len() > 80 {
-        return Err("Say the name of the application window to control.".to_string());
-    }
-    if !matches!(action, "restore" | "minimize" | "maximize") {
-        return Err("That named window action is not approved for voice control.".to_string());
-    }
-
-    let runtime_dir = voice_runtime_data_dir()?.join("kwin");
-    fs::create_dir_all(&runtime_dir)
-        .map_err(|error| format!("Could not prepare KDE window control: {error}"))?;
-    let script_path = runtime_dir.join("voice-window-action.js");
-    let application_json = serde_json::to_string(&application)
-        .map_err(|error| format!("Could not prepare the application window match: {error}"))?;
-    let action_json = serde_json::to_string(action)
-        .map_err(|error| format!("Could not prepare the window action: {error}"))?;
-    let script = format!(
-        r#"const requested = {application_json};
-const action = {action_json};
-
-function normalize(value) {{
-  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-}}
-
-function compact(value) {{
-  return normalize(value).replace(/ /g, "");
-}}
-
-function matchScore(window) {{
-  const names = [window.resourceClass, window.resourceName, window.desktopFileName]
-    .map(normalize)
-    .filter(Boolean);
-  const requestedCompact = compact(requested);
-  if (names.some((name) => name === requested)) return 4;
-  if (names.some((name) => compact(name) === requestedCompact)) return 3;
-  if (names.some((name) => name.includes(requested) || requested.includes(name))) return 2;
-  const caption = normalize(window.caption);
-  return caption.includes(requested) ? 1 : 0;
-}}
-
-let selected = null;
-let selectedScore = 0;
-for (let index = workspace.stackingOrder.length - 1; index >= 0; index -= 1) {{
-  const window = workspace.stackingOrder[index];
-  if (!window || window.deleted || !window.normalWindow) continue;
-  const score = matchScore(window);
-  if (score === 0) continue;
-  if (!selected || score > selectedScore || (score === selectedScore && window.minimized && !selected.minimized)) {{
-    selected = window;
-    selectedScore = score;
-  }}
-}}
-
-if (selected) {{
-  if (selected.desktops.length > 0) workspace.currentDesktop = selected.desktops[0];
-  if (action === "minimize") {{
-    selected.minimized = true;
-  }} else {{
-    selected.minimized = false;
-    if (action === "maximize") selected.setMaximize(true, true);
-    workspace.activeWindow = selected;
-  }}
-}} else {{
-  print("AI Agent Control Center: no matching window for", requested);
-}}
-"#,
-    );
-    fs::write(&script_path, script)
-        .map_err(|error| format!("Could not prepare the KDE window action: {error}"))?;
-
-    let qdbus = find_in_path("qdbus6")
-        .ok_or_else(|| "KDE's D-Bus command-line tool is unavailable.".to_string())?;
-    let script_path = script_path.to_string_lossy().to_string();
-    let plugin_name = "ai-agent-control-center-voice-window-action";
-    let _ = Command::new(&qdbus)
-        .args([
-            "org.kde.KWin",
-            "/Scripting",
-            "org.kde.kwin.Scripting.unloadScript",
-            plugin_name,
-        ])
-        .output();
-    let load = Command::new(&qdbus)
-        .args([
-            "org.kde.KWin",
-            "/Scripting",
-            "org.kde.kwin.Scripting.loadScript",
-            &script_path,
-            plugin_name,
-        ])
-        .output()
-        .map_err(|error| format!("Could not load the KDE window action: {error}"))?;
-    if !load.status.success() {
-        return Err(format!(
-            "KDE could not load the window action: {}",
-            String::from_utf8_lossy(&load.stderr).trim()
-        ));
-    }
-    let start = Command::new(&qdbus)
-        .args(["org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.start"])
-        .output()
-        .map_err(|error| format!("Could not run the KDE window action: {error}"))?;
-    let _ = Command::new(&qdbus)
-        .args([
-            "org.kde.KWin",
-            "/Scripting",
-            "org.kde.kwin.Scripting.unloadScript",
-            plugin_name,
-        ])
-        .output();
-    if start.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "KDE could not run the window action: {}",
-            String::from_utf8_lossy(&start.stderr).trim()
-        ))
-    }
-}
-
-#[tauri::command]
-async fn send_desktop_keyboard_action(
-    agent_id: i64,
-    action: String,
-    state: State<'_, DesktopControl>,
-    persistence: State<'_, PersistenceService>,
-) -> Result<(), String> {
-    let action = action.trim().to_ascii_lowercase();
-    if !matches!(
-        action.as_str(),
-        "open-launcher"
-            | "volume-up"
-            | "volume-down"
-            | "toggle-mute"
-            | "minimize-window"
-            | "maximize-window"
-            | "restore-window"
-            | "next-window"
-            | "previous-window"
-            | "snap-left"
-            | "snap-right"
-            | "left"
-            | "right"
-            | "up"
-            | "down"
-            | "home"
-            | "end"
-            | "page-up"
-            | "page-down"
-            | "tab"
-            | "shift-tab"
-            | "enter"
-            | "escape"
-            | "backspace"
-            | "delete"
-            | "select-all"
-            | "copy"
-            | "cut"
-            | "paste"
-            | "undo"
-            | "redo"
-    ) {
-        return Err("That keyboard action is not approved for voice control.".to_string());
-    }
-    consume_authorization(
-        persistence.inner(),
-        ActionIntent::DesktopKeyboard {
-            agent_id,
-            action: action.clone(),
-        },
-    )
-    .await?;
-    let active_session = state
-        .session
-        .lock()
-        .map_err(|_| "The desktop control registry is unavailable.".to_string())?
-        .clone()
-        .ok_or_else(|| {
-            "Enable KDE desktop input before using voice keyboard commands.".to_string()
-        })?;
-    let kwin_shortcut = match action.as_str() {
-        "minimize-window" => Some("Window Minimize"),
-        "maximize-window" => Some("Window Maximize"),
-        "restore-window" => Some("Window Restore"),
-        "snap-left" => Some("Window Quick Tile Left"),
-        "snap-right" => Some("Window Quick Tile Right"),
-        _ => None,
-    };
-    if let Some(shortcut) = kwin_shortcut {
-        return invoke_kwin_shortcut(shortcut);
-    }
-    let events: Vec<(i32, KeyState)> = match action.as_str() {
-        "open-launcher" => vec![
-            (KEYSYM_SUPER, KeyState::Pressed),
-            (KEYSYM_SUPER, KeyState::Released),
-        ],
-        "volume-up" => vec![
-            (0x1008ff13, KeyState::Pressed),
-            (0x1008ff13, KeyState::Released),
-        ],
-        "volume-down" => vec![
-            (0x1008ff11, KeyState::Pressed),
-            (0x1008ff11, KeyState::Released),
-        ],
-        "toggle-mute" => vec![
-            (0x1008ff12, KeyState::Pressed),
-            (0x1008ff12, KeyState::Released),
-        ],
-        "next-window" => vec![
-            (KEYSYM_ALT, KeyState::Pressed),
-            (0xff09, KeyState::Pressed),
-            (0xff09, KeyState::Released),
-            (KEYSYM_ALT, KeyState::Released),
-        ],
-        "previous-window" => vec![
-            (KEYSYM_ALT, KeyState::Pressed),
-            (KEYSYM_SHIFT, KeyState::Pressed),
-            (0xff09, KeyState::Pressed),
-            (0xff09, KeyState::Released),
-            (KEYSYM_SHIFT, KeyState::Released),
-            (KEYSYM_ALT, KeyState::Released),
-        ],
-        "left" => vec![(0xff51, KeyState::Pressed), (0xff51, KeyState::Released)],
-        "right" => vec![(0xff53, KeyState::Pressed), (0xff53, KeyState::Released)],
-        "up" => vec![(0xff52, KeyState::Pressed), (0xff52, KeyState::Released)],
-        "down" => vec![(0xff54, KeyState::Pressed), (0xff54, KeyState::Released)],
-        "home" => vec![(0xff50, KeyState::Pressed), (0xff50, KeyState::Released)],
-        "end" => vec![(0xff57, KeyState::Pressed), (0xff57, KeyState::Released)],
-        "page-up" => vec![(0xff55, KeyState::Pressed), (0xff55, KeyState::Released)],
-        "page-down" => vec![(0xff56, KeyState::Pressed), (0xff56, KeyState::Released)],
-        "tab" => vec![(0xff09, KeyState::Pressed), (0xff09, KeyState::Released)],
-        "shift-tab" => vec![
-            (KEYSYM_SHIFT, KeyState::Pressed),
-            (0xff09, KeyState::Pressed),
-            (0xff09, KeyState::Released),
-            (KEYSYM_SHIFT, KeyState::Released),
-        ],
-        "enter" => vec![(0xff0d, KeyState::Pressed), (0xff0d, KeyState::Released)],
-        "escape" => vec![(0xff1b, KeyState::Pressed), (0xff1b, KeyState::Released)],
-        "backspace" => vec![(0xff08, KeyState::Pressed), (0xff08, KeyState::Released)],
-        "delete" => vec![(0xffff, KeyState::Pressed), (0xffff, KeyState::Released)],
-        "select-all" => vec![
-            (KEYSYM_CONTROL, KeyState::Pressed),
-            (0x61, KeyState::Pressed),
-            (0x61, KeyState::Released),
-            (KEYSYM_CONTROL, KeyState::Released),
-        ],
-        "copy" => vec![
-            (KEYSYM_CONTROL, KeyState::Pressed),
-            (0x63, KeyState::Pressed),
-            (0x63, KeyState::Released),
-            (KEYSYM_CONTROL, KeyState::Released),
-        ],
-        "cut" => vec![
-            (KEYSYM_CONTROL, KeyState::Pressed),
-            (0x78, KeyState::Pressed),
-            (0x78, KeyState::Released),
-            (KEYSYM_CONTROL, KeyState::Released),
-        ],
-        "paste" => vec![
-            (KEYSYM_CONTROL, KeyState::Pressed),
-            (0x76, KeyState::Pressed),
-            (0x76, KeyState::Released),
-            (KEYSYM_CONTROL, KeyState::Released),
-        ],
-        "undo" => vec![
-            (KEYSYM_CONTROL, KeyState::Pressed),
-            (0x7a, KeyState::Pressed),
-            (0x7a, KeyState::Released),
-            (KEYSYM_CONTROL, KeyState::Released),
-        ],
-        "redo" => vec![
-            (KEYSYM_CONTROL, KeyState::Pressed),
-            (KEYSYM_SHIFT, KeyState::Pressed),
-            (0x7a, KeyState::Pressed),
-            (0x7a, KeyState::Released),
-            (KEYSYM_SHIFT, KeyState::Released),
-            (KEYSYM_CONTROL, KeyState::Released),
-        ],
-        _ => return Err("That keyboard action is not approved for voice control.".to_string()),
-    };
-    for (keysym, key_state) in events {
-        active_session
-            .portal
-            .notify_keyboard_keysym(
-                &active_session.session,
-                keysym,
-                key_state,
-                NotifyKeyboardKeysymOptions::default(),
-            )
-            .await
-            .map_err(|error| format!("KDE could not send that keyboard action: {error}"))?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
-async fn control_named_desktop_window(
-    agent_id: i64,
-    application: String,
-    action: String,
-    state: State<'_, DesktopControl>,
-    persistence: State<'_, PersistenceService>,
-) -> Result<(), String> {
-    let normalized_action = action.trim().to_ascii_lowercase();
-    let normalized_application = normalized_application_name(&application);
-    if normalized_application.is_empty() || normalized_application.len() > 80 {
-        return Err("Say the name of the application window to control.".to_string());
-    }
-    if !matches!(
-        normalized_action.as_str(),
-        "restore" | "minimize" | "maximize"
-    ) {
-        return Err("That named window action is not approved for voice control.".to_string());
-    }
-    consume_authorization(
-        persistence.inner(),
-        ActionIntent::DesktopWindow {
-            agent_id,
-            application: normalized_application.clone(),
-            action: normalized_action.clone(),
-        },
-    )
-    .await?;
-    let desktop_control_active = state
-        .session
-        .lock()
-        .map_err(|_| "The desktop control registry is unavailable.".to_string())?
-        .is_some();
-    if !desktop_control_active {
-        return Err(
-            "Enable KDE desktop input before controlling a named application window by voice."
-                .to_string(),
-        );
-    }
-    control_named_kwin_window(&normalized_application, &normalized_action)
-}
-
-#[tauri::command]
-async fn type_desktop_text(
-    agent_id: i64,
-    text: String,
-    state: State<'_, DesktopControl>,
-    persistence: State<'_, PersistenceService>,
-) -> Result<(), String> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Err("Say the text to type after type, write, or dictate.".to_string());
-    }
-    if text.len() > 280
-        || !text.chars().all(|character| {
-            character.is_ascii_alphanumeric()
-                || matches!(
-                    character,
-                    ' ' | '\n' | '-' | '.' | '/' | '_' | ':' | ',' | '=' | '+' | '?' | '@'
-                )
-        })
-    {
-        return Err("Dictated text can contain up to 280 ASCII letters, numbers, spaces, line breaks, and common terminal symbols.".to_string());
-    }
-    consume_authorization(
-        persistence.inner(),
-        ActionIntent::TypeDesktopText {
-            agent_id,
-            text: text.to_string(),
-        },
-    )
-    .await?;
-    let active_session = state
-        .session
-        .lock()
-        .map_err(|_| "The desktop control registry is unavailable.".to_string())?
-        .clone()
-        .ok_or_else(|| "Enable KDE desktop input before typing by voice.".to_string())?;
-    for character in text.chars() {
-        let keysym = if character == '\n' {
-            0xff0d
-        } else {
-            character as i32
-        };
-        active_session
-            .portal
-            .notify_keyboard_keysym(
-                &active_session.session,
-                keysym,
-                KeyState::Pressed,
-                NotifyKeyboardKeysymOptions::default(),
-            )
-            .await
-            .map_err(|error| format!("KDE could not type the dictated text: {error}"))?;
-        active_session
-            .portal
-            .notify_keyboard_keysym(
-                &active_session.session,
-                keysym,
-                KeyState::Released,
-                NotifyKeyboardKeysymOptions::default(),
-            )
-            .await
-            .map_err(|error| format!("KDE could not type the dictated text: {error}"))?;
-    }
-    Ok(())
 }
 
 #[tauri::command]
@@ -3853,17 +4055,10 @@ pub fn run() {
             choose_workspace_folder,
             cancel_agent_run,
             open_workspace_item,
-            launch_allowed_application,
-            launch_desktop_application,
-            open_standard_folder,
-            close_allowed_application,
-            close_active_desktop_application,
-            send_desktop_keyboard_action,
-            control_named_desktop_window,
-            type_desktop_text,
+            submit_voice_intent,
+            query_system_action_audits,
             desktop_control_status,
             enable_desktop_control,
-            send_desktop_pointer_action,
             voice_runtime_status,
             install_voice_runtime,
             install_high_accuracy_voice_runtime,
@@ -4197,39 +4392,9 @@ mod tests {
         let handlers = [
             ("open_workspace_item", "ActionIntent::OpenWorkspaceItem"),
             (
-                "launch_allowed_application",
-                "ActionIntent::LaunchAllowedApplication",
-            ),
-            (
-                "launch_desktop_application",
-                "ActionIntent::LaunchDesktopApplication",
-            ),
-            ("open_standard_folder", "ActionIntent::OpenStandardFolder"),
-            (
-                "close_allowed_application",
-                "ActionIntent::CloseAllowedApplication",
-            ),
-            (
                 "enable_desktop_control",
                 "ActionIntent::EnableDesktopControl",
             ),
-            (
-                "send_desktop_pointer_action",
-                "ActionIntent::DesktopPointer",
-            ),
-            (
-                "close_active_desktop_application",
-                "ActionIntent::CloseActiveApplication",
-            ),
-            (
-                "send_desktop_keyboard_action",
-                "ActionIntent::DesktopKeyboard",
-            ),
-            (
-                "control_named_desktop_window",
-                "ActionIntent::DesktopWindow",
-            ),
-            ("type_desktop_text", "ActionIntent::TypeDesktopText"),
             ("install_voice_runtime", "ActionIntent::InstallVoiceRuntime"),
             (
                 "install_high_accuracy_voice_runtime",
@@ -4271,6 +4436,94 @@ mod tests {
         assert!(run_body.contains("registry.run(provider_id, context, authorized)"));
         assert!(run_body.contains("attach_workspace_evidence"));
         assert!(!run_body.contains("is_ollama_provider"));
+    }
+
+    #[test]
+    fn task_0015_renderer_exposes_only_the_unified_voice_system_action_gateway() {
+        let source = include_str!("lib.rs");
+        let invoke_start = source
+            .find(".invoke_handler(tauri::generate_handler![")
+            .unwrap();
+        let invoke_body =
+            &source[invoke_start..source[invoke_start..].find("])\n").unwrap() + invoke_start];
+        assert!(invoke_body.contains("submit_voice_intent"));
+        assert!(invoke_body.contains("query_system_action_audits"));
+        for removed in [
+            "launch_allowed_application",
+            "launch_desktop_application",
+            "open_standard_folder",
+            "close_allowed_application",
+            "close_active_desktop_application",
+            "send_desktop_keyboard_action",
+            "control_named_desktop_window",
+            "type_desktop_text",
+            "send_desktop_pointer_action",
+        ] {
+            assert!(
+                !invoke_body.contains(removed),
+                "legacy direct handler {removed} must not be an IPC surface"
+            );
+        }
+
+        let gateway_start = source.find("async fn submit_voice_intent(").unwrap();
+        let gateway = &source[gateway_start
+            ..source[gateway_start..]
+                .find("async fn query_system_action_audits(")
+                .unwrap()
+                + gateway_start];
+        assert!(gateway.contains("resolve_active_template_agent"));
+        assert!(gateway.contains("authorize_gateway_intent"));
+        assert!(gateway.contains("write_system_action_audit"));
+        assert!(gateway.contains("create_routed_task"));
+        assert!(gateway.contains("execute_prepared_system_action"));
+    }
+
+    #[test]
+    fn task_0015_approval_retry_refuses_a_changed_exact_target() {
+        let existing = SystemActionAuditRecord {
+            id: 1,
+            request_id: "voice:retry:1".to_string(),
+            request_fingerprint: "voice-intent-v1|fixture".to_string(),
+            intent_kind: "closeApplication".to_string(),
+            risk_class: "destructive".to_string(),
+            target_kind: "kwinWindow".to_string(),
+            target_id: "exact-window-1:desktop:org.example.Editor.desktop".to_string(),
+            agent_id: 7,
+            task_owner_agent_id: None,
+            task_id: None,
+            approval_id: Some(9),
+            authorization_kind: "approvalRequired".to_string(),
+            intent_fingerprint_sha256: "a".repeat(64),
+            policy_fingerprint_sha256: "b".repeat(64),
+            status: "approvalRequired".to_string(),
+            detail_code: Some("APPROVAL_REQUIRED".to_string()),
+            detail_message: None,
+            content_sha256: None,
+            content_length: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        };
+
+        assert!(ensure_gateway_retry_target(
+            &existing,
+            "destructive",
+            "kwinWindow",
+            "exact-window-1:desktop:org.example.Editor.desktop",
+            7,
+        )
+        .is_ok());
+        assert_eq!(
+            ensure_gateway_retry_target(
+                &existing,
+                "destructive",
+                "kwinWindow",
+                "exact-window-1:desktop:org.example.Other.desktop",
+                7,
+            )
+            .unwrap_err()
+            .code,
+            "SYSTEM_ACTION_TARGET_CHANGED"
+        );
     }
 
     fn agent_run_request_fixture() -> ProviderRunRequest {
