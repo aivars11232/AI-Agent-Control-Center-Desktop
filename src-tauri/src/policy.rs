@@ -1,7 +1,10 @@
 use crate::{
     app_state::{Agent, AgentTask, ApplicationState, WorkspaceDefinition},
     provider_runtime::resolve_model_identity,
-    review_orchestration::ReviewIntentContext,
+    review_orchestration::{ReviewIntentContext, ReviewLevel},
+    specialist_capabilities::{
+        core_specialist_kind, SpecialistKind, SpecialistTaskRequestV1, WorkspaceMutationClass,
+    },
     system_actions::{AuthorizedSystemAction, KeyboardAction},
 };
 use serde::{Deserialize, Serialize};
@@ -541,6 +544,18 @@ impl<'a> EvaluationContext<'a> {
                     "The selected agent is not the exact required reviewer in the executor reporting chain.",
                 ));
             }
+            if context.level == ReviewLevel::Senior
+                && task
+                    .specialist_request
+                    .as_ref()
+                    .is_some_and(|request| request.kind() == SpecialistKind::Coding)
+                && self.agent.template_key.as_deref() != Some("debugging")
+            {
+                return Err(PolicyDenial::new(
+                    "WRONG_SPECIALIST_REVIEWER",
+                    "Coding work requires the exact stable Debugging template for Senior review.",
+                ));
+            }
         }
 
         self.title = if run_mode == RunMode::Review {
@@ -548,12 +563,23 @@ impl<'a> EvaluationContext<'a> {
         } else {
             format!("Run task: {}", task.title)
         };
-        self.require_scope(Scope::Files, 1)?;
         if run_mode == RunMode::Review {
+            self.require_scope(Scope::Files, 1)?;
             self.risk_level = "Low";
             self.reason = "Review runs are confined to read-only workspace access.".to_string();
             return Ok(());
         }
+
+        if let Some(request) = task.specialist_request.clone() {
+            return self.evaluate_specialist_run(&request);
+        }
+        if core_specialist_kind(self.agent.template_key.as_deref()).is_some() {
+            return Err(PolicyDenial::new(
+                "SPECIALIST_REQUEST_REQUIRED",
+                "Core specialist templates require a typed specialist request.",
+            ));
+        }
+        self.require_scope(Scope::Files, 1)?;
 
         let text = format!("{} {}", task.title, task.category).to_ascii_lowercase();
         let privileged = contains_any(
@@ -695,6 +721,70 @@ impl<'a> EvaluationContext<'a> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        Ok(())
+    }
+
+    fn evaluate_specialist_run(
+        &mut self,
+        request: &SpecialistTaskRequestV1,
+    ) -> Result<(), PolicyDenial> {
+        request
+            .validate()
+            .map_err(|error| PolicyDenial::new(error.code, error.message))?;
+        let kind = request.kind();
+        if self.agent.template_key.as_deref() != Some(kind.template_key()) {
+            return Err(PolicyDenial::new(
+                "SPECIALIST_TEMPLATE_MISMATCH",
+                "Typed specialist work requires its exact stable core template.",
+            ));
+        }
+        let task = self.task.expect("specialist runs always resolve a task");
+        if task.category != kind.category() {
+            return Err(PolicyDenial::new(
+                "SPECIALIST_CATEGORY_MISMATCH",
+                "The task category must match its typed specialist request.",
+            ));
+        }
+
+        match request {
+            SpecialistTaskRequestV1::Coding(coding) => {
+                self.require_scope(Scope::Files, 2)?;
+                self.require_scope(Scope::Terminal, 1)?;
+                if coding.allow_web_research {
+                    self.require_scope(Scope::Internet, 1)?;
+                }
+                let destructive = coding.mutation_classes.iter().any(|class| {
+                    matches!(
+                        class,
+                        WorkspaceMutationClass::Delete | WorkspaceMutationClass::Rename
+                    )
+                });
+                self.risk_level = if destructive || task.priority == "Critical" {
+                    "High"
+                } else {
+                    "Medium"
+                };
+                self.force_approval = true;
+                self.reason = "Coding is confined to the selected workspace and always requires a one-use approval bound to its exact typed request.".to_string();
+            }
+            SpecialistTaskRequestV1::Debugging(debugging) => {
+                self.require_scope(Scope::Files, 1)?;
+                if !debugging.requested_checks.is_empty() {
+                    self.require_scope(Scope::Terminal, 1)?;
+                }
+                self.risk_level = "Low";
+                self.reason = "Debugging is read-only; it may diagnose and run bounded checks but cannot apply a fix.".to_string();
+            }
+            SpecialistTaskRequestV1::BrowserResearch(_) => {
+                self.require_scope(Scope::Internet, 1)?;
+                self.risk_level = "Low";
+                self.reason = "Browser Research uses hosted read-only search with no submissions, downloads, authentication, purchases, or other external effects.".to_string();
+            }
+            SpecialistTaskRequestV1::FinancialAnalysis(_) => {
+                self.risk_level = "Low";
+                self.reason = "Financial Analysis is confined to local fixed-point calculations and reports; account access and transactions are prohibited.".to_string();
+            }
+        }
         Ok(())
     }
 
@@ -877,6 +967,7 @@ impl<'a> EvaluationContext<'a> {
                 "priority": task.priority,
                 "assignedAgentId": task.assigned_agent_id,
                 "workspaceId": task.workspace_id,
+                "specialistRequest": task.specialist_request,
                 "reviewAgentId": task.review_agent_id,
                 "reviewStatus": task.review_status,
             })
@@ -1079,6 +1170,24 @@ fn approval_mode(agent: &Agent, scope: Scope) -> &str {
 mod tests {
     use super::*;
     use crate::app_state::default_application_state;
+    use crate::specialist_capabilities::{
+        BrowserResearchRequestV1, CodingRequestV1, DebuggingRequestV1, FinancialAnalysisRequestV1,
+        SpecialistTaskRequestV1, WorkspaceMutationClass, SPECIALIST_PROFILE_VERSION,
+        SPECIALIST_SCHEMA_VERSION,
+    };
+
+    fn coding_request() -> SpecialistTaskRequestV1 {
+        SpecialistTaskRequestV1::Coding(CodingRequestV1 {
+            schema_version: SPECIALIST_SCHEMA_VERSION,
+            profile_version: SPECIALIST_PROFILE_VERSION.to_string(),
+            objective: "Edit the parser".to_string(),
+            acceptance_criteria: vec!["Tests pass".to_string()],
+            constraints: vec![],
+            mutation_classes: vec![WorkspaceMutationClass::Modify],
+            requested_checks: vec!["cargo test".to_string()],
+            allow_web_research: false,
+        })
+    }
 
     fn state_with_task() -> ApplicationState {
         let mut state = default_application_state().unwrap();
@@ -1105,6 +1214,7 @@ mod tests {
             runtime_model: None,
             total_tokens: None,
             workspace_id: Some("workspace-1".to_string()),
+            specialist_request: Some(coding_request()),
             changed_files: Vec::new(),
             diff: None,
             workspace_changes: None,
@@ -1192,8 +1302,6 @@ mod tests {
     #[test]
     fn strict_mode_requires_approval_even_for_preallowed_read() {
         let mut state = state_with_task();
-        state.agents[1].tasks[0].title = "Inspect the parser".to_string();
-        state.agents[1].tasks[0].category = "General".to_string();
         state.agents[1].approvals.files = "allow".to_string();
         state.preferences.safety_mode = "strict".to_string();
         assert_eq!(
@@ -1333,6 +1441,112 @@ mod tests {
         assert_eq!(
             evaluate_policy(&state, &missing).unwrap_err().code,
             "WORKSPACE_NOT_FOUND"
+        );
+    }
+
+    #[test]
+    fn task_0017_policy_enforces_distinct_specialist_scopes_and_prohibited_crossing() {
+        let coding = evaluate_policy(&state_with_task(), &run_intent()).unwrap();
+        assert_eq!(coding.disposition, PolicyDisposition::ApprovalRequired);
+        assert_eq!(coding.scopes, vec![Scope::Files, Scope::Terminal]);
+
+        let mut debugging_state = state_with_task();
+        debugging_state.preferences.active_ai_provider = "codex".to_string();
+        debugging_state.agents[1].tasks[0].assigned_agent_id = 3;
+        debugging_state.agents[1].tasks[0].specialist_request =
+            Some(SpecialistTaskRequestV1::Debugging(DebuggingRequestV1 {
+                schema_version: SPECIALIST_SCHEMA_VERSION,
+                profile_version: SPECIALIST_PROFILE_VERSION.to_string(),
+                objective: "Diagnose without fixing".to_string(),
+                symptoms: vec!["A check fails".to_string()],
+                expected_behavior: "The check passes".to_string(),
+                reproduction_steps: vec![],
+                requested_checks: vec![],
+            }));
+        let debugging = evaluate_policy(
+            &debugging_state,
+            &ActionIntent::RunTask {
+                agent_id: 3,
+                task_owner_agent_id: 2,
+                task_id: 41,
+                run_mode: RunMode::Execute,
+                review_context: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(debugging.scopes, vec![Scope::Files]);
+
+        let mut browser_state = state_with_task();
+        browser_state.preferences.active_ai_provider = "codex".to_string();
+        browser_state.agents[3].status = "Waiting".to_string();
+        browser_state.agents[1].tasks[0].assigned_agent_id = 4;
+        browser_state.agents[1].tasks[0].category = "Browsing".to_string();
+        browser_state.agents[1].tasks[0].specialist_request = Some(
+            SpecialistTaskRequestV1::BrowserResearch(BrowserResearchRequestV1 {
+                schema_version: SPECIALIST_SCHEMA_VERSION,
+                profile_version: SPECIALIST_PROFILE_VERSION.to_string(),
+                question: "Find primary sources".to_string(),
+                allowed_domains: vec![],
+                max_sources: 3,
+                freshness_context: None,
+            }),
+        );
+        let browser = evaluate_policy(
+            &browser_state,
+            &ActionIntent::RunTask {
+                agent_id: 4,
+                task_owner_agent_id: 2,
+                task_id: 41,
+                run_mode: RunMode::Execute,
+                review_context: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(browser.scopes, vec![Scope::Internet]);
+
+        let mut financial_state = state_with_task();
+        financial_state.preferences.active_ai_provider = "codex".to_string();
+        financial_state.agents[4].status = "Waiting".to_string();
+        financial_state.agents[1].tasks[0].assigned_agent_id = 5;
+        financial_state.agents[1].tasks[0].category = "Finance".to_string();
+        financial_state.agents[1].tasks[0].specialist_request = Some(
+            SpecialistTaskRequestV1::FinancialAnalysis(FinancialAnalysisRequestV1 {
+                schema_version: SPECIALIST_SCHEMA_VERSION,
+                profile_version: SPECIALIST_PROFILE_VERSION.to_string(),
+                question: "Calculate supplied figures".to_string(),
+                currency: Some("EUR".to_string()),
+                assumptions: vec![],
+                calculations: vec![],
+            }),
+        );
+        let financial = evaluate_policy(
+            &financial_state,
+            &ActionIntent::RunTask {
+                agent_id: 5,
+                task_owner_agent_id: 2,
+                task_id: 41,
+                run_mode: RunMode::Execute,
+                review_context: None,
+            },
+        )
+        .unwrap();
+        assert!(financial.scopes.is_empty());
+
+        debugging_state.agents[1].tasks[0].specialist_request = Some(coding_request());
+        assert_eq!(
+            evaluate_policy(
+                &debugging_state,
+                &ActionIntent::RunTask {
+                    agent_id: 3,
+                    task_owner_agent_id: 2,
+                    task_id: 41,
+                    run_mode: RunMode::Execute,
+                    review_context: None,
+                }
+            )
+            .unwrap_err()
+            .code,
+            "SPECIALIST_TEMPLATE_MISMATCH"
         );
     }
 

@@ -1,4 +1,7 @@
 use crate::app_state::ModelDefinition;
+use crate::specialist_capabilities::{
+    SpecialistResultV1, SpecialistRunContractV1, SpecialistTaskRequestV1,
+};
 use crate::workspace_evidence::WorkspaceChangeEvidenceV1;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -264,6 +267,8 @@ pub(crate) struct ProviderRunRequest {
     pub(crate) authorized_scopes: Vec<String>,
     pub(crate) destructive_actions_approved: bool,
     pub(crate) timeout_seconds: u64,
+    pub(crate) specialist_request: Option<SpecialistTaskRequestV1>,
+    pub(crate) specialist_contract: Option<SpecialistRunContractV1>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -321,6 +326,7 @@ pub(crate) struct ProviderRunResult {
     pub(crate) diff: Option<String>,
     pub(crate) duration_seconds: u64,
     pub(crate) evidence: ProviderRunEvidence,
+    pub(crate) specialist_result: Option<SpecialistResultV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -679,6 +685,7 @@ pub(crate) mod test_support {
                 diff: None,
                 duration_seconds: 1,
                 evidence: ProviderRunEvidence::default(),
+                specialist_result: None,
             })
         }
     }
@@ -707,6 +714,8 @@ pub(crate) mod test_support {
             authorized_scopes: Vec::new(),
             destructive_actions_approved: false,
             timeout_seconds: 60,
+            specialist_request: None,
+            specialist_contract: None,
         }
     }
 }

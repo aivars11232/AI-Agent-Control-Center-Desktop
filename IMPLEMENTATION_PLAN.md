@@ -154,9 +154,13 @@ acceptance.
 
 ### M6 — Complete bounded core agents
 
-TASK-0017 makes Coding, Debugging, Browser, and Financial specialist behavior
-real and bounded. TASK-0018 adds passive reminders, structured memory, and
-management handoff workspaces without background model execution.
+TASK-0017 now makes Coding, Debugging, Browser Research, and Financial Analysis
+distinct backend-enforced profiles: typed requests and results, exact stable-
+template routing, immutable per-run tool ceilings, forced one-use Coding
+approval, read-only Debugging, hosted-search-only Browser Research, and local
+fixed-point Financial Analysis with no external effects. TASK-0018 adds passive
+reminders, structured memory, and management handoff workspaces without
+background model execution.
 
 ### M7 — Package and release
 

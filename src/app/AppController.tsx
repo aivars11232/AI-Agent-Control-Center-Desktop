@@ -64,6 +64,10 @@ import {
   ollamaCodingModelName,
 } from "../domain/models";
 import { desktopClient, isDesktopRuntime } from "../services/desktopClient";
+import {
+  isSpecialistTaskRequest,
+  type SpecialistTaskRequest,
+} from "../specialistCapabilities";
 import { ActivityPage } from "../features/activity/ActivityPage";
 import { AgentsPage } from "../features/agents/AgentsPage";
 import { ApprovalsPage } from "../features/approvals/ApprovalsPage";
@@ -365,6 +369,7 @@ export function AppController() {
               queueState?: AgentTask["queueState"];
               enqueueSequence?: number | null;
               routingEvidence?: RoutingEvidence | null;
+              specialistRequest?: SpecialistTaskRequest | null;
               reviewAgentId?: number | null;
               reviewStatus?: ReviewStatus;
               reviewResult?: string | null;
@@ -500,6 +505,11 @@ export function AppController() {
               queueState,
               enqueueSequence,
               routingEvidence,
+              specialistRequest: isSpecialistTaskRequest(
+                legacyTask.specialistRequest,
+              )
+                ? legacyTask.specialistRequest
+                : null,
               reviewAgentId:
                 typeof legacyTask.reviewAgentId === "number"
                   ? legacyTask.reviewAgentId

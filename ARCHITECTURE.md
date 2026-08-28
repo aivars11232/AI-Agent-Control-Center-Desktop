@@ -40,6 +40,7 @@ The binding decision record is
       |-- task queue/routing evidence projection (src/taskOrchestration.ts)
       |-- structured review-flow projection (src/reviewOrchestration.ts)
       |-- run snapshot/event projection (src/runCoordinator.ts)
+      |-- specialist request/result presentation (src/specialistCapabilities.ts)
       |-- structured workspace-evidence projection (src/workspaceEvidence.ts)
       |-- canonical voice-intent interpretation (src/voiceCommand.ts)
       |-- browser-preview localStorage (non-authoritative compatibility only)
@@ -52,6 +53,7 @@ The binding decision record is
       |-- authoritative agent registry/hierarchy (agent_registry.rs)
       |-- authoritative task routing/queue contract (task_orchestration.rs)
       |-- authoritative review protocol/pipeline (review_orchestration.rs)
+      |-- strict specialist request/result/tool contracts (specialist_capabilities.rs)
       |-- capability policy + authoritative one-use approvals
       |-- authoritative single-run coordinator + durable bounded ledger
       |-- provider registry/common contract (provider_runtime.rs)
@@ -99,6 +101,10 @@ reviewers, parse provider verdicts, or decide transitions.
 <code>src/workspaceEvidence.ts</code> defensively projects the backend's
 versioned evidence into task, dashboard, and activity views and only offers a
 file-open action for an existing final regular file or directory.
+<code>src/specialistCapabilities.ts</code> builds typed role-specific task
+requests, describes effective ceilings, and projects backend-validated results.
+Its Debugging-to-Coding action only pre-populates a visible Coding draft; it
+does not create, approve, queue, or dispatch work by itself.
 
 ### Rust backend
 
@@ -113,6 +119,7 @@ also composes <code>app_state.rs</code>, <code>policy.rs</code>,
 <code>provider_runtime.rs</code>, <code>codex_runtime.rs</code>,
 <code>ollama_runtime.rs</code>, <code>workspace_tools.rs</code>,
 <code>workspace_evidence.rs</code>, <code>data_lifecycle.rs</code>,
+<code>specialist_capabilities.rs</code>,
 <code>system_actions.rs</code>, <code>linux_paths.rs</code>,
 <code>linux_desktop.rs</code>, <code>voice_runtime.rs</code>,
 <code>desktop_control.rs</code>, and
@@ -137,8 +144,8 @@ provider startup.
 ### Persistence and migration
 
 The desktop database is <code>application-state.sqlite3</code> below Tauri's
-platform application-data directory. Migrations 0001 through 0009 establish
-schema version 9 plus a migration ledger. Repository writes replace one
+platform application-data directory. Migrations 0001 through 0010 establish
+schema version 10 plus a migration ledger. Repository writes replace one
 validated aggregate inside an immediate transaction and use a monotonically
 increasing revision to reject stale writers. Startup refuses corrupt or
 unsupported newer databases and retains the typed error for the renderer
@@ -224,6 +231,16 @@ Restart reconciliation changes a pre-crash <code>dispatched</code> action to
 <code>uncertain</code> and never repeats it. Portable backup v3 intentionally
 omits this local authority/evidence domain.
 
+Schema v10 adds bounded JSON-checked specialist requests to tasks and immutable
+specialist run contracts/results to attempts. Strict duplicate-free parsing,
+unknown/future-field rejection, canonical request hashing, task-template-kind
+matching, and generic-save preservation keep those records backend-owned.
+Untouched legacy seed profiles are narrowed to truthful defaults; customized
+profile rows are preserved. Older tasks without a typed request remain visible
+but cannot acquire core-specialist authority until the user creates a new typed
+task. Portable backup v3 carries portable task requests but excludes immutable
+run contracts/results with the rest of the run ledger.
+
 Monitoring reads the application, task-orchestration, run-coordinator,
 review-orchestration, and lifecycle revisions in one transaction. Task and
 activity page queries require that exact tuple, reject stale callers, and cap
@@ -256,7 +273,8 @@ closed canonical intent union. The backend—not the renderer—selects the curr
 agent/workspace, resolves exact XDG/KWin targets, derives risk and scopes,
 issues/consumes approval, writes audit transitions, and dispatches.
 Voice-created coding tasks use the existing routed-task transaction and global
-sequential queue. Raw transcripts are not sent to the gateway; dictated and
+sequential queue and now carry the same typed Coding request as renderer-created
+work. Raw transcripts are not sent to the gateway; dictated and
 coding content are represented in the action audit only by SHA-256 and length,
 while configured workspace paths are bound by SHA-256 without storing the raw
 path.
@@ -310,6 +328,8 @@ packaged acceptance.
    backend filters candidates by active state, workspace, capability, and exact
    provider/model readiness, applies deterministic scores, workload, and
    overflow policy, and persists candidate evidence plus the selected executor.
+   A core specialist request must match exactly one stable template and category;
+   generic or manually selected cross-specialist routing cannot bypass this gate.
 2. Execute tasks enter one durable global queue. The backend snapshot orders
    them by priority, enqueue sequence, owner ID, and task ID; held tasks retain
    their queue age, while a terminal task reset receives a new sequence.
@@ -330,6 +350,8 @@ packaged acceptance.
    Ollama, requires that adapter to equal the persisted active provider, and
    dispatches exactly that registry adapter. Unsupported, missing, ambiguous,
    inactive, or unavailable identities fail closed without fallback.
+   For core work it also hashes the typed request and persists an immutable
+   role/tool/provider/model/approval contract before dispatch.
 7. Codex dispatch revalidates its executable, streams the prompt on standard
    input, runs in an outer lifecycle-only Bubblewrap namespace plus an explicit
    inner Codex sandbox, parses bounded JSONL incrementally, and refuses a
@@ -344,6 +366,12 @@ packaged acceptance.
    state, terminal outcome, output summary, and usage. Terminal attempts cannot
    be updated. A successful execution starts or resumes one normalized review
    flow when review is required.
+   A successful specialist run additionally requires one strict kind-matched
+   structured result. Debugging, Browser Research, and Financial Analysis must
+   have zero observed scratch/workspace changes; Browser sources must be HTTPS
+   and domain-bounded; requested checks must be reported exactly; Financial
+   assumptions and calculation values must exactly match the request and
+   backend fixed-point results.
 10. The next stage is derived from the executor role and walks the exact active
     reporting chain sequentially: Senior, Team Leader, and Supervisor as
     applicable. Missing, repeated, inactive, or provider-unready identities
@@ -388,6 +416,9 @@ monitoring and data-lifecycle commands without moving authority into the UI.
 TASK-0015 connects Voice Control to the typed backend gateway and audit without
 moving agent selection, capability decisions, target resolution, or dispatch
 authority into the UI.
+TASK-0017 connects the Agents task composer and run ledger to typed specialist
+requests, visible effective ceilings, immutable run contracts, and validated
+structured results without making renderer fields an authorization boundary.
 
 The renderer may request actions and display decisions. It must not mint
 authorization, decide durable run truth, or become the sole owner of domain
@@ -401,6 +432,10 @@ state.
   recovery, retention, and migration evidence.
 - **Policy/authorization** — normalized capabilities, approval matching,
   expiry, one-use consumption, replay resistance, and denial reasons.
+- **Specialist contracts** — strict request/result schemas, exact stable-template
+  identity, immutable per-run tool ceilings, fixed-point calculations, and
+  cross-role/external-effect rejection. This boundary is implemented by
+  TASK-0017.
 - **Task orchestrator** — deterministic hard eligibility, scoring, workload and
   overflow decisions, durable global execute-queue ordering, and backend queue
   admission. This boundary is implemented by TASK-0010.
@@ -439,7 +474,7 @@ task must choose the smallest structure supported by the code at that time.
 | Data or decision | Current owner | Planned authoritative owner |
 | --- | --- | --- |
 | Agents and hierarchy | Validated backend registry with transactional CRUD, lifecycle, role-derived authority, and reporting constraints; renderer projects views | Backend agent registry |
-| Tasks and results | Backend SQLite aggregate plus authoritative task creation/rerouting/queue state and run-ledger-owned lifecycle/results | Backend domain store and run ledger |
+| Tasks and results | Backend SQLite aggregate plus authoritative task creation/rerouting/queue state, typed core-specialist requests, and run-ledger-owned lifecycle/contracts/results | Backend domain store and run ledger |
 | Approval records | Backend SQLite; backend-issued rows are authoritative and imported rows are expired history | Backend policy/approval store |
 | Approval match/consume | Backend exact-match transaction | Backend exact-match transaction |
 | Routing and review | Backend owns routing, execute-queue admission, exact reviewer selection, structured stage transitions, revisions, human fallback, and recovery; renderer projects state and requests commands | Backend scheduler/orchestrator |
@@ -504,10 +539,11 @@ accessible, responsive renderer; TASK-0014 establishes strict portable backup,
 bounded continuous retention, and truthful revision-bound monitoring.
 TASK-0015 establishes the unified system-action policy/audit gateway;
 TASK-0016 establishes deterministic offline voice plus non-live
-KDE/portal/XDG integration contracts. TASK-0020 retains their sequential live
-and packaged acceptance.
-TASK-0017 through TASK-0020 complete bounded roles,
-packaging, acceptance, and release.
+KDE/portal/XDG integration contracts. TASK-0017 establishes strict bounded
+Coding, Debugging, Browser Research, and Financial Analysis profiles.
+TASK-0020 retains their sequential live and packaged acceptance. TASK-0018
+through TASK-0020 complete management handoffs, packaging, acceptance, and
+release.
 
 Exact dependencies and gates are authoritative in
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).

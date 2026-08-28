@@ -1,4 +1,5 @@
 use crate::agent_registry::{normalize_legacy_agents, validate_agent_registry};
+use crate::specialist_capabilities::SpecialistTaskRequestV1;
 use crate::task_orchestration::{RoutingEvidence, ROUTING_ALGORITHM_VERSION};
 use crate::workspace_evidence::{
     WorkspaceChangeEvidenceV1, MAX_PERSISTED_WORKSPACE_EVIDENCE_BYTES,
@@ -6,7 +7,7 @@ use crate::workspace_evidence::{
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fmt};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 pub const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 pub const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -238,6 +239,8 @@ pub struct AgentTask {
     pub runtime_model: Option<String>,
     pub total_tokens: Option<i64>,
     pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub specialist_request: Option<SpecialistTaskRequestV1>,
     pub changed_files: Vec<String>,
     pub diff: Option<String>,
     #[serde(default)]
@@ -1153,6 +1156,11 @@ fn validate_task(path: &str, task: &AgentTask) -> Result<(), StateValidationErro
         task.routed_from_agent_id,
     )?;
     validate_optional_id(&format!("{path}.reviewAgentId"), task.review_agent_id)?;
+    if let Some(request) = &task.specialist_request {
+        request.validate().map_err(|error| {
+            StateValidationError::new(format!("{path}.specialistRequest"), error.message)
+        })?;
+    }
     if task.total_tokens.is_some_and(|value| value < 0) {
         return Err(StateValidationError::new(
             format!("{path}.totalTokens"),

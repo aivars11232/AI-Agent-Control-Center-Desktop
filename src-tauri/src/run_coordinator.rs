@@ -1,3 +1,4 @@
+use crate::specialist_capabilities::{SpecialistResultV1, SpecialistRunContractV1};
 use crate::workspace_evidence::WorkspaceChangeEvidenceV1;
 use serde::{Deserialize, Serialize};
 
@@ -183,6 +184,10 @@ pub struct RunAttemptProjection {
     pub model: Option<String>,
     pub workspace_id: Option<String>,
     pub approval_id: Option<i64>,
+    #[serde(default)]
+    pub specialist_contract: Option<SpecialistRunContractV1>,
+    #[serde(default)]
+    pub specialist_result: Option<SpecialistResultV1>,
     pub review_flow_id: Option<i64>,
     pub review_stage_attempt_id: Option<i64>,
     pub review_revision_round: Option<i64>,
@@ -242,6 +247,7 @@ pub struct RunCompletion {
     pub changed_files: Vec<String>,
     pub diff: Option<String>,
     pub workspace_changes: WorkspaceChangeEvidenceV1,
+    pub specialist_result: Option<SpecialistResultV1>,
     pub duration_seconds: u64,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
@@ -275,6 +281,7 @@ impl RunCompletion {
             workspace_changes: WorkspaceChangeEvidenceV1::legacy_unavailable(
                 "The run ended before bounded workspace evidence was attached.",
             ),
+            specialist_result: None,
             duration_seconds,
             error_code: Some(code.into()),
             error_message: Some(bounded.as_str().to_string()),

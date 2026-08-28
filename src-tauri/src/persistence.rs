@@ -21,7 +21,7 @@ use crate::data_lifecycle::{
     MAX_MAINTENANCE_EVIDENCE_ROWS, MAX_MAINTENANCE_ROWS_PER_DOMAIN, MONITORING_PAGE_LIMIT,
 };
 use crate::policy::{evaluate_policy, ActionIntent, PolicyDisposition, PolicyEvaluation};
-use crate::provider_runtime::ProviderRegistrySnapshot;
+use crate::provider_runtime::{resolve_model_identity, ProviderRegistrySnapshot};
 use crate::review_orchestration::{
     build_review_request, human_review_result, next_required_level, parse_review_result,
     required_levels_for_role, select_reviewer, HumanReviewDecisionRequest, ReviewActor,
@@ -35,6 +35,10 @@ use crate::run_coordinator::{
     RunEventProjection, RunTruncationEvidence, RunUsage, MAX_ERROR_BYTES, MAX_PROGRESS_BYTES,
     MAX_PROGRESS_EVENTS, MAX_PROGRESS_MESSAGE_BYTES, MAX_RECENT_ATTEMPTS, MAX_RETAINED_ATTEMPTS,
     MAX_RETAINED_PAYLOAD_BYTES, MAX_STDERR_CAPTURE_BYTES, MAX_SUMMARY_BYTES,
+};
+use crate::specialist_capabilities::{
+    canonical_specialist_result_json, parse_specialist_request_json, parse_specialist_result_json,
+    SpecialistKind, SpecialistRunContractV1,
 };
 use crate::system_actions::{
     validate_audit_write, AuditWrite, SystemActionAuditPage, SystemActionAuditRecord,
@@ -71,6 +75,8 @@ const WORKSPACE_EVIDENCE_MIGRATION: &str =
 const DATA_LIFECYCLE_MIGRATION: &str = include_str!("../migrations/0008_data_lifecycle.sql");
 const SYSTEM_ACTION_GATEWAY_MIGRATION: &str =
     include_str!("../migrations/0009_system_action_gateway.sql");
+const SPECIALIST_CAPABILITIES_MIGRATION: &str =
+    include_str!("../migrations/0010_specialist_capabilities.sql");
 const MAX_AUTHORIZATION_RECORDS: i64 = 10_000;
 
 #[derive(Debug, Clone)]
@@ -1112,6 +1118,7 @@ impl StateRepository {
             runtime_model: None,
             total_tokens: None,
             workspace_id: Some(request.workspace_id),
+            specialist_request: request.specialist_request,
             changed_files: Vec::new(),
             diff: None,
             workspace_changes: None,
@@ -1209,6 +1216,7 @@ impl StateRepository {
         task.category = request.category;
         task.priority = request.priority;
         task.workspace_id = Some(request.workspace_id);
+        task.specialist_request = request.specialist_request;
         task.routing_mode = request.routing_mode;
         let input = RoutingTaskInput {
             task_owner_agent_id: request.task_owner_agent_id,
@@ -1233,14 +1241,20 @@ impl StateRepository {
                     false,
                 )
             })?;
+        let specialist_request_json = task
+            .specialist_request
+            .as_ref()
+            .map(|request| request.canonical_json())
+            .transpose()
+            .map_err(|error| PersistenceError::new(error.code, error.message, false))?;
         transaction
             .execute(
                 "UPDATE agent_tasks
                  SET title = ?1, category = ?2, priority = ?3, workspace_id = ?4,
                      routing_mode = ?5, assigned_agent_id = ?6,
                      routed_from_agent_id = ?7, routing_reason = ?8,
-                     routing_evidence_json = ?9
-                 WHERE owner_agent_id = ?10 AND id = ?11",
+                     routing_evidence_json = ?9, specialist_request_json = ?10
+                 WHERE owner_agent_id = ?11 AND id = ?12",
                 params![
                     task.title,
                     task.category,
@@ -1251,6 +1265,7 @@ impl StateRepository {
                     task.routed_from_agent_id,
                     task.routing_reason,
                     routing_evidence_json,
+                    specialist_request_json,
                     request.task_owner_agent_id,
                     request.task_id
                 ],
@@ -1535,33 +1550,6 @@ impl StateRepository {
 
         let state = read_application_state(&transaction)?;
         let prior_reviewer_ids = read_prior_reviewer_ids(&transaction, flow.id, level)?;
-        let reviewer = match select_reviewer(
-            &state,
-            providers,
-            flow.executor_agent_id,
-            level,
-            &prior_reviewer_ids,
-        ) {
-            Ok(reviewer) => reviewer.clone(),
-            Err(error) => {
-                mark_review_awaiting_human(
-                    &transaction,
-                    &flow,
-                    &error.code,
-                    &error.message,
-                    timestamp,
-                )?;
-                let snapshot = read_review_orchestration_snapshot(&transaction)?;
-                transaction.commit().map_err(PersistenceError::database)?;
-                return Ok(ReviewStageStart {
-                    snapshot,
-                    stage: None,
-                    context: None,
-                    blocked_code: Some(error.code),
-                    blocked_message: Some(error.message),
-                });
-            }
-        };
         let owner = state
             .agents
             .iter()
@@ -1584,6 +1572,40 @@ impl StateRepository {
                     true,
                 )
             })?;
+        let required_template_key = (level == ReviewLevel::Senior
+            && task
+                .specialist_request
+                .as_ref()
+                .is_some_and(|specialist| specialist.kind() == SpecialistKind::Coding))
+        .then_some("debugging");
+        let reviewer = match select_reviewer(
+            &state,
+            providers,
+            flow.executor_agent_id,
+            level,
+            &prior_reviewer_ids,
+            required_template_key,
+        ) {
+            Ok(reviewer) => reviewer.clone(),
+            Err(error) => {
+                mark_review_awaiting_human(
+                    &transaction,
+                    &flow,
+                    &error.code,
+                    &error.message,
+                    timestamp,
+                )?;
+                let snapshot = read_review_orchestration_snapshot(&transaction)?;
+                transaction.commit().map_err(PersistenceError::database)?;
+                return Ok(ReviewStageStart {
+                    snapshot,
+                    stage: None,
+                    context: None,
+                    blocked_code: Some(error.code),
+                    blocked_message: Some(error.message),
+                });
+            }
+        };
         let executor = state
             .agents
             .iter()
@@ -3329,6 +3351,48 @@ impl StateRepository {
                     true,
                 )
             })?;
+        let specialist_contract_json = if run_mode == RunAttemptMode::Execute {
+            task.specialist_request
+                .as_ref()
+                .map(|request| {
+                    let agent = state
+                        .agents
+                        .iter()
+                        .find(|agent| agent.id == agent_id)
+                        .ok_or_else(|| {
+                            PersistenceError::new(
+                                "AGENT_NOT_FOUND",
+                                "The selected agent no longer exists.",
+                                true,
+                            )
+                        })?;
+                    let model = resolve_model_identity(
+                        &state.models,
+                        &agent.model,
+                        &state.preferences.active_ai_provider,
+                    )
+                    .map_err(|error| {
+                        PersistenceError::new(error.code.as_str(), error.message, false)
+                    })?;
+                    let contract = SpecialistRunContractV1::for_request(
+                        request,
+                        model.provider_id.to_string(),
+                        model.runtime_model,
+                        approval_id,
+                    )
+                    .map_err(|error| PersistenceError::new(error.code, error.message, false))?;
+                    serde_json::to_string(&contract).map_err(|_| {
+                        PersistenceError::new(
+                            "SPECIALIST_CONTRACT_INVALID",
+                            "The specialist run contract could not be normalized.",
+                            false,
+                        )
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
         transaction
             .execute(
                 "INSERT INTO run_attempts
@@ -3336,9 +3400,10 @@ impl StateRepository {
                  workspace_fingerprint, agent_id, task_owner_agent_id, task_id, task_title,
                   run_mode, review_flow_id, review_stage_attempt_id, review_revision_round,
                   status, workspace_id, approval_id, task_status_before,
-                  task_phase_before, review_status_before, admitted_at_unix_ms)
+                  task_phase_before, review_status_before, admitted_at_unix_ms,
+                  specialist_contract_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                         ?13, 'admitted', ?14, ?15, ?16, ?17, ?18, ?19)",
+                         ?13, 'admitted', ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                 params![
                     request_id,
                     intent_json,
@@ -3362,7 +3427,8 @@ impl StateRepository {
                     task.status,
                     task.phase,
                     task.review_status,
-                    timestamp
+                    timestamp,
+                    specialist_contract_json
                 ],
             )
             .map_err(PersistenceError::database)?;
@@ -3799,6 +3865,41 @@ impl StateRepository {
                 false,
             ));
         }
+        let specialist_result_json = if terminal_status != RunAttemptStatus::Succeeded {
+            None
+        } else {
+            match (
+                current.specialist_contract.as_ref(),
+                completion.specialist_result.as_ref(),
+            ) {
+                (Some(contract), Some(result)) if contract.kind == result.kind() => Some(
+                    canonical_specialist_result_json(result)
+                        .map_err(|error| PersistenceError::new(error.code, error.message, false))?,
+                ),
+                (Some(_), Some(_)) => {
+                    return Err(PersistenceError::new(
+                        "SPECIALIST_RESULT_MISMATCH",
+                        "The specialist result kind does not match its immutable run contract.",
+                        false,
+                    ))
+                }
+                (Some(_), None) => {
+                    return Err(PersistenceError::new(
+                        "SPECIALIST_RESULT_REQUIRED",
+                        "A successful specialist run requires a validated structured result.",
+                        false,
+                    ))
+                }
+                (None, Some(_)) => {
+                    return Err(PersistenceError::new(
+                        "SPECIALIST_RESULT_UNBOUND",
+                        "A specialist result cannot be stored without an immutable run contract.",
+                        false,
+                    ))
+                }
+                (None, None) => None,
+            }
+        };
         let mut truncation = completion.truncation.clone();
         if let Some(summary) = &summary {
             truncation.summary_truncated |= summary.truncated();
@@ -3850,6 +3951,7 @@ impl StateRepository {
                 diff.as_deref(),
                 completion.error_code.as_deref(),
                 error_text,
+                specialist_result_json.as_deref(),
             ],
             &changed_files_json,
             &workspace_evidence_json,
@@ -3878,8 +3980,8 @@ impl StateRepository {
                      original_summary_bytes = ?26, original_diff_bytes = ?27,
                      original_changed_file_count = ?28,
                      omitted_progress_event_count = ?29, recovery_disposition = ?30,
-                     workspace_evidence_json = ?31
-                 WHERE id = ?32 AND status = ?33",
+                     workspace_evidence_json = ?31, specialist_result_json = ?32
+                 WHERE id = ?33 AND status = ?34",
                 params![
                     terminal_status.as_str(),
                     timestamp,
@@ -3912,6 +4014,7 @@ impl StateRepository {
                     bounded_i64(truncation.omitted_progress_event_count),
                     recovery_disposition,
                     &workspace_evidence_json,
+                    specialist_result_json,
                     attempt_id,
                     current.status.as_str()
                 ],
@@ -4090,6 +4193,11 @@ impl StateRepository {
                     9,
                     "system_action_policy_gateway",
                     SYSTEM_ACTION_GATEWAY_MIGRATION,
+                )?,
+                9 => self.apply_migration(
+                    10,
+                    "bounded_specialist_capabilities",
+                    SPECIALIST_CAPABILITIES_MIGRATION,
                 )?,
                 version => {
                     return Err(PersistenceError::new(
@@ -5202,6 +5310,8 @@ struct StoredRunAttempt {
     original_changed_file_count: i64,
     omitted_progress_event_count: i64,
     workspace_evidence_json: Option<String>,
+    specialist_contract_json: Option<String>,
+    specialist_result_json: Option<String>,
 }
 
 fn map_stored_run_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRunAttempt> {
@@ -5253,6 +5363,8 @@ fn map_stored_run_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRun
         original_changed_file_count: row.get(44)?,
         omitted_progress_event_count: row.get(45)?,
         workspace_evidence_json: row.get(46)?,
+        specialist_contract_json: row.get(47)?,
+        specialist_result_json: row.get(48)?,
     })
 }
 
@@ -5268,7 +5380,8 @@ const RUN_ATTEMPT_PROJECTION_QUERY: &str =
             changed_files_truncated, progress_truncated, before_snapshot_truncated,
             after_snapshot_truncated, original_stdout_bytes, original_stderr_bytes,
             original_summary_bytes, original_diff_bytes, original_changed_file_count,
-            omitted_progress_event_count, workspace_evidence_json
+            omitted_progress_event_count, workspace_evidence_json,
+            specialist_contract_json, specialist_result_json
      FROM run_attempts WHERE id = ?1";
 
 fn read_run_attempt(
@@ -5331,6 +5444,43 @@ fn read_run_attempt(
             "This run predates structured workspace evidence persistence.",
         ),
     };
+    let specialist_contract = stored
+        .specialist_contract_json
+        .as_deref()
+        .map(|json| {
+            let contract = serde_json::from_str::<SpecialistRunContractV1>(json).map_err(|_| {
+                PersistenceError::new(
+                    "RUN_LEDGER_INVALID",
+                    "Stored specialist contract is invalid.",
+                    false,
+                )
+            })?;
+            contract.validate().map_err(|error| {
+                PersistenceError::new("RUN_LEDGER_INVALID", error.message, false)
+            })?;
+            Ok(contract)
+        })
+        .transpose()?;
+    let specialist_result = stored
+        .specialist_result_json
+        .as_deref()
+        .map(|json| {
+            parse_specialist_result_json(json)
+                .map_err(|error| PersistenceError::new("RUN_LEDGER_INVALID", error.message, false))
+        })
+        .transpose()?;
+    if specialist_result
+        .as_ref()
+        .zip(specialist_contract.as_ref())
+        .is_some_and(|(result, contract)| result.kind() != contract.kind)
+        || (specialist_result.is_some() && specialist_contract.is_none())
+    {
+        return Err(PersistenceError::new(
+            "RUN_LEDGER_INVALID",
+            "Stored specialist result does not match its immutable run contract.",
+            false,
+        ));
+    }
     Ok(RunAttemptProjection {
         id: stored.id,
         request_id: stored.request_id,
@@ -5344,6 +5494,8 @@ fn read_run_attempt(
         model: stored.model,
         workspace_id: stored.workspace_id,
         approval_id: stored.approval_id,
+        specialist_contract,
+        specialist_result,
         review_flow_id: stored.review_flow_id,
         review_stage_attempt_id: stored.review_stage_attempt_id,
         review_revision_round: stored.review_revision_round,
@@ -6568,7 +6720,7 @@ fn project_recovered_attempt_to_task(
 }
 
 fn run_payload_bytes(
-    text_parts: [Option<&str>; 6],
+    text_parts: [Option<&str>; 7],
     changed_files_json: &str,
     workspace_evidence_json: &str,
 ) -> PersistenceResult<i64> {
@@ -7601,6 +7753,7 @@ fn task_run_inputs_changed(current: &AgentTask, requested: &AgentTask) -> bool {
         || current.assigned_agent_id != requested.assigned_agent_id
         || current.created_at != requested.created_at
         || current.workspace_id != requested.workspace_id
+        || current.specialist_request != requested.specialist_request
         || current.routing_mode != requested.routing_mode
         || current.routed_from_agent_id != requested.routed_from_agent_id
         || current.routing_reason != requested.routing_reason
@@ -7613,6 +7766,7 @@ fn task_orchestration_inputs_changed(current: &AgentTask, requested: &AgentTask)
         || current.assigned_agent_id != requested.assigned_agent_id
         || current.created_at != requested.created_at
         || current.workspace_id != requested.workspace_id
+        || current.specialist_request != requested.specialist_request
         || current.routing_mode != requested.routing_mode
         || current.routed_from_agent_id != requested.routed_from_agent_id
         || current.routing_reason != requested.routing_reason
@@ -9247,6 +9401,12 @@ fn write_task(
                 false,
             )
         })?;
+    let specialist_request_json = task
+        .specialist_request
+        .as_ref()
+        .map(|request| request.canonical_json())
+        .transpose()
+        .map_err(|error| PersistenceError::new(error.code, error.message, false))?;
     transaction
         .execute(
             "INSERT INTO agent_tasks
@@ -9256,13 +9416,13 @@ fn write_task(
               routed_from_agent_id, routing_reason, review_agent_id, review_status,
               review_result, review_model, review_duration_seconds, reviewed_at,
               queue_state, enqueue_sequence, routing_evidence_json, workspace_evidence_json,
-              created_at_unix_ms, completed_at_unix_ms)
+              specialist_request_json, created_at_unix_ms, completed_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                      ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                     ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-                     COALESCE(?32, CAST(strftime('%s', ?10) AS INTEGER) * 1000, ?34),
+                     ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
+                     COALESCE(?33, CAST(strftime('%s', ?10) AS INTEGER) * 1000, ?35),
                      CASE WHEN ?11 IS NULL THEN NULL
-                          ELSE COALESCE(?33, CAST(strftime('%s', ?11) AS INTEGER) * 1000, ?34)
+                          ELSE COALESCE(?34, CAST(strftime('%s', ?11) AS INTEGER) * 1000, ?35)
                      END)",
             params![
                 owner_agent_id,
@@ -9296,6 +9456,7 @@ fn write_task(
                 task.enqueue_sequence,
                 routing_evidence_json,
                 workspace_evidence_json,
+                specialist_request_json,
                 existing_timestamps.0,
                 existing_timestamps.1,
                 lifecycle_timestamp
@@ -9545,7 +9706,7 @@ fn read_tasks(connection: &Connection, owner_agent_id: i64) -> PersistenceResult
                     workspace_id, diff, duration_seconds, routing_mode, routed_from_agent_id,
                     routing_reason, review_agent_id, review_status, review_result, review_model,
                     review_duration_seconds, reviewed_at, queue_state, enqueue_sequence,
-                    routing_evidence_json, workspace_evidence_json
+                    routing_evidence_json, workspace_evidence_json, specialist_request_json
              FROM agent_tasks WHERE owner_agent_id = ?1 ORDER BY position",
         )
         .map_err(PersistenceError::database)?;
@@ -9582,6 +9743,18 @@ fn read_tasks(connection: &Connection, owner_agent_id: i64) -> PersistenceResult
                         )
                     }),
             );
+            let specialist_request_json: Option<String> = row.get(29)?;
+            let specialist_request = specialist_request_json
+                .map(|json| {
+                    parse_specialist_request_json(&json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            29,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .transpose()?;
             Ok(AgentTask {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -9597,6 +9770,7 @@ fn read_tasks(connection: &Connection, owner_agent_id: i64) -> PersistenceResult
                 runtime_model: row.get(11)?,
                 total_tokens: row.get(12)?,
                 workspace_id: row.get(13)?,
+                specialist_request,
                 changed_files: Vec::new(),
                 diff: row.get(14)?,
                 workspace_changes,
@@ -9937,6 +10111,10 @@ mod tests {
         ReviewCheckKind, ReviewCheckResultV1, ReviewCheckStatus, ReviewRequestV1,
         REQUIRED_REVIEW_CHECKS,
     };
+    use crate::specialist_capabilities::{
+        CodingRequestV1, CodingResultV1, SpecialistResultV1, SpecialistTaskRequestV1,
+        WorkspaceMutationClass, SPECIALIST_PROFILE_VERSION, SPECIALIST_SCHEMA_VERSION,
+    };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -10041,7 +10219,21 @@ mod tests {
             routing_mode: "automatic".to_string(),
             preferred_agent_id: Some(2),
             selected_agent_id: None,
+            specialist_request: Some(coding_request(title)),
         }
+    }
+
+    fn coding_request(objective: &str) -> SpecialistTaskRequestV1 {
+        SpecialistTaskRequestV1::Coding(CodingRequestV1 {
+            schema_version: SPECIALIST_SCHEMA_VERSION,
+            profile_version: SPECIALIST_PROFILE_VERSION.to_string(),
+            objective: objective.to_string(),
+            acceptance_criteria: vec!["The requested bounded change is verified.".to_string()],
+            constraints: vec!["Preserve unrelated workspace state.".to_string()],
+            mutation_classes: vec![WorkspaceMutationClass::Modify],
+            requested_checks: vec![],
+            allow_web_research: false,
+        })
     }
 
     fn task_by_title<'a>(state: &'a ApplicationState, title: &str) -> &'a AgentTask {
@@ -10049,6 +10241,15 @@ mod tests {
             .agents
             .iter()
             .flat_map(|agent| &agent.tasks)
+            .find(|task| task.title == title)
+            .expect("task should exist")
+    }
+
+    fn task_by_title_mut<'a>(state: &'a mut ApplicationState, title: &str) -> &'a mut AgentTask {
+        state
+            .agents
+            .iter_mut()
+            .flat_map(|agent| &mut agent.tasks)
             .find(|task| task.title == title)
             .expect("task should exist")
     }
@@ -10083,10 +10284,10 @@ mod tests {
     }
 
     #[test]
-    fn task_0015_schema_nine_has_private_bounded_system_action_audit() {
+    fn task_0015_private_bounded_system_action_audit_survives_later_schema() {
         let mut repository = StateRepository::open_in_memory().unwrap();
         repository.initialize_fresh().unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 9);
+        assert_eq!(repository.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         let table_sql: String = repository
             .connection
             .query_row(
@@ -10196,7 +10397,8 @@ mod tests {
                     (6, "structured_review_orchestration".to_string()),
                     (7, "structured_workspace_evidence".to_string()),
                     (8, "data_lifecycle_and_monitoring".to_string()),
-                    (9, "system_action_policy_gateway".to_string())
+                    (9, "system_action_policy_gateway".to_string()),
+                    (10, "bounded_specialist_capabilities".to_string())
                 ]
             );
             let journal_mode: String = repository
@@ -10223,6 +10425,188 @@ mod tests {
         let reopened = repository.load().unwrap().expect("state should exist");
         assert_eq!(reopened.revision, 1);
         assert_eq!(reopened.state, expected);
+    }
+
+    #[test]
+    fn task_0017_schema_ten_persists_strict_requests_and_protects_renderer_mutation() {
+        let (mut repository, envelope) = task_0010_repository();
+        let request = SpecialistTaskRequestV1::Coding(CodingRequestV1 {
+            schema_version: SPECIALIST_SCHEMA_VERSION,
+            profile_version: SPECIALIST_PROFILE_VERSION.to_string(),
+            objective: "Implement a strict persisted request".to_string(),
+            acceptance_criteria: vec!["The canonical request survives restart".to_string()],
+            constraints: vec![],
+            mutation_classes: vec![WorkspaceMutationClass::Modify],
+            requested_checks: vec![],
+            allow_web_research: false,
+        });
+        let mut create = task_0010_create_request(envelope.revision, "Specialist task", "Normal");
+        create.specialist_request = Some(request.clone());
+        let created = repository
+            .create_routed_task(create, &task_0010_provider_snapshot())
+            .unwrap();
+        let task = task_by_title(&created.state, "Specialist task");
+        assert_eq!(task.specialist_request.as_ref(), Some(&request));
+
+        let stored: String = repository
+            .connection
+            .query_row(
+                "SELECT specialist_request_json FROM agent_tasks WHERE id = ?1",
+                [task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, request.canonical_json().unwrap());
+        for (table, column) in [
+            ("run_attempts", "specialist_contract_json"),
+            ("run_attempts", "specialist_result_json"),
+        ] {
+            let count: i64 = repository
+                .connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                    [column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+
+        let mut forged = created.state.clone();
+        task_by_title_mut(&mut forged, "Specialist task").specialist_request = None;
+        assert_eq!(
+            repository
+                .save(created.revision, &forged, true)
+                .unwrap_err()
+                .code,
+            "TASK_ORCHESTRATION_AUTHORITY_REQUIRED"
+        );
+        assert_eq!(
+            task_by_title(
+                &repository.load().unwrap().unwrap().state,
+                "Specialist task"
+            )
+            .specialist_request
+            .as_ref(),
+            Some(&request)
+        );
+
+        let task_id = task.id;
+        let intent = ActionIntent::RunTask {
+            agent_id: task.assigned_agent_id,
+            task_owner_agent_id: 1,
+            task_id,
+            run_mode: RunMode::Execute,
+            review_context: None,
+        };
+        let approval = repository
+            .request_authorization(&intent)
+            .unwrap()
+            .approval
+            .unwrap();
+        repository
+            .resolve_approval(approval.id, ApprovalResolution::Approve, true)
+            .unwrap();
+        let admitted = repository
+            .admit_run("task-0017-contract-ledger", &intent)
+            .unwrap();
+        let contract = admitted
+            .attempt
+            .specialist_contract
+            .as_ref()
+            .expect("specialist contract should be immutable at admission");
+        assert_eq!(contract.approval_id, Some(approval.id));
+        assert_eq!(contract.request_sha256, request.fingerprint().unwrap());
+        repository
+            .prepare_run_attempt(
+                admitted.attempt.id,
+                &contract.provider,
+                &contract.model,
+                admitted.attempt.workspace_id.as_deref(),
+            )
+            .unwrap();
+        repository
+            .mark_run_dispatching(admitted.attempt.id)
+            .unwrap();
+        repository.mark_run_started(admitted.attempt.id).unwrap();
+        let specialist_result = SpecialistResultV1::Coding(CodingResultV1 {
+            summary: "The bounded change was completed.".to_string(),
+            changes: vec![],
+            verification: vec![],
+            evidence_refs: vec![],
+            limitations: vec![],
+        });
+        let mut completion =
+            successful_completion(&serde_json::to_string(&specialist_result).unwrap());
+        completion.specialist_result = Some(specialist_result.clone());
+        let completed = repository
+            .complete_run(admitted.attempt.id, &completion)
+            .unwrap();
+        assert_eq!(completed.specialist_result, Some(specialist_result));
+        assert_eq!(
+            repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM run_attempts WHERE id = ?1 AND specialist_contract_json IS NOT NULL AND specialist_result_json IS NOT NULL",
+                    [admitted.attempt.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn task_0017_reroute_persists_the_exact_revalidated_specialist_request() {
+        let (mut repository, envelope) = task_0010_repository();
+        let providers = task_0010_provider_snapshot();
+        let created = repository
+            .create_routed_task(
+                task_0010_create_request(
+                    envelope.revision,
+                    "Original specialist request",
+                    "Normal",
+                ),
+                &providers,
+            )
+            .unwrap();
+        let original = task_by_title(&created.state, "Original specialist request").clone();
+        let updated_request = coding_request("Updated specialist request");
+
+        let rerouted = repository
+            .reroute_task(
+                RerouteTaskRequest {
+                    expected_revision: created.revision,
+                    task_owner_agent_id: 1,
+                    task_id: original.id,
+                    title: "Updated specialist request".to_string(),
+                    category: original.category,
+                    priority: original.priority,
+                    workspace_id: original.workspace_id.unwrap(),
+                    routing_mode: "automatic".to_string(),
+                    preferred_agent_id: Some(2),
+                    selected_agent_id: None,
+                    specialist_request: Some(updated_request.clone()),
+                },
+                &providers,
+            )
+            .unwrap();
+
+        assert_eq!(
+            task_by_title(&rerouted.state, "Updated specialist request")
+                .specialist_request
+                .as_ref(),
+            Some(&updated_request)
+        );
+        let stored: String = repository
+            .connection
+            .query_row(
+                "SELECT specialist_request_json FROM agent_tasks WHERE id = ?1",
+                [original.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, updated_request.canonical_json().unwrap());
     }
 
     #[test]
@@ -10284,6 +10668,12 @@ mod tests {
                 [],
             )
             .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE agent_tasks ADD COLUMN specialist_request_json TEXT",
+                [],
+            )
+            .unwrap();
         for statement in [
             "ALTER TABLE agent_tasks ADD COLUMN created_at_unix_ms INTEGER",
             "ALTER TABLE agent_tasks ADD COLUMN completed_at_unix_ms INTEGER",
@@ -10315,6 +10705,12 @@ mod tests {
         connection
             .execute(
                 "ALTER TABLE agent_tasks DROP COLUMN workspace_evidence_json",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "ALTER TABLE agent_tasks DROP COLUMN specialist_request_json",
                 [],
             )
             .unwrap();
@@ -10493,6 +10889,7 @@ mod tests {
         assert_eq!(snapshot.execute_queue[0].task_id, normal_task.id);
         assert_eq!(snapshot.held_tasks[0].task_id, critical_task.id);
 
+        approve_authorization(&mut repository, &normal_intent);
         let admitted = repository
             .admit_run("task-0010-head", &normal_intent)
             .unwrap();
@@ -10534,6 +10931,7 @@ mod tests {
             run_mode: RunMode::Execute,
             review_context: None,
         };
+        approve_authorization(&mut repository, &head_intent);
         let admitted = repository
             .admit_run("task-0010-head-failure", &head_intent)
             .unwrap();
@@ -10631,6 +11029,7 @@ mod tests {
             held_after_uncertain_dispatch.held_tasks[0].enqueue_sequence,
             head_task.enqueue_sequence.unwrap()
         );
+        approve_authorization(&mut repository, &later_intent);
         assert!(repository
             .admit_run("task-0010-next-after-hold", &later_intent)
             .is_ok());
@@ -10758,6 +11157,7 @@ mod tests {
                     routing_mode: "selected".to_string(),
                     preferred_agent_id: Some(2),
                     selected_agent_id: Some(2),
+                    specialist_request: original.specialist_request.clone(),
                 },
                 &providers,
             )
@@ -10776,6 +11176,7 @@ mod tests {
             run_mode: RunMode::Execute,
             review_context: None,
         };
+        approve_authorization(&mut repository, &intent);
         let attempt = repository.admit_run("task-0010-reset", &intent).unwrap();
         repository
             .prepare_run_attempt(attempt.attempt.id, "Ollama", "qwen2.5-coder:7b", None)
@@ -11499,6 +11900,7 @@ mod tests {
             runtime_model: None,
             total_tokens: None,
             workspace_id: None,
+            specialist_request: None,
             changed_files: Vec::new(),
             diff: None,
             workspace_changes: None,
@@ -11895,6 +12297,7 @@ mod tests {
             runtime_model: None,
             total_tokens: None,
             workspace_id: Some("workspace-authorization".to_string()),
+            specialist_request: Some(coding_request("Run cargo test and edit the parser")),
             changed_files: Vec::new(),
             diff: None,
             workspace_changes: None,
@@ -11992,6 +12395,13 @@ mod tests {
             workspace_changes: WorkspaceChangeEvidenceV1::complete_without_changes(
                 crate::workspace_evidence::WorkspaceEvidenceMode::Filesystem,
             ),
+            specialist_result: Some(SpecialistResultV1::Coding(CodingResultV1 {
+                summary: "The bounded fixture change completed.".to_string(),
+                changes: vec![],
+                verification: vec![],
+                evidence_refs: vec![],
+                limitations: vec![],
+            })),
             duration_seconds: 3,
             error_code: None,
             error_message: None,
@@ -12085,6 +12495,7 @@ mod tests {
                     routing_mode: "selected".to_string(),
                     preferred_agent_id: Some(2),
                     selected_agent_id: Some(2),
+                    specialist_request: Some(coding_request("Implement parser boundary")),
                 },
                 &task_0010_provider_snapshot(),
             )
@@ -12105,10 +12516,7 @@ mod tests {
             run_mode: RunMode::Execute,
             review_context: None,
         };
-        assert_eq!(
-            repository.request_authorization(&intent).unwrap().decision,
-            crate::authorization::AuthorizationDecision::Allowed
-        );
+        approve_authorization(repository, &intent);
         let admitted = repository.admit_run(request_id, &intent).unwrap();
         repository
             .prepare_run_attempt(
@@ -12219,6 +12627,7 @@ mod tests {
         let completion = RunCompletion {
             changed_files: Vec::new(),
             diff: None,
+            specialist_result: None,
             ..successful_completion(&output)
         };
         let completed = repository
@@ -12346,6 +12755,7 @@ mod tests {
                     &RunCompletion {
                         changed_files: Vec::new(),
                         diff: None,
+                        specialist_result: None,
                         ..successful_completion("VERDICT: APPROVED")
                     },
                 )
@@ -13306,6 +13716,9 @@ mod tests {
                     routing_mode: "selected".to_string(),
                     preferred_agent_id: Some(2),
                     selected_agent_id: Some(2),
+                    specialist_request: Some(coding_request(
+                        &changed_task.agents[1].tasks[0].title,
+                    )),
                 },
                 &task_0010_provider_snapshot(),
             )
@@ -13326,7 +13739,7 @@ mod tests {
             .unwrap();
         let envelope = repository.load().unwrap().unwrap();
         let mut changed_policy = envelope.state;
-        changed_policy.agents[1].capabilities.clipboard = "read".to_string();
+        changed_policy.agents[1].capabilities.internet = "none".to_string();
         repository
             .save(envelope.revision, &changed_policy, false)
             .unwrap();

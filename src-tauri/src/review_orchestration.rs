@@ -424,6 +424,7 @@ pub fn select_reviewer<'a>(
     executor_agent_id: i64,
     level: ReviewLevel,
     prior_reviewer_ids: &HashSet<i64>,
+    required_template_key: Option<&str>,
 ) -> Result<&'a Agent, ReviewEligibilityFailure> {
     let executor = state
         .agents
@@ -456,6 +457,14 @@ pub fn select_reviewer<'a>(
                 )
             })?;
         if candidate.role == expected_role {
+            if required_template_key
+                .is_some_and(|template_key| candidate.template_key.as_deref() != Some(template_key))
+            {
+                return Err(ReviewEligibilityFailure::new(
+                    "REVIEW_SPECIALIST_TEMPLATE_REQUIRED",
+                    "The review stage requires its exact stable specialist reviewer template.",
+                ));
+            }
             validate_reviewer_candidate(state, providers, executor, candidate, prior_reviewer_ids)?;
             return Ok(candidate);
         }
@@ -978,6 +987,8 @@ mod tests {
             model: Some("gpt-5.6-terra".to_string()),
             workspace_id: Some("workspace-1".to_string()),
             approval_id: None,
+            specialist_contract: None,
+            specialist_result: None,
             review_flow_id: None,
             review_stage_attempt_id: None,
             review_revision_round: None,
@@ -1029,6 +1040,7 @@ mod tests {
             runtime_model: None,
             total_tokens: None,
             workspace_id: Some("workspace-1".to_string()),
+            specialist_request: None,
             changed_files: Vec::new(),
             diff: None,
             workspace_changes: None,
@@ -1227,19 +1239,19 @@ mod tests {
         let providers = providers();
         let prior = HashSet::new();
         assert_eq!(
-            select_reviewer(&state, &providers, 2, ReviewLevel::Senior, &prior)
+            select_reviewer(&state, &providers, 2, ReviewLevel::Senior, &prior, None)
                 .unwrap()
                 .id,
             3
         );
         assert_eq!(
-            select_reviewer(&state, &providers, 2, ReviewLevel::TeamLeader, &prior)
+            select_reviewer(&state, &providers, 2, ReviewLevel::TeamLeader, &prior, None)
                 .unwrap()
                 .id,
             6
         );
         assert_eq!(
-            select_reviewer(&state, &providers, 2, ReviewLevel::Supervisor, &prior)
+            select_reviewer(&state, &providers, 2, ReviewLevel::Supervisor, &prior, None)
                 .unwrap()
                 .id,
             1
@@ -1248,17 +1260,53 @@ mod tests {
         let mut paused = state.clone();
         paused.agents[2].status = "Paused".to_string();
         assert_eq!(
-            select_reviewer(&paused, &providers, 2, ReviewLevel::Senior, &prior)
+            select_reviewer(&paused, &providers, 2, ReviewLevel::Senior, &prior, None)
                 .unwrap_err()
                 .code,
             "REVIEWER_INACTIVE"
         );
         let prior = HashSet::from([3]);
         assert_eq!(
-            select_reviewer(&state, &providers, 2, ReviewLevel::Senior, &prior)
+            select_reviewer(&state, &providers, 2, ReviewLevel::Senior, &prior, None)
                 .unwrap_err()
                 .code,
             "REVIEWER_NOT_DISTINCT"
+        );
+    }
+
+    #[test]
+    fn task_0017_coding_senior_review_requires_stable_debugging_template() {
+        let state = default_application_state().unwrap();
+        let providers = providers();
+        let prior = HashSet::new();
+        assert_eq!(
+            select_reviewer(
+                &state,
+                &providers,
+                2,
+                ReviewLevel::Senior,
+                &prior,
+                Some("debugging")
+            )
+            .unwrap()
+            .id,
+            3
+        );
+
+        let mut forged = state;
+        forged.agents[2].template_key = None;
+        assert_eq!(
+            select_reviewer(
+                &forged,
+                &providers,
+                2,
+                ReviewLevel::Senior,
+                &prior,
+                Some("debugging")
+            )
+            .unwrap_err()
+            .code,
+            "REVIEW_SPECIALIST_TEMPLATE_REQUIRED"
         );
     }
 

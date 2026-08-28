@@ -22,6 +22,15 @@ import { KeyboardAction } from "../../components/KeyboardAction";
 import { errorMessage } from "../../domain/errors";
 import type { TaskOrchestrationMutation } from "../contracts";
 import { markApprovalConsumed, prepareBackendAuthorization, type AuthorizationReadiness } from "../../services/authorization";
+import {
+  buildSpecialistTaskRequest,
+  createSpecialistTaskDraft,
+  specialistProfileForTemplate,
+  type SpecialistProfile,
+  type SpecialistResult,
+  type SpecialistTaskDraft,
+  type WorkspaceMutationClass,
+} from "../../specialistCapabilities";
 
 type WorkspaceTab = "Overview" | "Capabilities" | "Memory" | "Tasks" | "Activity";
 
@@ -36,6 +45,255 @@ const workspaceTabs = [
   { value: "Tasks", label: "Tasks" },
   { value: "Activity", label: "Activity" },
 ] as const satisfies ReadonlyArray<{ value: WorkspaceTab; label: string }>;
+
+function SpecialistComposerFields({
+  profile,
+  draft,
+  onChange,
+}: {
+  profile: SpecialistProfile;
+  draft: SpecialistTaskDraft;
+  onChange: (update: Partial<SpecialistTaskDraft>) => void;
+}) {
+  function toggleMutation(mutation: WorkspaceMutationClass) {
+    onChange({
+      mutationClasses: draft.mutationClasses.includes(mutation)
+        ? draft.mutationClasses.filter((item) => item !== mutation)
+        : [...draft.mutationClasses, mutation],
+    });
+  }
+
+  return (
+    <>
+      <div className="specialist-profile" role="status">
+        <strong>{profile.label} contract</strong>
+        <span>{profile.summary}</span>
+        <ul>
+          {profile.ceilings.map((ceiling) => (
+            <li key={ceiling}>{ceiling}</li>
+          ))}
+        </ul>
+      </div>
+
+      {profile.templateKey === "coding" && (
+        <div className="specialist-fields">
+          <label className="form-field">
+            <span>Acceptance criteria · one per line</span>
+            <textarea
+              rows={3}
+              value={draft.acceptanceCriteria}
+              onChange={(event) => onChange({ acceptanceCriteria: event.target.value })}
+              placeholder="The focused check passes\nUnrelated behavior remains unchanged"
+            />
+          </label>
+          <label className="form-field">
+            <span>Constraints · one per line</span>
+            <textarea
+              rows={3}
+              value={draft.constraints}
+              onChange={(event) => onChange({ constraints: event.target.value })}
+              placeholder="Preserve the public API"
+            />
+          </label>
+          <fieldset className="specialist-mutations">
+            <legend>Allowed workspace mutations</legend>
+            {(["create", "modify", "delete", "rename"] as const).map((mutation) => (
+              <label key={mutation}>
+                <input
+                  type="checkbox"
+                  checked={draft.mutationClasses.includes(mutation)}
+                  onChange={() => toggleMutation(mutation)}
+                />
+                {mutation}
+              </label>
+            ))}
+          </fieldset>
+          <label className="form-field">
+            <span>Requested safe checks · one command per line</span>
+            <textarea
+              rows={3}
+              value={draft.requestedChecks}
+              onChange={(event) => onChange({ requestedChecks: event.target.value })}
+              placeholder="npm test -- --runInBand"
+            />
+          </label>
+          <label className="specialist-checkbox">
+            <input
+              type="checkbox"
+              checked={draft.allowWebResearch}
+              onChange={(event) => onChange({ allowWebResearch: event.target.checked })}
+            />
+            Allow hosted read-only web research for this task
+          </label>
+        </div>
+      )}
+
+      {profile.templateKey === "debugging" && (
+        <div className="specialist-fields">
+          <label className="form-field">
+            <span>Observed symptoms · one per line</span>
+            <textarea
+              rows={3}
+              value={draft.symptoms}
+              onChange={(event) => onChange({ symptoms: event.target.value })}
+              placeholder="The command exits with code 1"
+            />
+          </label>
+          <label className="form-field">
+            <span>Expected behavior</span>
+            <textarea
+              rows={3}
+              value={draft.expectedBehavior}
+              onChange={(event) => onChange({ expectedBehavior: event.target.value })}
+            />
+          </label>
+          <label className="form-field">
+            <span>Reproduction steps · one per line</span>
+            <textarea
+              rows={3}
+              value={draft.reproductionSteps}
+              onChange={(event) => onChange({ reproductionSteps: event.target.value })}
+            />
+          </label>
+          <label className="form-field">
+            <span>Requested read-only checks · one command per line</span>
+            <textarea
+              rows={3}
+              value={draft.requestedChecks}
+              onChange={(event) => onChange({ requestedChecks: event.target.value })}
+            />
+          </label>
+        </div>
+      )}
+
+      {profile.templateKey === "browser" && (
+        <div className="specialist-fields">
+          <label className="form-field">
+            <span>Allowed source domains · optional, comma or line separated</span>
+            <textarea
+              rows={3}
+              value={draft.allowedDomains}
+              onChange={(event) => onChange({ allowedDomains: event.target.value })}
+              placeholder="kde.org, freedesktop.org"
+            />
+          </label>
+          <label className="form-field">
+            <span>Maximum sources</span>
+            <input
+              type="number"
+              min={1}
+              max={20}
+              value={draft.maxSources}
+              onChange={(event) => onChange({ maxSources: Number(event.target.value) })}
+            />
+          </label>
+          <label className="form-field">
+            <span>Freshness context · optional</span>
+            <input
+              type="text"
+              value={draft.freshnessContext}
+              onChange={(event) => onChange({ freshnessContext: event.target.value })}
+              placeholder="Prefer sources updated in 2026"
+            />
+          </label>
+        </div>
+      )}
+
+      {profile.templateKey === "financial" && (
+        <div className="specialist-fields">
+          <label className="form-field">
+            <span>Currency · optional three-letter code</span>
+            <input
+              type="text"
+              maxLength={3}
+              value={draft.currency}
+              onChange={(event) => onChange({ currency: event.target.value })}
+              placeholder="EUR"
+            />
+          </label>
+          <label className="form-field">
+            <span>Assumptions · one per line</span>
+            <textarea
+              rows={3}
+              value={draft.assumptions}
+              onChange={(event) => onChange({ assumptions: event.target.value })}
+            />
+          </label>
+          <label className="form-field specialist-calculations">
+            <span>Fixed-point calculations · optional, one per line</span>
+            <textarea
+              rows={4}
+              value={draft.calculations}
+              onChange={(event) => onChange({ calculations: event.target.value })}
+              placeholder="margin | percentOf | 2500.00, 12.5 | 2"
+            />
+            <small>
+              Format: id | sum, difference, product, quotient, percentOf, or percentChange | comma-separated operands | output scale 0–12.
+            </small>
+          </label>
+        </div>
+      )}
+    </>
+  );
+}
+
+function SpecialistResultView({ result }: { result: SpecialistResult }) {
+  const checks = result.kind === "coding"
+    ? result.verification
+    : result.kind === "debugging"
+      ? result.checks
+      : [];
+  const limitations = result.kind === "coding" || result.kind === "browserResearch"
+    ? result.limitations
+    : result.kind === "financialAnalysis"
+      ? result.caveats
+      : [];
+  return (
+    <div className="specialist-result">
+      <div className="agent-result-heading">
+        <strong>Validated {result.kind.replace(/([A-Z])/g, " $1")} result</strong>
+        <small>Backend-validated structured evidence</small>
+      </div>
+      <p>
+        {result.kind === "browserResearch"
+          ? result.answer
+          : result.kind === "financialAnalysis"
+            ? result.report
+            : result.summary}
+      </p>
+      {result.kind === "coding" && result.changes.length > 0 && (
+        <div><strong>Reported changes</strong><ul>{result.changes.map((item) => <li key={item}>{item}</li>)}</ul></div>
+      )}
+      {result.kind === "debugging" && (
+        <>
+          {result.findings.length > 0 && <div><strong>Findings</strong><ul>{result.findings.map((item) => <li key={item}>{item}</li>)}</ul></div>}
+          {result.rootCauses.length > 0 && <div><strong>Root causes</strong><ul>{result.rootCauses.map((item) => <li key={item}>{item}</li>)}</ul></div>}
+          {result.recommendedFixes.length > 0 && <div><strong>Recommended fixes</strong><ul>{result.recommendedFixes.map((item) => <li key={item}>{item}</li>)}</ul></div>}
+          <small>Workspace changed: {result.workspaceChanged ? "reported changed" : "no"}</small>
+        </>
+      )}
+      {checks.length > 0 && (
+        <div>
+          <strong>Checks</strong>
+          <ul>{checks.map((check, index) => <li key={`${check.command}-${index}`}><code>{check.command}</code> · {check.status} · {check.summary}</li>)}</ul>
+        </div>
+      )}
+      {result.kind === "browserResearch" && result.sources.length > 0 && (
+        <div>
+          <strong>Sources</strong>
+          <ul>{result.sources.map((source) => <li key={source.url}><span>{source.title}</span><br /><code>{source.url}</code><br /><small>{source.retrievedAt} · {source.supports}</small></li>)}</ul>
+        </div>
+      )}
+      {result.kind === "financialAnalysis" && (
+        <>
+          {result.calculationResults.length > 0 && <div><strong>Authoritative calculations</strong><ul>{result.calculationResults.map((calculation) => <li key={calculation.id}><code>{calculation.id}</code> = {calculation.value}</li>)}</ul></div>}
+          <small>Decision authority: {result.decisionAuthority} · External effects: {result.externalEffects.length}</small>
+        </>
+      )}
+      {limitations.length > 0 && <div><strong>Limitations</strong><ul>{limitations.map((item) => <li key={item}>{item}</li>)}</ul></div>}
+    </div>
+  );
+}
 
 export function AgentsPage({
   agents,
@@ -101,6 +359,10 @@ export function AgentsPage({
   const [newTaskWorkspaceId, setNewTaskWorkspaceId] = useState<string | null>(
     preferences.activeWorkspaceId,
   );
+  const [specialistDraft, setSpecialistDraft] = useState<SpecialistTaskDraft>(
+    createSpecialistTaskDraft,
+  );
+  const [specialistDraftMessage, setSpecialistDraftMessage] = useState("");
   const [selectedAgentId, setSelectedAgentId] = useState<number | null>(null);
   const [activeAgentGroup, setActiveAgentGroup] =
     useState<AgentGroup>("All agents");
@@ -112,6 +374,9 @@ export function AgentsPage({
 
   const selectedAgent =
     agents.find((agent) => agent.id === selectedAgentId) ?? null;
+  const selectedSpecialistProfile = specialistProfileForTemplate(
+    selectedAgent?.templateKey,
+  );
   const activeRun = runCoordinator.snapshot.activeAttempt;
   const runActive = activeRun !== null;
   const runningTaskId =
@@ -514,21 +779,33 @@ export function AgentsPage({
       setRuntimeError("Select a workspace before creating the task.");
       return;
     }
+    const specialist = buildSpecialistTaskRequest(
+      selectedAgent?.templateKey,
+      trimmedTitle,
+      specialistDraft,
+    );
+    if (specialist.error) {
+      setRuntimeError(specialist.error);
+      return;
+    }
     setTaskMutationBusy(true);
     setRuntimeError("");
+    setSpecialistDraftMessage("");
     try {
       await onTaskMutation("create_routed_task", {
         taskOwnerAgentId: selectedAgentId,
         title: trimmedTitle,
-        category: newTaskCategory,
+        category: selectedSpecialistProfile?.category ?? newTaskCategory,
         priority: newTaskPriority,
         workspaceId: newTaskWorkspaceId,
         routingMode: newTaskRoutingMode,
         preferredAgentId: selectedAgentId,
         selectedAgentId:
           newTaskRoutingMode === "selected" ? selectedAgentId : null,
+        specialistRequest: specialist.request,
       });
       setNewTaskTitle("");
+      setSpecialistDraft(createSpecialistTaskDraft());
       setNewTaskCategory(preferences.defaultTaskCategory);
       setNewTaskPriority(preferences.defaultTaskPriority);
       setNewTaskRoutingMode(preferences.defaultRoutingMode);
@@ -559,12 +836,50 @@ export function AgentsPage({
         preferredAgentId: selectedAgent.id,
         selectedAgentId:
           routingMode === "selected" ? selectedAgent.id : null,
+        specialistRequest: task.specialistRequest,
       });
     } catch (error) {
       setRuntimeError(persistenceErrorMessage(error));
     } finally {
       setTaskMutationBusy(false);
     }
+  }
+
+  function prefillCodingTaskFromDebugging(task: AgentTask) {
+    const result = latestRunForTask(task)?.specialistResult;
+    const codingAgent = agents.find(
+      (agent) =>
+        agent.registryState === "active" && agent.templateKey === "coding",
+    );
+    if (!codingAgent || result?.kind !== "debugging") {
+      setRuntimeError(
+        "A validated Debugging result and active stable Coding Agent are required.",
+      );
+      return;
+    }
+    const draft = createSpecialistTaskDraft();
+    draft.acceptanceCriteria = result.recommendedFixes.length > 0
+      ? result.recommendedFixes.join("\n")
+      : "Implement a bounded correction for the validated diagnosis.";
+    draft.constraints = [
+      `Review Debugging task ${task.id} evidence before editing.`,
+      ...result.rootCauses.map((cause) => `Diagnosed cause: ${cause}`),
+    ].join("\n");
+    draft.requestedChecks = result.checks
+      .map((check) => check.command)
+      .join("\n");
+    setSpecialistDraft(draft);
+    setNewTaskTitle(`Implement fix for: ${task.title}`);
+    setNewTaskCategory("Development");
+    setNewTaskPriority(task.priority);
+    setNewTaskRoutingMode("selected");
+    setNewTaskWorkspaceId(task.workspaceId ?? preferences.activeWorkspaceId);
+    setSelectedAgentId(codingAgent.id);
+    setActiveWorkspaceTab("Tasks");
+    setRuntimeError("");
+    setSpecialistDraftMessage(
+      "Coding draft prefilled from validated Debugging evidence. Review it before adding; no task has been created or dispatched.",
+    );
   }
 
   async function setQueueDisposition(
@@ -1359,22 +1674,47 @@ export function AgentsPage({
 
             <div className="task-composer">
               <label className="form-field">
-                <span>Task title</span>
+                <span>
+                  {selectedSpecialistProfile?.primaryLabel ?? "Task title"}
+                </span>
                 <input
                   type="text"
                   value={newTaskTitle}
-                  onChange={(event) => setNewTaskTitle(event.target.value)}
+                  onChange={(event) => {
+                    setNewTaskTitle(event.target.value);
+                    setSpecialistDraftMessage("");
+                  }}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
                       void addTask();
                     }
                   }}
-                  placeholder="Add a task for this agent"
+                  placeholder={
+                    selectedSpecialistProfile
+                      ? `Enter the ${selectedSpecialistProfile.label.toLowerCase()} objective`
+                      : "Add a task for this agent"
+                  }
                 />
               </label>
 
+              {selectedSpecialistProfile && (
+                <SpecialistComposerFields
+                  profile={selectedSpecialistProfile}
+                  draft={specialistDraft}
+                  onChange={(update) => {
+                    setSpecialistDraft((current) => ({ ...current, ...update }));
+                    setSpecialistDraftMessage("");
+                  }}
+                />
+              )}
+
               <label className="form-field">
-                <span>Workspace</span>
+                <span>
+                  {selectedSpecialistProfile?.templateKey === "browser" ||
+                  selectedSpecialistProfile?.templateKey === "financial"
+                    ? "Task workspace · not exposed as this specialist's run workspace"
+                    : "Workspace"}
+                </span>
                 <select
                   value={newTaskWorkspaceId ?? ""}
                   onChange={(event) =>
@@ -1396,7 +1736,8 @@ export function AgentsPage({
               <label className="form-field">
                 <span>Category</span>
                 <select
-                  value={newTaskCategory}
+                  value={selectedSpecialistProfile?.category ?? newTaskCategory}
+                  disabled={Boolean(selectedSpecialistProfile)}
                   onChange={(event) =>
                     setNewTaskCategory(
                       event.target.value as TaskCategory,
@@ -1451,9 +1792,19 @@ export function AgentsPage({
                 }
                 onClick={() => void addTask()}
               >
-                {taskMutationBusy ? "Updating queue…" : "Add task"}
+                {taskMutationBusy
+                  ? "Updating queue…"
+                  : selectedSpecialistProfile
+                    ? `Add ${selectedSpecialistProfile.label} task`
+                    : "Add task"}
               </button>
             </div>
+
+            {specialistDraftMessage && (
+              <div className="runtime-message" role="status">
+                {specialistDraftMessage}
+              </div>
+            )}
 
             {runtimeError && (
               <div className="runtime-message error" role="alert">
@@ -1471,6 +1822,10 @@ export function AgentsPage({
                   const entry = queueEntry(task);
                   const executor = executorForTask(task);
                   const latestRun = latestRunForTask(task);
+                  const specialistResult = latestRun?.specialistResult ?? null;
+                  const taskSpecialistProfile = specialistProfileForTemplate(
+                    executor?.templateKey,
+                  );
                   const workspaceEvidence = workspaceEvidenceForTask(task);
                   const reviewFlow = reviewFlowForTask(
                     reviewOrchestration,
@@ -1522,6 +1877,31 @@ export function AgentsPage({
                         {executor?.name ?? "Unknown agent"} · Workspace:{" "}
                         {workspaceForTask(task)?.name ?? "Missing"}
                       </small>
+
+                      {taskSpecialistProfile && task.specialistRequest && (
+                        <div className="specialist-task-contract">
+                          <strong>{taskSpecialistProfile.label} profile v1</strong>
+                          <small>{taskSpecialistProfile.summary}</small>
+                          {latestRun?.specialistContract ? (
+                            <small>
+                              Effective backend ceiling: workspace {latestRun.specialistContract.tools.workspace} · terminal {latestRun.specialistContract.tools.terminal} · internet {latestRun.specialistContract.tools.internet} · calculator {latestRun.specialistContract.tools.calculator} · external effects {latestRun.specialistContract.tools.externalEffects}
+                            </small>
+                          ) : (
+                            <small>
+                              The immutable effective tool contract is recorded at run admission.
+                            </small>
+                          )}
+                        </div>
+                      )}
+
+                      {taskSpecialistProfile && !task.specialistRequest && (
+                        <div className="routing-note" role="alert">
+                          <strong>Typed specialist contract required</strong>
+                          <small>
+                            This pre-schema-v10 task cannot run under a core specialist profile. Recreate it with the typed composer so the backend can bind its role, tools, and result contract.
+                          </small>
+                        </div>
+                      )}
 
                       {reviewFlow && (
                         <div className="routing-note">
@@ -1646,7 +2026,11 @@ export function AgentsPage({
                         </div>
                       )}
 
-                      {task.result && (
+                      {specialistResult && (
+                        <SpecialistResultView result={specialistResult} />
+                      )}
+
+                      {task.result && !specialistResult && (
                         <div className="agent-result">
                           <div className="agent-result-heading">
                             <strong>Agent result</strong>
@@ -1818,6 +2202,15 @@ export function AgentsPage({
                     </div>
 
                     <div className="task-card-actions">
+                      {specialistResult?.kind === "debugging" && (
+                        <button
+                          className="secondary-button"
+                          disabled={runActive || taskMutationBusy}
+                          onClick={() => prefillCodingTaskFromDebugging(task)}
+                        >
+                          Draft Coding fix
+                        </button>
+                      )}
                       {latestApprovalForTask(task)?.status === "Pending" && (
                           <button
                             className="primary-button"

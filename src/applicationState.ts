@@ -4,6 +4,7 @@ import type {
   TaskQueueState,
 } from "./taskOrchestration";
 import type { WorkspaceChangeEvidence } from "./workspaceEvidence";
+import type { SpecialistTaskRequest } from "./specialistCapabilities";
 
 export type VoiceState = "VOICE_OFF" | "VOICE_PASSIVE" | "VOICE_ACTIVE";
 export type AccessLevel = "none" | "read" | "write" | "full";
@@ -152,6 +153,7 @@ export type AgentTask = {
   queueState: TaskQueueState;
   enqueueSequence: number | null;
   routingEvidence: RoutingEvidence | null;
+  specialistRequest: SpecialistTaskRequest | null;
   reviewAgentId: number | null;
   reviewStatus: ReviewStatus;
   reviewResult: string | null;

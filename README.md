@@ -33,9 +33,12 @@ The current checkout contains:
   isolation, bounded JSONL evidence, cancellation, and descendant cleanup;
 - a bounded async local Ollama path with exact installed-model inspection,
   cancellable HTTP requests, and conflict-safe Linux workspace tools;
+- schema-v10 typed Coding, Debugging, Browser Research, and Financial Analysis
+  requests, immutable run tool contracts, backend-validated structured
+  results, and exact stable-template routing;
 - a feature-modular React renderer with a typed desktop client, accessible
   navigation/dialog/tab/card primitives, and narrow-screen provider controls;
-- schema-v9 lifecycle timestamps and durable bounded retention evidence,
+- schema-v8 lifecycle timestamps and durable bounded retention evidence,
   strict sanitized portable backup v3, and revision-bound backend monitoring
   with explicitly non-authoritative browser previews;
 - one backend-owned canonical voice/system-action gateway with exact XDG/KWin
@@ -62,6 +65,14 @@ overflow handling, queue ordering, and execute-head admission are
 backend-authoritative. Structured multi-level review/recovery and complete
 workspace evidence are also backend-authoritative; live provider acceptance
 remains a later prototype boundary.
+Core specialist titles are not authority: the backend binds each typed task to
+one stable template, derives an immutable role-specific tool ceiling at run
+admission, and rejects cross-role routing, over-ceiling adapter behavior, or
+malformed provider results. Coding
+always needs one-use approval; Debugging is read-only; Browser Research uses
+hosted search plus disposable private scratch; Financial Analysis has no web,
+shell, user-workspace, account, credential, or transaction authority and uses
+backend fixed-point calculations.
 Agent identity, lifecycle, role-derived authority, reporting relationships,
 and template restoration are backend-authoritative; dashboard, agent, routing,
 review, voice, reminder, approval, and settings projections consume active

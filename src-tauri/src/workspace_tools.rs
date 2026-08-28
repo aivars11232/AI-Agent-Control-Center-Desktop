@@ -396,6 +396,9 @@ impl WorkspaceTools {
 }
 
 pub(crate) fn ollama_workspace_tools(file_access: &str) -> Vec<Value> {
+    if file_access == "none" {
+        return Vec::new();
+    }
     let mut tools = vec![
         json!({
           "type": "function",

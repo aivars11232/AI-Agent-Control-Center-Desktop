@@ -30,6 +30,7 @@ import type {
   MonitoringTaskPage,
 } from "../dataLifecycle";
 import type { CanonicalVoiceIntent } from "../voiceCommand";
+import type { SpecialistResult } from "../specialistCapabilities";
 
 export type AgentRunResult = {
   providerId: RuntimeProviderId | null;
@@ -44,6 +45,7 @@ export type AgentRunResult = {
   changedFiles: string[];
   diff: string | null;
   workspaceChanges: WorkspaceChangeEvidence;
+  specialistResult: SpecialistResult | null;
   durationSeconds: number;
 };
 

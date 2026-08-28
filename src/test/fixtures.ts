@@ -35,6 +35,7 @@ export function taskFixture(overrides: Partial<AgentTask> = {}): AgentTask {
     queueState: "queued",
     enqueueSequence: 1,
     routingEvidence: null,
+    specialistRequest: null,
     reviewAgentId: null,
     reviewStatus: "Not Requested",
     reviewResult: null,

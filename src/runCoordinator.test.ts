@@ -39,6 +39,8 @@ function attempt(id: number): RunAttempt {
     changedFiles: [],
     diff: null,
     workspaceChanges: unavailableWorkspaceEvidence(),
+    specialistContract: null,
+    specialistResult: null,
     errorCode: null,
     errorMessage: null,
     progressEventCount: 0,

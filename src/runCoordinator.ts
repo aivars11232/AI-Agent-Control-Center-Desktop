@@ -1,4 +1,8 @@
 import type { WorkspaceChangeEvidence } from "./workspaceEvidence";
+import type {
+  SpecialistResult,
+  SpecialistRunContract,
+} from "./specialistCapabilities";
 
 export type RunAttemptMode = "execute" | "review";
 
@@ -66,6 +70,8 @@ export type RunAttempt = {
   changedFiles: string[];
   diff: string | null;
   workspaceChanges: WorkspaceChangeEvidence;
+  specialistContract: SpecialistRunContract | null;
+  specialistResult: SpecialistResult | null;
   errorCode: string | null;
   errorMessage: string | null;
   progressEventCount: number;

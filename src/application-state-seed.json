@@ -28,7 +28,7 @@
       "registryIssue": null,
       "deletedAtUnixMs": null,
       "name": "Coding Agent",
-      "description": "Builds and edits project files",
+      "description": "Implements approved, typed changes inside one selected workspace",
       "status": "Working",
       "role": "Specialist",
       "category": "Development",
@@ -39,8 +39,8 @@
       "tasks": [],
       "activity": [],
       "performance": { "strength": 8, "focus": "balanced", "cpuLimit": 85, "gpuLimit": 70, "queueThreshold": 10, "overflowAction": "redirect", "redirectAgentId": 3 },
-      "capabilities": { "files": "write", "internet": "read", "clipboard": "write", "terminal": "safe", "system": "none" },
-      "approvals": { "files": "allow", "internet": "ask", "clipboard": "allow", "terminal": "ask", "system": "deny" }
+      "capabilities": { "files": "write", "internet": "read", "clipboard": "none", "terminal": "safe", "system": "none" },
+      "approvals": { "files": "ask", "internet": "ask", "clipboard": "deny", "terminal": "ask", "system": "deny" }
     },
     {
       "id": 3,
@@ -49,7 +49,7 @@
       "registryIssue": null,
       "deletedAtUnixMs": null,
       "name": "Debugging Agent",
-      "description": "Finds errors and verifies fixes",
+      "description": "Diagnoses errors and runs requested checks without changing the workspace",
       "status": "Waiting",
       "role": "Senior Agent",
       "category": "Development",
@@ -60,8 +60,8 @@
       "tasks": [],
       "activity": [],
       "performance": { "strength": 7, "focus": "strength", "cpuLimit": 75, "gpuLimit": 60, "queueThreshold": 10, "overflowAction": "redirect", "redirectAgentId": 1 },
-      "capabilities": { "files": "read", "internet": "none", "clipboard": "read", "terminal": "safe", "system": "none" },
-      "approvals": { "files": "ask", "internet": "deny", "clipboard": "ask", "terminal": "ask", "system": "deny" }
+      "capabilities": { "files": "read", "internet": "none", "clipboard": "none", "terminal": "safe", "system": "none" },
+      "approvals": { "files": "ask", "internet": "deny", "clipboard": "deny", "terminal": "ask", "system": "deny" }
     },
     {
       "id": 4,
@@ -70,7 +70,7 @@
       "registryIssue": null,
       "deletedAtUnixMs": null,
       "name": "Browser Agent",
-      "description": "Uses websites when permission is granted",
+      "description": "Performs hosted read-only research with bounded HTTPS sources",
       "status": "Paused",
       "role": "Specialist",
       "category": "Browsing",
@@ -81,8 +81,8 @@
       "tasks": [],
       "activity": [],
       "performance": { "strength": 4, "focus": "speed", "cpuLimit": 45, "gpuLimit": 10, "queueThreshold": 10, "overflowAction": "redirect", "redirectAgentId": 1 },
-      "capabilities": { "files": "none", "internet": "read", "clipboard": "read", "terminal": "none", "system": "none" },
-      "approvals": { "files": "deny", "internet": "ask", "clipboard": "ask", "terminal": "deny", "system": "deny" }
+      "capabilities": { "files": "none", "internet": "read", "clipboard": "none", "terminal": "none", "system": "none" },
+      "approvals": { "files": "deny", "internet": "ask", "clipboard": "deny", "terminal": "deny", "system": "deny" }
     },
     {
       "id": 5,
@@ -91,7 +91,7 @@
       "registryIssue": null,
       "deletedAtUnixMs": null,
       "name": "Financial Agent",
-      "description": "Tracks financial tasks and reports",
+      "description": "Produces local reports with bounded fixed-point calculations and no transactions",
       "status": "Paused",
       "role": "Specialist",
       "category": "Finance",
@@ -102,8 +102,8 @@
       "tasks": [],
       "activity": [],
       "performance": { "strength": 5, "focus": "balanced", "cpuLimit": 55, "gpuLimit": 25, "queueThreshold": 10, "overflowAction": "redirect", "redirectAgentId": 1 },
-      "capabilities": { "files": "read", "internet": "none", "clipboard": "none", "terminal": "none", "system": "none" },
-      "approvals": { "files": "ask", "internet": "deny", "clipboard": "deny", "terminal": "deny", "system": "deny" }
+      "capabilities": { "files": "none", "internet": "none", "clipboard": "none", "terminal": "none", "system": "none" },
+      "approvals": { "files": "deny", "internet": "deny", "clipboard": "deny", "terminal": "deny", "system": "deny" }
     },
     {
       "id": 6,

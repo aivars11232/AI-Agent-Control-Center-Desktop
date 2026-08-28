@@ -720,6 +720,7 @@ mod tests {
                 runtime_model: Some("model".to_string()),
                 total_tokens: Some(12),
                 workspace_id: None,
+                specialist_request: None,
                 changed_files: vec!["secret.txt".to_string()],
                 diff: Some("diff".to_string()),
                 workspace_changes: None,

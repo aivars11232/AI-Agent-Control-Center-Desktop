@@ -25,7 +25,10 @@
 > redacted-audit boundary. TASK-0016 adds pinned staged offline releases,
 > bounded local-audio/listener handling, private XDG paths, exact install
 > cancellation, and lifecycle-safe capability-bound KDE portal sessions;
-> later tasks still own packaging and live acceptance.
+> TASK-0017 adds strict typed core-specialist requests/results, exact stable-
+> template identity, immutable run tool ceilings, fixed-point finance,
+> disposable private scratch, and backend rejection of cross-role or external
+> effects; later tasks still own packaging and live acceptance.
 
 ## Security objective
 
@@ -54,7 +57,7 @@ when stored locally.
 | React renderer/WebView | Untrusted for authorization; may be compromised or hold stale/tampered state |
 | Imported backup and <code>localStorage</code> | Untrusted serialized input requiring validation and migration |
 | Tauri IPC | Untrusted request boundary; backend must authenticate semantics, not just types |
-| Rust backend | Authoritative agent registry, task routing/queue, structured review/revision, workspace evidence, approval/action-policy, canonical system-action gateway/audit, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
+| Rust backend | Authoritative agent registry, task routing/queue, specialist request/tool/result contracts, structured review/revision, workspace evidence, approval/action-policy, canonical system-action gateway/audit, provider/model dispatch, single-run lifecycle, ledger, and persistence boundary; later tasks retain broader domain work |
 | Codex/Ollama output | Untrusted content and action proposals |
 | Selected workspace | Sensitive bounded filesystem root |
 | External/local provider process | Separate process/service with its own failure and trust model |
@@ -174,6 +177,29 @@ Static inspection and deterministic tests found these implemented controls:
 - dedicated revision-checked task creation/rerouting/hold/resume/reset IPC,
   with generic renderer saves unable to create, remove, relocate, reroute, or
   forge executor, queue, lifecycle, and routing-evidence state;
+- schema-v10 duplicate-key-free, unknown-field-denying, size-bounded specialist
+  requests, immutable admission contracts, canonical SHA-256 request binding,
+  and structured result validation protected from generic renderer saves;
+- exact stable-template/category routing for Coding, Debugging, Browser
+  Research, and Financial Analysis; generic task text and manual selection
+  cannot cross those identities or grant a core profile;
+- forced one-use approval and selected-workspace-only authority for Coding,
+  with destructive classification bound to declared delete/rename, optional
+  hosted research bound to the exact request, Ollama create/modify tools
+  filtered before execution, and all observed mutation classes checked before
+  successful completion;
+- read-only Debugging with exact requested-check result binding, zero observed
+  workspace changes, and separately created Coding work for any fix; Coding's
+  Senior review requires the exact stable Debugging template rather than a title;
+- hosted-search-only Browser Research in a unique mode-0700 private scratch
+  directory, HTTPS/domain/source-count validation, zero scratch changes, and
+  backend rejection of form, authentication, upload/download, purchase,
+  account, or other external-effect authority;
+- Financial Analysis with no web, shell, user-workspace, account, credential,
+  trading, transfer, purchase, or autonomous-decision authority; bounded
+  decimal strings use checked fixed-point arithmetic and half-even rounding,
+  and provider assumptions/values must exactly match the request/backend
+  results;
 - schema-versioned SQLite persistence with foreign keys, integrity checks,
   explicit migration evidence, atomic writes, and stale-revision rejection;
 - one durable global execute queue ordered by priority, monotonic enqueue
@@ -221,8 +247,9 @@ Codex process/protocol boundary, TASK-0008 Ollama transport/workspace-tool
 boundary, TASK-0009 agent-registry boundary, and TASK-0010 routing/queue
 boundary, the TASK-0011 structured-review boundary, the TASK-0012 workspace
 evidence boundary, the TASK-0014 backup/retention/monitoring boundary, and the
-TASK-0015 voice/system-action boundary. They do not establish production
-readiness or the later live provider/platform guarantees.
+TASK-0015 voice/system-action boundary, TASK-0016 offline voice/KDE lifecycle
+boundary, and TASK-0017 specialist-contract boundary. They do not establish
+production readiness or the later live provider/platform guarantees.
 
 ## Known current gaps
 
@@ -238,6 +265,13 @@ authority and run/review/provider/portal/voice-runtime authority; apply is
 revision checked, idle-run guarded, natively confirmed, and atomic. Legacy v2
 imports cross the same sanitizer. The browser preview remains explicitly
 non-authoritative.
+
+Schema v10 persists portable typed task requests and non-portable immutable run
+contracts/results. Generic saves cannot mutate them. Untouched legacy seed
+profiles narrow during migration, while customized rows are preserved. A
+pre-v10 core task without a typed request remains visible but fails closed at
+routing/policy/run admission; the user must review it and create a new typed
+task rather than receiving inferred authority from old prose.
 
 Schema-v8 retention uses backend time, normalized timestamps, active-record
 protection, 500-row per-domain passes, latest-100 evidence, a 15-minute timer,
@@ -301,10 +335,23 @@ tests cover Ollama discovery, transport, cancellation, large/conflicting edits,
 path escape, and bounded tool turns. They do not establish live Ollama or
 packaged-platform behavior, which remains with TASK-0020. Descriptor-confined
 workspace tools fail closed outside Linux.
+Browser Research is Codex-only because its contract requires hosted search;
+Financial Analysis may use Ollama without tools or Codex in a disposable
+private scratch directory. The zero-user-workspace profiles therefore do not
+claim the current Codex CLI can enforce a literal no-filesystem mode. No live
+specialist provider run, live source retrieval, transaction, or consequential
+external action was exercised by TASK-0017's deterministic checks.
+Codex Coding's workspace-write sandbox also cannot pre-restrict create,
+modify, delete, and rename as separate operation classes, and safe terminal is
+not a backend command allowlist. Authoritative post-run evidence rejects an
+undeclared observed mutation from successful completion but does not undo it;
+unexpected changes require user review/recovery. Ollama is narrower: typed
+create/modify tools are filtered before execution, hidden calls fail, and
+contracts requiring shell checks or delete/rename are rejected at routing.
 
 ### Verification coverage
 
-The checked-in non-live suite contains 59 frontend tests and 130 Rust tests. It
+The checked-in non-live suite contains 66 frontend tests and 186 Rust tests. It
 covers frontend characterization, typed IPC mapping, keyboard/dialog/tab
 interaction, deterministic axe checks, responsive-style contracts, plus backend
 policy, authorization, run
@@ -319,8 +366,12 @@ schema-v5 review migration, persistence validation, migration, corruption,
 concurrency, rollback, Git/non-Git add/modify/delete/rename/binary/staging,
 explicit collection limits, symlink containment, redaction, disabled Git
 helpers, structured persistence, and review eligibility
-cases. These checks do not establish end-to-end,
-packaging, upgrade, or live acceptance. Rust advisory status remains
+cases. Nineteen TASK-0017 Rust tests additionally cover strict specialist
+schemas/hashes/ceilings/results, fixed-point arithmetic, exact
+checks/assumptions, cross-role routing/review, schema-v10 persistence and
+reroute, scratch cleanup, and hidden Ollama tool rejection; three frontend
+tests cover composer/profile contracts. These checks do not establish live
+end-to-end, packaging, upgrade, or live acceptance. Rust advisory status remains
 indeterminate when <code>cargo-audit</code> is unavailable.
 
 ## Target security invariants
@@ -366,8 +417,10 @@ invariants remain the release target:
 | Action class | Default direction | Required boundary |
 | --- | --- | --- |
 | Read workspace file | Deny outside selected root | Descriptor-confined backend path resolution on the current Linux path |
-| Write/delete workspace file | Explicit capability; approval when policy requires | Backend policy plus conflict-safe workspace containment; Ollama exposes no delete tool |
+| Write/delete workspace file | Explicit capability; approval when policy requires | Backend policy plus workspace containment; Ollama filters create/modify and exposes no delete, while Codex mutation classes are post-evidence rather than pre-operation |
 | Web access | Off unless capability and task policy permit | Provider/tool-specific network gate |
+| Browser research | Hosted read-only search only; no interactive effects | Exact Browser request, HTTPS/domain/source validation, private scratch, and Codex hosted-search contract |
+| Financial calculation/report | Local inputs only; user retains decisions | Checked fixed-point backend results, zero tools/external effects, and strict structured result |
 | Terminal command | Deny by default; never infer from prose | Normalized command policy and bounded process execution |
 | Clipboard | Deny by default | Backend action-specific grant |
 | Package/power/privileged system action | Deny | Separate explicitly approved future decision, if ever supported |
@@ -436,6 +489,10 @@ workarounds before any code change.
   exhausted stage attempts, the revision cap, or ambiguous legacy binding.
 - Never infer or replay a review verdict from provider prose, renderer state,
   task phase, or a prior request fingerprint.
+- Reject a malformed, wrong-kind, check/assumption/calculation-mismatched,
+  undeclared-mutation, external-effect, or workspace-changing specialist result
+  as a typed protocol failure. Remove the private scratch directory on every
+  normal/error path; report cleanup failure instead of claiming clean completion.
 - Never infer success from a missing process or UI state.
 - Preserve approval records and workspace evidence needed for audit while
   applying explicit retention and redaction rules.
@@ -452,6 +509,9 @@ workarounds before any code change.
   workspace evidence. TASK-0012 redacts detected secret lines and sensitive
   paths and omits binary bodies, but those bounded controls are not a guarantee
   that all sensitive content can be recognized; retention remains required.
+- Treat typed specialist questions, symptoms, assumptions, constraints,
+  calculations, sources, and structured results as sensitive task/run data;
+  keep them out of routine logs and non-portable authority records.
 - Do not include secrets, complete private prompts, workspace contents, or raw
   microphone audio in routine logs.
 - Keep age retention bounded and revision visible; protect active authority and

@@ -1,12 +1,13 @@
 # Current State
 
 > **Classification: Current static and fresh non-live evidence.** This snapshot
-> was refreshed for TASK-0016 on 2026-08-28 from starting commit
-> <code>ef3d1127a34e4c89bfc4a6c636ea5f1f03b0cb1c</code>
-> (<code>task15</code>) on branch <code>main</code>. At the TASK-0016 preflight,
+> was refreshed for TASK-0017 on 2026-08-28 from starting commit
+> <code>d28ef0b5d4ff1d6c5e36a493d1f28d97515128cb</code>
+> (<code>task16</code>) on branch <code>main</code>. At the TASK-0017 preflight,
 > checked-out <code>main</code> and <code>origin/main</code> both resolved to that
-> commit, with zero ahead/behind and a clean working tree. Its 23-file actual
-> scope matched retained TASK-0015 evidence. Reverify later implementation
+> commit, with zero ahead/behind and a clean working tree. Its 21-file actual
+> scope (4,004 insertions and 772 deletions) matched retained TASK-0016
+> evidence. Reverify later implementation
 > facts when they may have drifted.
 
 This document owns statements about what is implemented now. Planned behavior
@@ -69,8 +70,16 @@ machine; private temporary high-accuracy audio; native portal closure
 monitoring and explicit disable; release-or-close input cleanup; and
 capability-bound portal reconciliation after state or agent changes.
 
-TASK-0016 did **not** run a live Codex task, Ollama, or another model/provider.
-It also did not capture microphone input; import or start the Python listener;
+TASK-0017 adds schema-v10 strict typed requests for the four stable core
+specialists, exact template/category routing, immutable run tool contracts,
+role-specific provider prompts and result schemas, forced one-use Coding
+approval, read-only Debugging plus exact reviewer identity, hosted read-only
+Browser Research, backend fixed-point Financial Analysis, disposable private
+scratch workspaces, and structured renderer task/result presentation.
+
+TASK-0017 did **not** run a live Codex task, Ollama, hosted web search, or
+another model/provider. It also did not capture microphone input; import or
+start the Python listener;
 authorize a KDE/XDG portal; execute voice/install/remove scripts; build a desktop
 package; or perform a desktop/system-control action. The retained TASK-0008
 Ollama tests use isolated numeric-loopback fake servers and temporary
@@ -107,6 +116,7 @@ remain historical unless this document identifies a fresh result.
 | <code>src/providerRegistry.ts</code> | Typed renderer projection of backend provider status, catalog bindings, and fail-closed model eligibility |
 | <code>src/agentRegistry.ts</code> | Dynamic active-agent, category-group, ancestor, hierarchy-repair, stable-template, and compatible-manager projections |
 | <code>src/taskOrchestration.ts</code> | Typed projection of backend queue order, positions, state, head admission, and routing evidence |
+| <code>src/specialistCapabilities.ts</code> | Typed core-specialist drafts/requests, truthful profile ceilings, result contracts, and deterministic composer validation |
 | <code>src/reviewOrchestration.ts</code> | Typed projection of backend review flows, levels, attempts, human fallback, and revision state |
 | <code>src/runCoordinator.ts</code> | Typed renderer projection of authoritative run snapshots/events, stale-event rejection, and global stop state |
 | <code>src/workspaceEvidence.ts</code> | Versioned renderer projection, defensive shape normalization, truthful labels, and safe final-state openability for workspace evidence |
@@ -124,6 +134,7 @@ remain historical unless this document identifies a fresh result.
 | <code>src-tauri/src/agent_registry.rs</code> | Agent-registry DTOs, template catalog, role authority, legacy repair, and hierarchy validation |
 | <code>src-tauri/src/task_orchestration.rs</code> | Deterministic routing eligibility/scoring, workload/overflow decisions, and queue DTOs |
 | <code>src-tauri/src/review_orchestration.rs</code> | Versioned review schemas, exact reporting-chain selection, prompt/protocol validation, and review DTOs |
+| <code>src-tauri/src/specialist_capabilities.rs</code> | Strict specialist request/run/result contracts, canonical hashing, fixed-point finance, prompts, and fail-closed result validation |
 | <code>src-tauri/src/policy.rs</code> / <code>src-tauri/src/authorization.rs</code> | Normalized action intents, capability evaluation, native confirmation, and approval IPC contracts |
 | <code>src-tauri/src/run_coordinator.rs</code> | Run states, legal transitions, ledger projections, and explicit evidence/retention bounds |
 | <code>src-tauri/src/data_lifecycle.rs</code> | Strict duplicate-free bounded backup parsing, portable-state sanitization, backup/monitoring DTOs, and lifecycle constants |
@@ -168,7 +179,7 @@ retains a clearly labelled non-authoritative legacy version 2 preview path.
 
 In the desktop runtime, core product state and the run ledger are stored in
 <code>application-state.sqlite3</code> below Tauri's operating-system-provided
-application data directory. Schema version 8 stores:
+application data directory. Schema version 10 stores:
 
 - agents, stable template identity, lifecycle/repair metadata, reporting
   structure, and their nested tasks, activity, memory, roles, and policies;
@@ -187,12 +198,14 @@ application data directory. Schema version 8 stores:
 - normalized Unix-millisecond task/activity/reminder lifecycle columns,
   retention indexes, maintenance revision/totals, and the latest 100 bounded
   maintenance-run evidence records.
+- bounded typed specialist request JSON on tasks and immutable specialist
+  tool-contract/result JSON in the run ledger.
 
 The backend validates aggregate size, counts, identifiers, enums, numeric
 ranges, text bounds, and selected relationships before an atomic replacement.
 SQLite foreign keys, rollback-journal mode, full synchronous writes, integrity
 checks, transactional aggregate reads, a migration ledger,
-<code>PRAGMA user_version = 8</code>, and compare-and-swap revisions protect the
+<code>PRAGMA user_version = 10</code>, and compare-and-swap revisions protect the
 repository boundary. The database and its parent directory are restricted to
 the current user on Unix.
 
@@ -267,6 +280,16 @@ retention; pending approval and dispatched records remain protected. Startup
 turns an interrupted dispatched record into <code>uncertain</code> without
 repeating the action.
 
+Migration 0010 adds 64 KiB JSON-checked typed requests to tasks, 64 KiB
+immutable tool contracts and 256 KiB structured results to run attempts, and
+narrows only untouched legacy seed profiles to their truthful role defaults.
+Customized agent profiles are preserved. Request parsing rejects duplicate
+keys, unknown/trailing/future data and invalid bounds; canonical JSON is bound
+to the run contract by SHA-256. Generic state saves cannot forge or replace a
+specialist request, contract, or result. Pre-v10 core tasks remain visible but
+receive no inferred authority from prose and must be recreated as typed work
+before a new core-specialist run can be admitted.
+
 Portable backup v3 is capped at 16 MiB and 128 JSON levels, rejects duplicate
 keys, unknown fields, trailing content, unsupported versions, and future
 schemas, and sanitizes active tasks/approvals/runtime evidence before export or
@@ -337,6 +360,37 @@ tombstone, direct reports require a valid reassignment, affected live task and
 approval references are reconciled, and a default returns only through an
 explicit template restore.
 
+### Core specialist profiles
+
+| Stable template | Typed authority and evidence |
+| --- | --- |
+| Coding | Selected-workspace write ceiling with declared create/modify/delete/rename intent; exact requested-check reporting; optional hosted research; forced one-use approval; structured changes/checks/evidence/limitations |
+| Debugging | Selected workspace read-only; terminal disabled when no checks are requested; exact requested-check reporting and zero observed changes; any fix is a separately reviewed Coding draft/task |
+| Browser | Codex hosted read-only search, bounded HTTPS sources and optional domain allowlist, private scratch, no interactive browser/forms/auth/upload/download/purchase/account or external effects |
+| Financial | Supplied local inputs and exact assumptions, checked fixed-point calculations with half-even rounding, private scratch, no web/shell/credentials/accounts/trading/transfers/purchases/autonomous decisions |
+
+The task composer emits only the exact schema for the selected stable template,
+shows its effective ceiling, and preserves the typed request on reroute. At
+admission the backend records the request hash, provider/model, approval ID,
+workspace binding, and exact tool ceiling. A successful completion persists
+only a kind-matched structured result validated against authoritative workspace
+evidence. Browser and Financial private scratch directories are unique,
+mode 0700 on Unix, and explicitly removed after each run. The Debugging result
+action pre-fills a Coding draft and switches to the Coding agent; it never
+creates, approves, queues, or dispatches work automatically.
+
+Ollama Coding exposes read/list plus only the declared create and/or modify
+tools; a hidden or undeclared tool call is rejected before execution. Its
+adapter cannot execute requested shell checks or perform delete/rename, so
+those exact contracts are routing failures. Codex Coding uses the CLI's
+workspace-write sandbox and its safe terminal ceiling is not a per-command
+allowlist. The backend therefore compares observed mutation classes with the
+typed request after Codex returns: an undeclared class fails the run and keeps
+its workspace evidence for review, but TASK-0017 does not claim pre-execution
+prevention or automatic rollback of that already-observed change. Browser and
+Codex Financial runs use read-only private scratch because the inspected Codex
+CLI cannot enforce literal no-file access; terminal features remain disabled.
+
 ## Provider behavior
 
 ### Codex
@@ -358,6 +412,13 @@ approved run capability. A requested file capability of <code>none</code> fails
 because the inspected CLI cannot enforce it. Write/full file levels collapse
 to workspace-write, and safe/user terminal levels collapse to the Codex
 sandbox; administrator terminal access remains denied by backend policy.
+When the effective terminal level is none, compatibility inspection must expose
+the disableable shell features and the launch disables shell tool, unified
+execution, and shell snapshot. Coding/Debugging safe terminal access remains a
+sandbox ceiling rather than backend interception of each command; their strict
+structured results must nevertheless report exactly the requested checks.
+Codex Coding mutation-class validation occurs against authoritative post-run
+workspace evidence and does not roll back an unexpected mutation.
 
 The outer Bubblewrap process unshares user and PID namespaces, drops
 capabilities, binds a private <code>/proc</code>, and dies with its parent. This
@@ -407,6 +468,12 @@ displaced inode and content and rolls back a conflict instead of silently
 overwriting newer data. Ollama receives no terminal, web, delete, clipboard,
 or system-control tool. Descriptor-confined tools currently fail closed on
 non-Linux platforms.
+For typed Coding, the tool list is further reduced to the declared create and
+modify classes, and a model-requested name absent from that immutable list is a
+protocol failure before tool execution. Coding/Debugging contracts requiring
+shell checks and Coding contracts requiring delete/rename are disqualified
+from Ollama routing. Financial Analysis can use a completion-capable Ollama
+model with an empty tool list.
 
 ### Registry, identity, and availability
 
@@ -484,6 +551,11 @@ was checked in TASK-0008.
   admission, consumed once only after the provider startup boundary succeeds,
   and released when cancellation or failure occurs before dispatch. Once
   dispatch may have occurred, recovery never restores that approval for replay.
+- Core-specialist execution additionally requires one strict typed request
+  matching the exact stable template/category. Admission persists its SHA-256,
+  provider/model, workspace binding, approval ID, and role tool ceiling;
+  successful completion requires a kind-matched result with exact requested
+  checks and, for Finance, exact assumptions/backend calculations.
 - The backend keeps only the live cancellation handle in memory. Admission,
   cancellation requests, task projections, events, outcomes, usage, structured
   workspace changes, bounded compatibility paths/diffs, errors, and recovery
@@ -637,7 +709,14 @@ The backend currently:
 - resolves the selected workspace and constrains Codex with an explicit Codex
   sandbox plus Linux process-lifecycle containment;
 - anchors Ollama tools to a selected-workspace descriptor, refuses symlink and
-  <code>.git</code> traversal, and requires hash-preconditioned atomic edits.
+  <code>.git</code> traversal, and requires hash-preconditioned atomic edits;
+- binds each core task to its exact stable specialist template/category and
+  rejects generic or cross-specialist selection, unsupported Ollama contracts,
+  altered run ceilings, malformed results, external-effect claims, and
+  unexpected Debugging/Browser/Financial workspace changes;
+- filters typed Ollama Coding create/modify tools before execution and rejects
+  hidden tool calls; Codex Coding's declared mutation classes are checked from
+  post-run workspace evidence and are not represented as pre-execution rollback.
 
 These controls include backend-issued exact approvals with native resolution,
 expiry, policy/workspace invalidation, and atomic one-use consumption. Imported
@@ -654,7 +733,7 @@ and WebSocket endpoints.
 
 ## Verification inventory
 
-Nineteen Vitest files contain 63 deterministic frontend tests for renderer
+Twenty Vitest files contain 66 deterministic frontend tests for renderer
 domain characterization, voice, persistence, revision/fail-closed writer
 behavior, authoritative run/provider/registry/queue/review projections, exact
 desktop command/event mappings, native-dialog focus and cancellation, APG tab
@@ -662,7 +741,7 @@ keyboard behavior, keyboard agent-card activation, skip navigation, page-focus
 transfer, deterministic axe checks, and responsive provider/reduced-motion
 style contracts.
 
-The Rust library contains 167 passing tests. They add Codex compatibility,
+The Rust library contains 186 passing tests. They add Codex compatibility,
 command-isolation, bounded protocol, fake-process descendant cleanup, provider
 registry, fake-adapter dispatch, exact identity, typed failure, run-state,
 concurrent admission, idempotency, approval-boundary, cancellation, timeout,
@@ -750,6 +829,19 @@ frontend files/63 tests, TypeScript, 7 Python listener/setup tests, rustfmt,
 denied, shell/Python/strict-JSON checks, npm/Cargo dependency trees, and
 production plus full npm audits reporting zero vulnerabilities.
 
+TASK-0017 focused checks passed on 2026-08-28: 19 Rust tests cover strict
+request/hash/tool/result contracts, fixed-point arithmetic, exact
+checks/assumptions, mutation and external-effect rejection, stable routing and
+review identity, schema-v10 persistence/reroute, private scratch cleanup, and
+hidden Ollama tool calls. One focused frontend file passed 3 composer/profile
+tests, and TypeScript passed. The complete fast gate passed with 20 frontend
+files/66 tests, TypeScript, 7 Python listener/setup tests, rustfmt, and 186
+locked/offline Rust tests. The complete full gate repeated those checks, built
+67 modules, passed Clippy with warnings denied, shell/Python/strict-JSON checks,
+npm/Cargo dependency trees, and production plus full npm audits with zero
+vulnerabilities. No live provider, hosted search, transaction, microphone,
+portal, installer, package, or desktop/system action was run.
+
 <code>cargo-audit</code> is not installed in the inspected environment. The
 full route therefore reports the Rust advisory result as **indeterminate** and
 does not represent the skip as a pass. Mandatory installed/CI security tooling
@@ -762,10 +854,11 @@ belongs to TASK-0019.
 | Mandatory installed/CI Rust advisory tooling | TASK-0019 |
 | Live Codex compatibility, authentication, model, and packaged-platform acceptance | TASK-0020 |
 | Live Ollama connectivity, installed-model behavior, cancellation, and packaged-platform acceptance | TASK-0020 |
+| Live core-specialist provider, hosted-search, structured-result, and adapter-limit acceptance | TASK-0020 |
 | Physical database/file purge and installed removal evidence | TASK-0019 |
 | Installed WebView, packaged accessibility, and live platform acceptance | TASK-0020 |
 | Live installed voice, microphone, restored-session, and KDE/portal/XDG acceptance | TASK-0020 |
-| Bounded specialist capabilities and management handoffs | TASK-0017–TASK-0018 |
+| Passive reminders, structured memory, and management handoffs | TASK-0018 |
 | Packaging, CI, live acceptance, and production gate | TASK-0019–TASK-0020 |
 
 See [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for exact sequencing.
