@@ -51,6 +51,18 @@ export type VoiceRuntimeStatus = {
   installed: boolean;
   listening: boolean;
   highAccuracyAvailable: boolean;
+  installState: "missing" | "installing" | "cancelling" | "ready" | "failed";
+  listenerState:
+    | "stopped"
+    | "starting"
+    | "passive"
+    | "active"
+    | "listening"
+    | "transcribing"
+    | "stopping"
+    | "failed";
+  operationId: string | null;
+  canCancel: boolean;
   message: string;
 };
 
@@ -60,6 +72,8 @@ export type VoiceTranscriptEvent = {
     | "deactivated"
     | "off_requested"
     | "listening"
+    | "transcribing"
+    | "warning"
     | "ready"
     | "error"
     | "command"
@@ -69,6 +83,7 @@ export type VoiceTranscriptEvent = {
 
 export type DesktopControlStatus = {
   enabled: boolean;
+  state: "disabled" | "starting" | "enabled" | "stopping" | "closed" | "failed";
   message: string;
 };
 
@@ -206,6 +221,10 @@ export function createDesktopClient(
       });
     },
 
+    disableDesktopControl() {
+      return invokeFn<DesktopControlStatus>("disable_desktop_control");
+    },
+
     desktopControlStatus() {
       return invokeFn<DesktopControlStatus>("desktop_control_status");
     },
@@ -272,26 +291,36 @@ export function createDesktopClient(
       return listenFn<VoiceRuntimeStatus>("voice-runtime-status", handler);
     },
 
+    onDesktopControlStatus(handler: (status: DesktopControlStatus) => void) {
+      return listenFn<DesktopControlStatus>("desktop-control-status", handler);
+    },
+
     onVoiceTranscript(handler: (event: VoiceTranscriptEvent) => void) {
       return listenFn<VoiceTranscriptEvent>("voice-transcript", handler);
     },
 
     installVoiceRuntime(agentId: number) {
-      return invokeFn<void>("install_voice_runtime", { agentId });
+      return invokeFn<VoiceRuntimeStatus>("install_voice_runtime", { agentId });
     },
 
     installHighAccuracyVoiceRuntime(agentId: number) {
-      return invokeFn<void>("install_high_accuracy_voice_runtime", {
+      return invokeFn<VoiceRuntimeStatus>("install_high_accuracy_voice_runtime", {
         agentId,
       });
     },
 
+    cancelVoiceRuntimeInstall(operationId: string) {
+      return invokeFn<VoiceRuntimeStatus>("cancel_voice_runtime_install", {
+        operationId,
+      });
+    },
+
     startVoiceListener(agentId: number) {
-      return invokeFn<void>("start_voice_listener", { agentId });
+      return invokeFn<VoiceRuntimeStatus>("start_voice_listener", { agentId });
     },
 
     stopVoiceListener() {
-      return invokeFn<void>("stop_voice_listener");
+      return invokeFn<VoiceRuntimeStatus>("stop_voice_listener");
     },
 
     chooseWorkspaceFolder() {

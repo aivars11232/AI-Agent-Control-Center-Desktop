@@ -36,8 +36,8 @@ ready merely because its predecessor's code was edited.
 | TASK-0012 | TASK-0011 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Complete workspace change evidence and Git/non-Git inspection |
 | TASK-0013 | TASK-0012 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Frontend modularization, accessibility, and responsive operation |
 | TASK-0014 | TASK-0013 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Data lifecycle, strict backup, retention, and truthful monitoring |
-| TASK-0015 | TASK-0014 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Unified voice intent and system-action policy gateway |
-| TASK-0016 | TASK-0015 | NOT STARTED | NO | NOT STARTED | — | — | Offline voice runtime, KDE portal control, and XDG integration |
+| TASK-0015 | TASK-0014 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Unified voice intent and system-action policy gateway |
+| TASK-0016 | TASK-0015 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Offline voice runtime, KDE portal control, and XDG integration |
 | TASK-0017 | TASK-0016 | NOT STARTED | NO | NOT STARTED | — | — | Bounded Coding, Debugging, Browser, and Financial agent capabilities |
 | TASK-0018 | TASK-0017 | NOT STARTED | NO | NOT STARTED | — | — | Reminder scheduler, structured memory, and management handoff workspaces |
 | TASK-0019 | TASK-0018 | NOT STARTED | NO | NOT STARTED | — | — | Packaging, privacy-safe removal, release metadata, and CI security gates |
@@ -1067,7 +1067,88 @@ ready merely because its predecessor's code was edited.
   TASK-0020 owns sequential live acceptance. Rust advisory status is
   indeterminate in this environment because <code>cargo-audit</code> is
   unavailable
-- Git closure: **PENDING USER** review, commit, push, and clean-tree evidence
+- Git closure: implementation commit
+  <code>ef3d1127a34e4c89bfc4a6c636ea5f1f03b0cb1c</code>
+  (<code>task15</code>) was identified from actual history at the TASK-0016
+  preflight. It was checked-out <code>main</code> HEAD, reachable from
+  <code>origin/main</code>, and both refs matched with zero ahead/behind and a
+  clean tree. Its actual 23-file scope (5,423 insertions, 1,837 deletions)
+  matched the reported TASK-0015 implementation with no unexplained
+  intervening state; all seven successor-preflight closure conditions passed.
+
+## TASK-0016 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>ef3d1127a34e4c89bfc4a6c636ea5f1f03b0cb1c</code>
+  (<code>task15</code>)
+- Starting status: clean; checked-out <code>main</code> and freshly fetched
+  <code>origin/main</code> matched with zero ahead/behind
+- Dependency: TASK-0015 satisfied every successor-preflight condition. Its
+  implementation commit was actual checked-out/reachable history, its 23-file
+  scope matched retained evidence, and the tracker lag was backfilled above
+- Phase A outcome: <code>PHASE_A_READY</code>
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0016 AS PLANNED.</code>
+- Added shared absolute XDG data/config/cache/runtime paths and ordered data
+  roots. Desktop discovery now honors locale fallback, higher-precedence
+  tombstones, <code>NoDisplay</code>, <code>OnlyShowIn</code>,
+  <code>NotShowIn</code>, executable <code>TryExec</code>, bounded traversal,
+  and a GIO fallback that launches only the resolved desktop file
+- Replaced unpinned heavyweight base setup with a CPython 3.14 x86_64 Vosk
+  0.3.45 release whose selected wheel/dependency/model artifacts are pinned and
+  SHA-256 checked. Optional whisper.cpp 1.9.1 is source-commit/model-hash bound.
+  Downloads use a private resumable cache; scripts build in a unique stage and
+  write a strict manifest last
+- Added one backend-owned install operation, overlap refusal, exact-ID cancel,
+  process-group termination, bounded/discarded diagnostics, strict stage
+  validation, and atomic promotion with previous-release preservation. Base
+  Vosk is independently usable when optional high accuracy is absent or fails
+- Reworked the local listener around exact 20 ms PipeWire PCM frames, bounded
+  short-read accumulation, one-copy pre-roll, a 20-second utterance cap,
+  at-most-once-per-second last-known-good config reload, Vosk endpointing, and
+  bounded sanitized NDJSON. Base audio stays in memory; optional Whisper uses
+  a mode-0600 runtime WAV that is removed on success, failure, and timeout
+- Added truthful install/listener lifecycle IPC and UI, exact-operation cancel,
+  optional-high-accuracy fallback, and no-overlap controls. The fast gate now
+  includes deterministic Python voice-runtime tests without importing Vosk,
+  downloading models, or capturing audio
+- Hardened KDE RemoteDesktop integration with native <code>Closed</code>
+  monitoring, explicit disable, private atomic restore-token handling, partial
+  grant closure, exact Full PC Control agent binding, and reconciliation after
+  generic state save, reset, backup import, delete/update, or template restore.
+  Failed pressed-key/button release closes the session; target checks and the
+  TASK-0015 policy/audit gateway remain authoritative
+- Focused verification passed on 2026-08-28: 14 TASK-0016 Rust tests, 7 Python
+  listener/setup tests, 2 renderer/client files with 6 tests, TypeScript,
+  rustfmt, and shell/Python syntax. Coverage includes path precedence,
+  localization/visibility/tombstones, manifests/promotion/cancellation,
+  private modes, bounded diagnostics/messages, framing/pre-roll/config/temp
+  cleanup, install/listener/portal overlap refusal, portal-agent eligibility,
+  input release order, disable-wins lifecycle handling, and UI cancel/disable
+- No Cargo/npm dependency, manifest/lock, database schema/migration, backup
+  format, provider/model protocol, release version, package-install, or desktop
+  install/remove change was required
+- Live Codex/Ollama generation, provider authentication, model download,
+  installer execution, microphone/listener, KDE portal authorization, KWin
+  action, desktop input, package build, install, and removal: not run
+- Complete fast gate: <code>npm run verify:fast</code> passed on 2026-08-28
+  with 19 frontend files/63 tests, TypeScript, 7 Python listener/setup tests,
+  rustfmt, and 167 locked/offline Rust tests
+- Full non-live gate: <code>npm run verify:full</code> passed on 2026-08-28 with
+  the same fast checks, a 66-module production build, Clippy with warnings
+  denied, shell/Python/strict-JSON checks, npm/Cargo dependency trees, and
+  production plus full npm audits reporting zero vulnerabilities
+- Rust advisory result: **indeterminate** because <code>cargo-audit</code> is
+  unavailable; the full gate reported the skip and did not count it as a pass
+- Remaining limits: deterministic checks establish checked-in process,
+  filesystem, parsing, IPC, and lifecycle contracts; TASK-0020 owns sequential
+  live microphone, portal, restored-session, KWin/input, installed, and
+  packaged acceptance. TASK-0019 owns mandatory installed/CI advisory tooling
+- Git closure: <code>PENDING USER</code> review, commit, push, and successor
+  evidence
 
 ## Successor-preflight closure rule
 

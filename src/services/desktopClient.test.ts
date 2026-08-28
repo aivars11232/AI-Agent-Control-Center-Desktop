@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import type { InvokeFunction } from "../persistence";
 import {
   createDesktopClient,
+  type DesktopControlStatus,
   type DesktopListenFunction,
+  type VoiceRuntimeStatus,
   type VoiceTranscriptEvent,
 } from "./desktopClient";
 
@@ -181,10 +183,12 @@ describe("typed desktop client command contracts", () => {
     const { calls, client } = clientHarness();
 
     await client.desktopControlStatus();
+    await client.disableDesktopControl();
     await client.reviewOrchestrationSnapshot();
     await client.voiceRuntimeStatus();
     await client.installVoiceRuntime(12);
     await client.installHighAccuracyVoiceRuntime(12);
+    await client.cancelVoiceRuntimeInstall("install-base-12");
     await client.startVoiceListener(12);
     await client.stopVoiceListener();
     await client.chooseWorkspaceFolder();
@@ -199,12 +203,17 @@ describe("typed desktop client command contracts", () => {
 
     expect(calls).toEqual([
       { command: "desktop_control_status", args: undefined },
+      { command: "disable_desktop_control", args: undefined },
       { command: "review_orchestration_snapshot", args: undefined },
       { command: "voice_runtime_status", args: undefined },
       { command: "install_voice_runtime", args: { agentId: 12 } },
       {
         command: "install_high_accuracy_voice_runtime",
         args: { agentId: 12 },
+      },
+      {
+        command: "cancel_voice_runtime_install",
+        args: { operationId: "install-base-12" },
       },
       { command: "start_voice_listener", args: { agentId: 12 } },
       { command: "stop_voice_listener", args: undefined },
@@ -224,16 +233,24 @@ describe("typed desktop client command contracts", () => {
   it("uses stable event names, forwards payloads, and exposes listener cleanup", async () => {
     const { client, listeners, stoppedEvents } = clientHarness();
     const transcriptHandler = vi.fn<(event: VoiceTranscriptEvent) => void>();
+    const runtimeHandler = vi.fn<(status: VoiceRuntimeStatus) => void>();
+    const desktopHandler = vi.fn<(status: DesktopControlStatus) => void>();
     const openHandler = vi.fn<() => void>();
 
     const stopTranscript = await client.onVoiceTranscript(transcriptHandler);
+    const stopRuntime = await client.onVoiceRuntimeStatus(runtimeHandler);
+    const stopDesktop = await client.onDesktopControlStatus(desktopHandler);
     const stopOpen = await client.onVoiceControlOpen(openHandler);
     listeners.get("voice-transcript")?.({
       kind: "command",
       transcript: "inspect the build",
     });
     listeners.get("voice-control-open")?.(undefined);
+    listeners.get("voice-runtime-status")?.({ installState: "ready" });
+    listeners.get("desktop-control-status")?.({ state: "closed" });
     stopTranscript();
+    stopRuntime();
+    stopDesktop();
     stopOpen();
 
     expect(transcriptHandler).toHaveBeenCalledWith({
@@ -241,7 +258,14 @@ describe("typed desktop client command contracts", () => {
       transcript: "inspect the build",
     });
     expect(openHandler).toHaveBeenCalledOnce();
-    expect(stoppedEvents).toEqual(["voice-transcript", "voice-control-open"]);
+    expect(runtimeHandler).toHaveBeenCalledWith({ installState: "ready" });
+    expect(desktopHandler).toHaveBeenCalledWith({ state: "closed" });
+    expect(stoppedEvents).toEqual([
+      "voice-transcript",
+      "voice-runtime-status",
+      "desktop-control-status",
+      "voice-control-open",
+    ]);
   });
 
   it("maps lifecycle backup and revision-bound monitoring commands exactly", async () => {

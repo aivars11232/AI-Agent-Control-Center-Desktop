@@ -41,6 +41,12 @@ The current checkout contains:
 - one backend-owned canonical voice/system-action gateway with exact XDG/KWin
   target resolution, capability and one-use approval enforcement, normal
   sequential coding-task routing, and a bounded redacted action audit;
+- a pinned, staged, cancellable offline voice runtime with a Vosk base path,
+  optional hash-verified whisper.cpp support, bounded local audio handling,
+  and explicit listener lifecycle projection;
+- XDG-compliant localized desktop discovery and a backend-owned KDE
+  RemoteDesktop session that monitors native closure, releases or closes after
+  partial input, and follows the exact Full PC Control agent's authority;
 - local workspace, task, agent, approval, reminder, and model-management UI;
 - an included Python voice runtime and KDE-oriented install/remove scripts.
 
@@ -74,6 +80,11 @@ Voice interpretation submits one typed intent rather than invoking privileged
 desktop commands. The backend resolves the active agent and exact target,
 records authorization evidence before dispatch, refuses changed or ambiguous
 targets, and never stores raw dictated/coding text in the system-action audit.
+Voice setup uses private XDG data/config/cache/runtime roots and atomically
+promotes only a fully validated staged release. High accuracy is optional: a
+failed or absent whisper.cpp release does not disable the Vosk base listener.
+No checked-in verification command downloads a model, captures audio, opens a
+portal prompt, or sends desktop input.
 
 The supported product direction is Arch Linux, KDE Plasma, and Wayland first.
 Other platforms are not current release targets.
@@ -110,9 +121,10 @@ Run the deterministic fast characterization gate from the repository root:
 npm run verify:fast
 ```
 
-It runs 62 frontend characterization, interaction, accessibility, persistence,
+It runs 63 frontend characterization, interaction, accessibility, persistence,
 coordinator, provider, registry, and orchestration tests, the TypeScript check,
-the Rust format check, and 153 locked/offline Rust tests.
+7 Python voice-runtime tests, the Rust format check, and 167 locked/offline Rust
+tests.
 The full gate adds the
 frontend build, Clippy, shell/Python/JSON checks, dependency-tree checks, and
 production plus development npm audits:

@@ -145,9 +145,12 @@ platform acceptance remains part of TASK-0020.
 
 TASK-0015 now routes canonical voice/system intents through one authoritative
 policy, approval, exact-target, dispatch, and redacted-audit gateway; coding
-requests enter the existing sequential queue. TASK-0016 remains responsible
-for offline runtime reliability plus live native KDE/Wayland/XDG mechanisms
-and bounded workarounds.
+requests enter the existing sequential queue. TASK-0016 now establishes pinned
+and staged offline runtime reliability, bounded local listener behavior,
+standards-aware XDG discovery, and lifecycle-safe native KDE RemoteDesktop
+integration with bounded workarounds. TASK-0020 retains sequential live
+microphone, portal, compositor, restored-session, installed, and packaged
+acceptance.
 
 ### M6 — Complete bounded core agents
 

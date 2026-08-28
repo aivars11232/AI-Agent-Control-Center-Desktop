@@ -1,3 +1,4 @@
+use crate::linux_paths::LinuxPaths;
 use crate::system_actions::{
     sha256_hex, AuthorizedSystemAction, KeyboardAction, PointerAction, StandardFolder, VoiceIntent,
     WindowAction,
@@ -5,9 +6,9 @@ use crate::system_actions::{
 use ashpd::zbus;
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -66,6 +67,7 @@ impl KwinResultReceiver {
 pub struct DesktopEntryTarget {
     pub desktop_id: String,
     pub name: String,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +80,7 @@ pub struct KwinWindowTarget {
 pub enum DesktopExecution {
     LaunchApplication {
         desktop_id: String,
+        desktop_file: PathBuf,
     },
     OpenStandardFolder {
         folder: StandardFolder,
@@ -128,6 +131,7 @@ pub async fn prepare_system_action(
                 },
                 execution: DesktopExecution::LaunchApplication {
                     desktop_id: entry.desktop_id,
+                    desktop_file: entry.path,
                 },
             })
         }
@@ -249,48 +253,64 @@ pub async fn prepare_system_action(
 }
 
 pub fn execute_xdg_action(execution: &DesktopExecution) -> Result<bool, LinuxDesktopError> {
-    let (program, argument, description) = match execution {
-        DesktopExecution::LaunchApplication { desktop_id } => (
-            find_in_path("gtk-launch").ok_or_else(|| {
-                LinuxDesktopError::new(
+    match execution {
+        DesktopExecution::LaunchApplication {
+            desktop_id,
+            desktop_file,
+        } => {
+            let mut command = if let Some(program) = find_in_path("gtk-launch") {
+                let mut command = Command::new(program);
+                command.arg(desktop_id);
+                command
+            } else if let Some(program) = find_in_path("gio") {
+                let mut command = Command::new(program);
+                command.arg("launch").arg(desktop_file);
+                command
+            } else {
+                return Err(LinuxDesktopError::new(
                     "DESKTOP_LAUNCHER_UNAVAILABLE",
-                    "The exact desktop-entry launcher is unavailable.",
+                    "Neither gtk-launch nor the GIO desktop-entry launcher is available.",
+                    true,
+                ));
+            };
+            command.spawn().map_err(|error| {
+                LinuxDesktopError::new(
+                    "XDG_ACTION_FAILED",
+                    format!("Could not open the exact desktop application: {error}"),
                     true,
                 )
-            })?,
-            desktop_id.as_str(),
-            "desktop application",
-        ),
-        DesktopExecution::OpenStandardFolder { path, .. } => (
-            find_in_path("xdg-open").ok_or_else(|| {
+            })?;
+            Ok(true)
+        }
+        DesktopExecution::OpenStandardFolder { path, .. } => {
+            let program = find_in_path("xdg-open").ok_or_else(|| {
                 LinuxDesktopError::new(
                     "XDG_OPEN_UNAVAILABLE",
                     "The XDG opener is unavailable.",
                     true,
                 )
-            })?,
-            path.to_str().ok_or_else(|| {
+            })?;
+            let argument = path.to_str().ok_or_else(|| {
                 LinuxDesktopError::new(
                     "STANDARD_FOLDER_INVALID",
                     "The configured standard folder cannot be represented safely.",
                     false,
                 )
-            })?,
-            "standard folder",
-        ),
-        _ => return Ok(false),
-    };
-    Command::new(program)
-        .arg(argument)
-        .spawn()
-        .map_err(|error| {
-            LinuxDesktopError::new(
-                "XDG_ACTION_FAILED",
-                format!("Could not open the exact {description}: {error}"),
-                true,
-            )
-        })?;
-    Ok(true)
+            })?;
+            Command::new(program)
+                .arg(argument)
+                .spawn()
+                .map_err(|error| {
+                    LinuxDesktopError::new(
+                        "XDG_ACTION_FAILED",
+                        format!("Could not open the exact standard folder: {error}"),
+                        true,
+                    )
+                })?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 pub async fn execute_kwin_action(
@@ -329,12 +349,63 @@ pub async fn ensure_active_window(
 }
 
 fn resolve_desktop_entry(query: &str) -> Result<DesktopEntryTarget, LinuxDesktopError> {
-    resolve_desktop_entry_in(query, &xdg_data_directories()?)
+    resolve_desktop_entry_in_context(
+        query,
+        &xdg_data_directories()?,
+        &DesktopEntryContext::discover(),
+    )
 }
 
+#[cfg(test)]
 fn resolve_desktop_entry_in(
     query: &str,
     data_directories: &[PathBuf],
+) -> Result<DesktopEntryTarget, LinuxDesktopError> {
+    resolve_desktop_entry_in_context(query, data_directories, &DesktopEntryContext::discover())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DesktopEntryContext {
+    locale_candidates: Vec<String>,
+    current_desktops: HashSet<String>,
+    executable_path: Option<OsString>,
+}
+
+impl DesktopEntryContext {
+    fn discover() -> Self {
+        let locale = env::var("LC_ALL")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                env::var("LC_MESSAGES")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            })
+            .or_else(|| env::var("LANG").ok().filter(|value| !value.is_empty()));
+        let current_desktops = env::var("XDG_CURRENT_DESKTOP")
+            .ok()
+            .into_iter()
+            .flat_map(|value| {
+                value
+                    .split(':')
+                    .map(str::trim)
+                    .filter(|desktop| !desktop.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        Self {
+            locale_candidates: locale_candidates(locale.as_deref()),
+            current_desktops,
+            executable_path: env::var_os("PATH"),
+        }
+    }
+}
+
+fn resolve_desktop_entry_in_context(
+    query: &str,
+    data_directories: &[PathBuf],
+    context: &DesktopEntryContext,
 ) -> Result<DesktopEntryTarget, LinuxDesktopError> {
     let normalized_query = normalized_lookup(query);
     if normalized_query.is_empty() {
@@ -345,17 +416,18 @@ fn resolve_desktop_entry_in(
         ));
     }
     let mut by_id = HashMap::<String, DesktopEntryTarget>::new();
+    let mut seen_ids = HashSet::<String>::new();
     for data_directory in data_directories {
         let applications = data_directory.join("applications");
         for (desktop_id, path) in desktop_entry_paths(&applications)? {
             let key = desktop_id.to_ascii_lowercase();
-            if by_id.contains_key(&key) {
+            if !seen_ids.insert(key.clone()) {
                 continue;
             }
-            if let Some(entry) = parse_desktop_entry(&path, desktop_id)? {
+            if let Some(entry) = parse_desktop_entry(&path, desktop_id, context)? {
                 by_id.insert(key, entry);
             }
-            if by_id.len() > MAX_DESKTOP_ENTRIES {
+            if seen_ids.len() > MAX_DESKTOP_ENTRIES {
                 return Err(LinuxDesktopError::new(
                     "DESKTOP_ENTRY_LIMIT_EXCEEDED",
                     "The XDG application registry exceeds the bounded resolver limit.",
@@ -394,27 +466,9 @@ fn resolve_desktop_entry_in(
 }
 
 fn xdg_data_directories() -> Result<Vec<PathBuf>, LinuxDesktopError> {
-    let home = absolute_home_directory()?;
-    let mut directories = vec![absolute_environment_path(env::var_os("XDG_DATA_HOME"))
-        .unwrap_or_else(|| home.join(".local/share"))];
-    let system = env::var("XDG_DATA_DIRS")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
-    let mut system_directories = system
-        .split(':')
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .collect::<Vec<_>>();
-    if system_directories.is_empty() {
-        system_directories = vec![
-            PathBuf::from("/usr/local/share"),
-            PathBuf::from("/usr/share"),
-        ];
-    }
-    directories.extend(system_directories);
-    Ok(directories)
+    LinuxPaths::discover()
+        .map(|paths| paths.data_directories().to_vec())
+        .map_err(|message| LinuxDesktopError::new("XDG_PATHS_UNAVAILABLE", message, false))
 }
 
 fn desktop_entry_paths(root: &Path) -> Result<Vec<(String, PathBuf)>, LinuxDesktopError> {
@@ -488,6 +542,7 @@ fn desktop_entry_paths(root: &Path) -> Result<Vec<(String, PathBuf)>, LinuxDeskt
 fn parse_desktop_entry(
     path: &Path,
     desktop_id: String,
+    context: &DesktopEntryContext,
 ) -> Result<Option<DesktopEntryTarget>, LinuxDesktopError> {
     let metadata = fs::metadata(path).map_err(|error| {
         LinuxDesktopError::new(
@@ -508,6 +563,7 @@ fn parse_desktop_entry(
     })?;
     let mut in_desktop_entry = false;
     let mut values = HashMap::<String, String>::new();
+    let mut duplicate_key = false;
     for line in content.lines() {
         let line = line.trim();
         if line.starts_with('[') && line.ends_with(']') {
@@ -518,35 +574,142 @@ fn parse_desktop_entry(
             continue;
         }
         if let Some((key, value)) = line.split_once('=') {
-            values
-                .entry(key.to_string())
-                .or_insert_with(|| value.trim().to_string());
+            if values
+                .insert(key.to_string(), value.trim().to_string())
+                .is_some()
+            {
+                duplicate_key = true;
+            }
         }
     }
-    if values
-        .get("Type")
-        .is_some_and(|value| value != "Application")
+    if duplicate_key
+        || values.get("Type").map(String::as_str) != Some("Application")
         || values.get("Hidden").is_some_and(|value| value == "true")
+        || values.get("NoDisplay").is_some_and(|value| value == "true")
+        || values.get("OnlyShowIn").is_some_and(|value| {
+            !desktop_list(value).any(|desktop| context.current_desktops.contains(desktop))
+        })
+        || values.get("NotShowIn").is_some_and(|value| {
+            desktop_list(value).any(|desktop| context.current_desktops.contains(desktop))
+        })
+        || values.get("TryExec").is_some_and(|value| {
+            !desktop_try_exec_available(value, context.executable_path.as_deref())
+        })
     {
         return Ok(None);
     }
-    let Some(name) = values.get("Name").filter(|value| !value.trim().is_empty()) else {
+    let Some(default_name) = values.get("Name").filter(|value| !value.trim().is_empty()) else {
         return Ok(None);
     };
+    let name = context
+        .locale_candidates
+        .iter()
+        .find_map(|locale| values.get(&format!("Name[{locale}]")))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(default_name);
     Ok(Some(DesktopEntryTarget {
         desktop_id,
-        name: name.clone(),
+        name: unescape_desktop_string(name),
+        path: path.to_path_buf(),
     }))
 }
 
+fn desktop_list(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+}
+
+fn locale_candidates(locale: Option<&str>) -> Vec<String> {
+    let Some(locale) = locale.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Vec::new();
+    };
+    if locale == "C" || locale == "POSIX" {
+        return Vec::new();
+    }
+    let normalized = locale.split_once('.').map_or_else(
+        || locale.to_string(),
+        |(prefix, suffix)| {
+            suffix.split_once('@').map_or_else(
+                || prefix.to_string(),
+                |(_, modifier)| format!("{prefix}@{modifier}"),
+            )
+        },
+    );
+    let without_encoding = normalized.as_str();
+    let (base, modifier) = without_encoding
+        .split_once('@')
+        .map_or((without_encoding, None), |(base, modifier)| {
+            (base, Some(modifier))
+        });
+    let (language, country) = base
+        .split_once('_')
+        .map_or((base, None), |(language, country)| {
+            (language, Some(country))
+        });
+    let mut candidates = Vec::new();
+    if let (Some(country), Some(modifier)) = (country, modifier) {
+        candidates.push(format!("{language}_{country}@{modifier}"));
+    }
+    if let Some(country) = country {
+        candidates.push(format!("{language}_{country}"));
+    }
+    if let Some(modifier) = modifier {
+        candidates.push(format!("{language}@{modifier}"));
+    }
+    candidates.push(language.to_string());
+    candidates.dedup();
+    candidates
+}
+
+fn unescape_desktop_string(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            result.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('s') => result.push(' '),
+            Some('n') => result.push('\n'),
+            Some('t') => result.push('\t'),
+            Some('r') => result.push('\r'),
+            Some('\\') => result.push('\\'),
+            Some(other) => {
+                result.push('\\');
+                result.push(other);
+            }
+            None => result.push('\\'),
+        }
+    }
+    result
+}
+
+fn desktop_try_exec_available(value: &str, path: Option<&OsStr>) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let candidate = Path::new(value);
+    if candidate.is_absolute() {
+        is_executable_file(candidate)
+    } else if candidate.components().count() == 1 {
+        find_in_path_value(value, path).is_some()
+    } else {
+        false
+    }
+}
+
 fn resolve_standard_folder(folder: &StandardFolder) -> Result<PathBuf, LinuxDesktopError> {
-    let home = absolute_home_directory()?;
+    let paths = LinuxPaths::discover()
+        .map_err(|message| LinuxDesktopError::new("XDG_PATHS_UNAVAILABLE", message, false))?;
+    let home = paths.home().to_path_buf();
     if folder == &StandardFolder::Home {
         return ensure_standard_folder(home, folder);
     }
-    let config_home = absolute_environment_path(env::var_os("XDG_CONFIG_HOME"))
-        .unwrap_or_else(|| home.join(".config"));
-    let config_path = config_home.join("user-dirs.dirs");
+    let config_path = paths.config_home().join("user-dirs.dirs");
     let metadata = fs::metadata(&config_path).map_err(|_| {
         LinuxDesktopError::new(
             "XDG_USER_DIRS_UNAVAILABLE",
@@ -1108,6 +1271,7 @@ fn path_sha256(path: &Path) -> String {
     sha256_hex(path.to_string_lossy().as_bytes())
 }
 
+#[cfg(test)]
 fn absolute_environment_path(value: Option<OsString>) -> Option<PathBuf> {
     value
         .filter(|value| !value.is_empty())
@@ -1115,23 +1279,33 @@ fn absolute_environment_path(value: Option<OsString>) -> Option<PathBuf> {
         .filter(|path| path.is_absolute())
 }
 
-fn absolute_home_directory() -> Result<PathBuf, LinuxDesktopError> {
-    absolute_environment_path(env::var_os("HOME")).ok_or_else(|| {
-        LinuxDesktopError::new(
-            "HOME_UNAVAILABLE",
-            "The absolute home directory is unavailable for XDG resolution.",
-            false,
-        )
+fn find_in_path(binary: &str) -> Option<PathBuf> {
+    find_in_path_value(binary, env::var_os("PATH").as_deref())
+}
+
+fn find_in_path_value(binary: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    path.and_then(|path| {
+        env::split_paths(path)
+            .filter(|directory| directory.is_absolute())
+            .map(|directory| directory.join(binary))
+            .find(|candidate| is_executable_file(candidate))
     })
 }
 
-fn find_in_path(binary: &str) -> Option<PathBuf> {
-    env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path)
-            .filter(|directory| directory.is_absolute())
-            .map(|directory| directory.join(binary))
-            .find(|candidate| candidate.is_file())
-    })
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    true
 }
 
 #[cfg(test)]
@@ -1155,11 +1329,14 @@ mod tests {
         }
 
         fn desktop_entry(&self, id: &str, name: &str) {
-            fs::write(
-                self.0.join("applications").join(id),
-                format!("[Desktop Entry]\nType=Application\nName={name}\nExec=/bin/true\n"),
-            )
-            .unwrap();
+            self.desktop_entry_content(
+                id,
+                &format!("[Desktop Entry]\nType=Application\nName={name}\nExec=/bin/true\n"),
+            );
+        }
+
+        fn desktop_entry_content(&self, id: &str, content: &str) {
+            fs::write(self.0.join("applications").join(id), content).unwrap();
         }
     }
 
@@ -1219,6 +1396,116 @@ mod tests {
         assert_eq!(
             absolute_environment_path(Some(OsString::from("/absolute/path"))).unwrap(),
             PathBuf::from("/absolute/path")
+        );
+    }
+
+    #[test]
+    fn task_0016_desktop_entries_honor_locale_visibility_and_tombstones() {
+        let user = FixtureDirectory::new();
+        let system = FixtureDirectory::new();
+        user.desktop_entry_content(
+            "org.example.Hidden.desktop",
+            "[Desktop Entry]\nType=Application\nName=Hidden override\nHidden=true\n",
+        );
+        system.desktop_entry("org.example.Hidden.desktop", "System fallback");
+        user.desktop_entry_content(
+            "org.example.Localized.desktop",
+            "[Desktop Entry]\nType=Application\nName=Editor\nName[nl]=Bewerker\\sLokaal\nOnlyShowIn=KDE;\nExec=/bin/true\n",
+        );
+        user.desktop_entry_content(
+            "org.example.NoDisplay.desktop",
+            "[Desktop Entry]\nType=Application\nName=Private app\nNoDisplay=true\n",
+        );
+        user.desktop_entry_content(
+            "org.example.OtherDesktop.desktop",
+            "[Desktop Entry]\nType=Application\nName=Other desktop\nOnlyShowIn=GNOME;\n",
+        );
+        let context = DesktopEntryContext {
+            locale_candidates: locale_candidates(Some("nl_NL.UTF-8")),
+            current_desktops: HashSet::from(["KDE".to_string()]),
+            executable_path: Some(OsString::from("/usr/bin:/bin")),
+        };
+
+        let localized = resolve_desktop_entry_in_context(
+            "Bewerker Lokaal",
+            &[user.0.clone(), system.0.clone()],
+            &context,
+        )
+        .unwrap();
+        assert_eq!(localized.desktop_id, "org.example.Localized.desktop");
+        assert_eq!(
+            localized.path,
+            user.0
+                .join("applications")
+                .join("org.example.Localized.desktop")
+        );
+        for unavailable in [
+            "org.example.Hidden",
+            "org.example.NoDisplay",
+            "org.example.OtherDesktop",
+        ] {
+            assert_eq!(
+                resolve_desktop_entry_in_context(
+                    unavailable,
+                    &[user.0.clone(), system.0.clone()],
+                    &context,
+                )
+                .unwrap_err()
+                .code,
+                "APPLICATION_NOT_FOUND"
+            );
+        }
+    }
+
+    #[test]
+    fn task_0016_desktop_entries_enforce_try_exec_and_locale_fallback_order() {
+        let user = FixtureDirectory::new();
+        let binaries = user.0.join("bin");
+        fs::create_dir_all(&binaries).unwrap();
+        let executable = binaries.join("available-app");
+        fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        user.desktop_entry_content(
+            "org.example.Available.desktop",
+            "[Desktop Entry]\nType=Application\nName=Default\nName[sr]=Jezik\nName[sr_RS]=Jezik Srbija\nName[sr_RS@latin]=Jezik Latinica\nTryExec=available-app\n",
+        );
+        user.desktop_entry_content(
+            "org.example.Missing.desktop",
+            "[Desktop Entry]\nType=Application\nName=Missing\nTryExec=missing-app\n",
+        );
+        let context = DesktopEntryContext {
+            locale_candidates: locale_candidates(Some("sr_RS.UTF-8@latin")),
+            current_desktops: HashSet::new(),
+            executable_path: Some(binaries.into_os_string()),
+        };
+
+        assert_eq!(
+            context.locale_candidates,
+            ["sr_RS@latin", "sr_RS", "sr@latin", "sr"]
+        );
+        assert_eq!(
+            resolve_desktop_entry_in_context(
+                "Jezik Latinica",
+                std::slice::from_ref(&user.0),
+                &context,
+            )
+            .unwrap()
+            .desktop_id,
+            "org.example.Available.desktop"
+        );
+        assert_eq!(
+            resolve_desktop_entry_in_context(
+                "org.example.Missing",
+                std::slice::from_ref(&user.0),
+                &context,
+            )
+            .unwrap_err()
+            .code,
+            "APPLICATION_NOT_FOUND"
         );
     }
 

@@ -249,6 +249,12 @@ export function VoiceControlPage({
       setIsListening(status.listening);
       setMessage(status.message);
     });
+    const unlistenDesktopControl = desktopClient.onDesktopControlStatus(
+      (status) => {
+        setDesktopControl(status);
+        setMessage(status.message);
+      },
+    );
     const unlistenTranscript = desktopClient.onVoiceTranscript((event) => {
       const { kind, transcript } = event;
       if (kind === "activated") {
@@ -299,6 +305,15 @@ export function VoiceControlPage({
         setMessage("Lucy is listening for your command.");
         return;
       }
+      if (kind === "transcribing") {
+        setVoiceUiState("PROCESSING");
+        setMessage("The optional local high-accuracy engine is transcribing.");
+        return;
+      }
+      if (kind === "warning") {
+        setMessage(transcript);
+        return;
+      }
       if (kind === "ready") {
         setIsListening(true);
         setVoiceState("VOICE_PASSIVE");
@@ -330,6 +345,7 @@ export function VoiceControlPage({
     return () => {
       active = false;
       void unlistenStatus.then((unlisten) => unlisten());
+      void unlistenDesktopControl.then((unlisten) => unlisten());
       void unlistenTranscript.then((unlisten) => unlisten());
     };
   }, []);
@@ -434,11 +450,10 @@ export function VoiceControlPage({
         agentId: pcAgent.id,
       });
       if (!authorization) return;
-      await desktopClient.installVoiceRuntime(pcAgent.id);
+      const status = await desktopClient.installVoiceRuntime(pcAgent.id);
       markApprovalConsumed(setApprovalRequests, authorization.approval);
-      setMessage(
-        "Downloading the local speech model. Keep the app open until installation finishes.",
-      );
+      setVoiceRuntime(status);
+      setMessage(status.message);
     } catch (error) {
       setMessage(errorMessage(error));
     }
@@ -455,11 +470,25 @@ export function VoiceControlPage({
         agentId: pcAgent.id,
       });
       if (!authorization) return;
-      await desktopClient.installHighAccuracyVoiceRuntime(pcAgent.id);
-      markApprovalConsumed(setApprovalRequests, authorization.approval);
-      setMessage(
-        "Building the high-accuracy speech engine and downloading its local model. This can take several minutes.",
+      const status = await desktopClient.installHighAccuracyVoiceRuntime(
+        pcAgent.id,
       );
+      markApprovalConsumed(setApprovalRequests, authorization.approval);
+      setVoiceRuntime(status);
+      setMessage(status.message);
+    } catch (error) {
+      setMessage(errorMessage(error));
+    }
+  }
+
+  async function cancelVoiceInstall() {
+    if (!voiceRuntime?.operationId) return;
+    try {
+      const status = await desktopClient.cancelVoiceRuntimeInstall(
+        voiceRuntime.operationId,
+      );
+      setVoiceRuntime(status);
+      setMessage(status.message);
     } catch (error) {
       setMessage(errorMessage(error));
     }
@@ -487,6 +516,16 @@ export function VoiceControlPage({
     }
   }
 
+  async function disableDesktopControl() {
+    try {
+      const status = await desktopClient.disableDesktopControl();
+      setDesktopControl(status);
+      setMessage(status.message);
+    } catch (error) {
+      setMessage(errorMessage(error));
+    }
+  }
+
   function startListening() {
     if (isDesktopRuntime()) {
       if (!pcAgent) {
@@ -500,13 +539,14 @@ export function VoiceControlPage({
         if (!authorization) return;
         void desktopClient
           .startVoiceListener(pcAgent.id)
-          .then(() => {
+          .then((status) => {
             markApprovalConsumed(
               setApprovalRequests,
               authorization.approval,
             );
+            setVoiceRuntime(status);
             setVoiceUiState("PROCESSING");
-            setMessage("Starting Lucy's microphone listener...");
+            setMessage(status.message);
           })
           .catch((error) => {
             setIsListening(false);
@@ -550,7 +590,11 @@ export function VoiceControlPage({
     if (isDesktopRuntime()) {
       void desktopClient
         .stopVoiceListener()
-        .then(() => setIsListening(false))
+        .then((status) => {
+          setVoiceRuntime(status);
+          setIsListening(false);
+          setMessage(status.message);
+        })
         .catch((error) => setMessage(errorMessage(error)));
       return;
     }
@@ -565,6 +609,9 @@ export function VoiceControlPage({
         : pcAgent?.capabilities.system === "notifications"
           ? "Minor system permission"
           : "No system permission";
+  const voiceInstallActive =
+    voiceRuntime?.installState === "installing" ||
+    voiceRuntime?.installState === "cancelling";
 
   return (
     <div hidden={!visible}>
@@ -633,8 +680,11 @@ export function VoiceControlPage({
               <button
                 className="secondary-button"
                 onClick={() => void installOfflineVoice()}
+                disabled={voiceInstallActive}
               >
-                Install offline voice engine
+                {voiceInstallActive
+                  ? "Voice installation active"
+                  : "Install offline voice engine"}
               </button>
             )}
             {isDesktopRuntime() &&
@@ -643,10 +693,20 @@ export function VoiceControlPage({
                 <button
                   className="secondary-button"
                   onClick={() => void installHighAccuracyVoice()}
+                  disabled={voiceInstallActive}
                 >
                   Install high-accuracy voice
                 </button>
               )}
+            {isDesktopRuntime() && voiceRuntime?.canCancel && (
+              <button
+                className="secondary-button"
+                onClick={() => void cancelVoiceInstall()}
+                disabled={!voiceRuntime.operationId}
+              >
+                Cancel voice installation
+              </button>
+            )}
             {isDesktopRuntime() && (
               <button
                 className="secondary-button"
@@ -670,7 +730,11 @@ export function VoiceControlPage({
             <button
               className="primary-button microphone-button"
               onClick={isListening ? stopListening : startListening}
-              disabled={!preferences.voiceControlMasterEnabled}
+              disabled={
+                !preferences.voiceControlMasterEnabled ||
+                (isDesktopRuntime() &&
+                  (!voiceRuntime?.installed || voiceInstallActive))
+              }
             >
               <span
                 className={`microphone-indicator ${
@@ -738,12 +802,20 @@ export function VoiceControlPage({
             Enable KDE desktop input
           </button>
         )}
+        {isDesktopRuntime() && desktopControl?.enabled && (
+          <button
+            className="secondary-button"
+            onClick={() => void disableDesktopControl()}
+          >
+            Disable KDE desktop input
+          </button>
+        )}
         {isDesktopRuntime() && voiceRuntime && (
           <p className="form-hint">
             {voiceRuntime.message}
             {voiceRuntime.highAccuracyAvailable
               ? " Whisper base.en transcribes commands after Lucy wakes."
-              : " Install high-accuracy voice for a broader command vocabulary."}
+              : " The Vosk base engine remains available; high accuracy is optional."}
             {preferences.backgroundVoiceEnabled &&
             preferences.voiceControlMasterEnabled
               ? " Lucy waits for its wake phrase while this app is in the tray."

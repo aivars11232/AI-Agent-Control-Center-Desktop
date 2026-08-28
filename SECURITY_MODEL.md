@@ -22,8 +22,10 @@
 > durable-state authority into the WebView. TASK-0014 adds strict portable
 > backup, bounded retention, and revision-bound monitoring. TASK-0015 adds the
 > canonical backend voice/system-action policy, exact-target, approval, and
-> redacted-audit boundary; later tasks still own offline/runtime integration,
-> packaging, and live acceptance.
+> redacted-audit boundary. TASK-0016 adds pinned staged offline releases,
+> bounded local-audio/listener handling, private XDG paths, exact install
+> cancellation, and lifecycle-safe capability-bound KDE portal sessions;
+> later tasks still own packaging and live acceptance.
 
 ## Security objective
 
@@ -268,9 +270,10 @@ event listeners behind a typed desktop client, but the backend remains the
 authority and persistence keeps its revision-aware injected invoke boundary.
 TASK-0015 removes the direct renderer application/window/input command surface
 and exposes one typed gateway plus a read-only redacted audit query. TASK-0016
-owns offline listener/portal integration reliability; TASK-0019 owns mandatory
-dependency/CI gates; TASK-0020 owns installed and packaged platform acceptance.
-Current source tests do not replace those later live gates.
+implements deterministic offline listener/portal integration reliability;
+TASK-0019 owns mandatory dependency/CI gates; TASK-0020 owns live installed and
+packaged platform acceptance. Current source tests do not replace those later
+live gates.
 
 ### Heuristic task-text checks
 
@@ -393,16 +396,23 @@ desktop-control workarounds:
   [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir/0.8/)
   for launch metadata and user-local data/config placement.
 
-TASK-0015 now uses XDG desktop-entry/base-directory data, configured
-<code>user-dirs.dirs</code>, KWin scripts with exact IDs, and the existing
+TASK-0015 and TASK-0016 use XDG desktop-entry/base-directory data, configured
+<code>user-dirs.dirs</code>, KWin scripts with exact IDs, and a backend-owned
 RemoteDesktop portal session for bounded input. Relative XDG/PATH inputs are
-ignored and configured folder paths are target-bound only by SHA-256; KWin
+ignored; localized names, precedence/tombstones, visibility, and
+<code>TryExec</code> are enforced; configured folder paths are target-bound
+only by SHA-256; KWin
 executes only the returned per-script object and reports through
 a token-bound callback authenticated to KWin's current D-Bus owner, rather
-than the broad all-scripts start method or journal/log parsing.
+than the broad all-scripts start method or journal/log parsing. The portal
+observes native session closure, offers explicit close, binds its generation
+to the exact active Full PC Control agent, and closes after partial grants or
+unconfirmed pressed-input cleanup. Its restore token and listener
+configuration use private atomic files. Base audio stays in memory; optional
+high-accuracy WAV files are mode 0600 and removed on every tested exit path.
 Deterministic tests establish the checked-in fail-closed contracts, not live
-KDE compatibility. TASK-0016 and TASK-0020 retain runtime and packaged
-acceptance. If a native mechanism cannot satisfy a bounded requirement, the
+KDE compatibility. TASK-0020 retains runtime and packaged acceptance. If a
+native mechanism cannot satisfy a bounded requirement, the
 owning Phase A plan must document the constraint and compare least-privilege
 workarounds before any code change.
 

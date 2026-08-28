@@ -3,7 +3,9 @@ mod app_state;
 mod authorization;
 mod codex_runtime;
 mod data_lifecycle;
+mod desktop_control;
 mod linux_desktop;
+mod linux_paths;
 mod ollama_runtime;
 mod persistence;
 mod policy;
@@ -12,6 +14,7 @@ mod review_orchestration;
 mod run_coordinator;
 mod system_actions;
 mod task_orchestration;
+mod voice_runtime;
 mod workspace_evidence;
 mod workspace_tools;
 
@@ -69,11 +72,11 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     env, fs,
-    io::{BufRead, BufReader},
+    io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -91,6 +94,11 @@ use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, State, WindowEvent,
+};
+use voice_runtime::{
+    base_release_ready, cleanup_stage, drain_bounded, ensure_private_directory, high_release_ready,
+    prepare_install, promote_install, write_private_atomic, InstallKind, VoiceRuntime,
+    VoiceRuntimePaths,
 };
 use workspace_evidence::{WorkspaceChangeEvidenceV1, WorkspaceEvidenceBaseline};
 use workspace_tools::{ollama_workspace_tools, WorkspaceTools};
@@ -128,19 +136,148 @@ struct ActiveRuns {
     runs: Arc<Mutex<HashMap<String, ActiveRunEntry>>>,
 }
 
-#[derive(Default)]
-struct VoiceListener {
-    child: Mutex<Option<Child>>,
-}
-
 struct DesktopControlSession {
     portal: RemoteDesktop,
     session: Session<RemoteDesktop>,
+    agent_id: i64,
+    generation: u64,
 }
 
-#[derive(Default)]
+struct DesktopControlRegistry {
+    session: Option<Arc<DesktopControlSession>>,
+    lifecycle: String,
+    message: String,
+}
+
+impl Default for DesktopControlRegistry {
+    fn default() -> Self {
+        Self {
+            session: None,
+            lifecycle: "disabled".to_string(),
+            message: "Enable KDE desktop input before using voice pointer commands. KDE will ask you to approve this permission."
+                .to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
 struct DesktopControl {
-    session: Mutex<Option<Arc<DesktopControlSession>>>,
+    registry: Arc<Mutex<DesktopControlRegistry>>,
+    next_generation: Arc<AtomicU64>,
+}
+
+impl DesktopControl {
+    fn session(&self) -> Result<Option<Arc<DesktopControlSession>>, String> {
+        self.registry
+            .lock()
+            .map(|registry| registry.session.clone())
+            .map_err(|_| "The desktop control registry is unavailable.".to_string())
+    }
+
+    fn status(&self) -> Result<DesktopControlStatus, String> {
+        let registry = self
+            .registry
+            .lock()
+            .map_err(|_| "The desktop control registry is unavailable.".to_string())?;
+        Ok(DesktopControlStatus {
+            enabled: registry.session.is_some() && registry.lifecycle == "enabled",
+            state: registry.lifecycle.clone(),
+            message: registry.message.clone(),
+        })
+    }
+
+    fn begin_start(&self) -> Result<bool, String> {
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| "The desktop control registry is unavailable.".to_string())?;
+        if registry.session.is_some() {
+            return Ok(false);
+        }
+        if matches!(registry.lifecycle.as_str(), "starting" | "stopping") {
+            return Err(
+                "DESKTOP_CONTROL_BUSY: A KDE desktop-input lifecycle change is already active."
+                    .to_string(),
+            );
+        }
+        registry.lifecycle = "starting".to_string();
+        registry.message =
+            "Waiting for KDE to approve exact keyboard and pointer access…".to_string();
+        Ok(true)
+    }
+
+    fn fail_start(&self, message: impl Into<String>) {
+        if let Ok(mut registry) = self.registry.lock() {
+            if registry.session.is_none() && registry.lifecycle == "starting" {
+                registry.lifecycle = "failed".to_string();
+                registry.message = message.into();
+            }
+        }
+    }
+
+    fn set_lifecycle(&self, lifecycle: &str, message: impl Into<String>) {
+        if let Ok(mut registry) = self.registry.lock() {
+            registry.lifecycle = lifecycle.to_string();
+            registry.message = message.into();
+        }
+    }
+
+    fn install_session(&self, session: Arc<DesktopControlSession>) -> Result<(), String> {
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| "The desktop control registry is unavailable.".to_string())?;
+        if registry.session.is_some() || registry.lifecycle != "starting" {
+            return Err(
+                "DESKTOP_CONTROL_START_CANCELLED: The KDE desktop-input request is no longer current."
+                    .to_string(),
+            );
+        }
+        registry.session = Some(session);
+        registry.lifecycle = "enabled".to_string();
+        registry.message =
+            "KDE desktop input permission is active for the exact Full PC Control agent."
+                .to_string();
+        Ok(())
+    }
+
+    fn take_session(
+        &self,
+        lifecycle: &str,
+        message: impl Into<String>,
+    ) -> Option<Arc<DesktopControlSession>> {
+        let mut registry = self.registry.lock().ok()?;
+        let session = registry.session.take();
+        registry.lifecycle = lifecycle.to_string();
+        registry.message = message.into();
+        session
+    }
+
+    fn clear_generation(
+        &self,
+        generation: u64,
+        lifecycle: &str,
+        message: impl Into<String>,
+    ) -> bool {
+        let Ok(mut registry) = self.registry.lock() else {
+            return false;
+        };
+        if !registry
+            .session
+            .as_ref()
+            .is_some_and(|session| session.generation == generation)
+        {
+            return false;
+        }
+        registry.session = None;
+        registry.lifecycle = lifecycle.to_string();
+        registry.message = message.into();
+        true
+    }
+
+    fn next_generation(&self) -> u64 {
+        self.next_generation.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 #[derive(Serialize)]
@@ -253,11 +390,15 @@ struct VoiceRuntimeStatus {
     installed: bool,
     listening: bool,
     high_accuracy_available: bool,
+    install_state: String,
+    listener_state: String,
+    operation_id: Option<String>,
+    can_cancel: bool,
     message: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct VoiceListenerConfig {
     wake_phrase: String,
     deactivate_phrase: String,
@@ -266,6 +407,7 @@ struct VoiceListenerConfig {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VoiceTranscriptEvent {
     kind: String,
     transcript: String,
@@ -275,6 +417,7 @@ struct VoiceTranscriptEvent {
 #[serde(rename_all = "camelCase")]
 struct DesktopControlStatus {
     enabled: bool,
+    state: String,
     message: String,
 }
 
@@ -328,14 +471,8 @@ fn open_voice_control(app: &AppHandle) {
     let _ = app.emit("voice-control-open", ());
 }
 
-fn voice_runtime_data_dir() -> Result<PathBuf, String> {
-    let home = env::var_os("HOME")
-        .ok_or_else(|| "Could not find the home directory for the voice runtime.".to_string())?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("ai-agent-control-center")
-        .join("voice-runtime"))
+fn voice_runtime_paths() -> Result<VoiceRuntimePaths, String> {
+    VoiceRuntimePaths::discover()
 }
 
 fn voice_runtime_file(app: &AppHandle, file_name: &str) -> Result<PathBuf, String> {
@@ -363,42 +500,19 @@ fn voice_runtime_file(app: &AppHandle, file_name: &str) -> Result<PathBuf, Strin
     }
 }
 
-fn voice_model_dir() -> Result<PathBuf, String> {
-    Ok(voice_runtime_data_dir()?
-        .join("models")
-        .join("vosk-model-small-en-us-0.15"))
-}
-
 fn voice_runtime_installed() -> Result<bool, String> {
-    Ok(voice_model_dir()?.is_dir()
-        && voice_runtime_data_dir()?
-            .join(".openwakeword-silero-ready")
-            .is_file())
-}
-
-fn voice_runtime_upgrade_ready() -> Result<bool, String> {
-    Ok(voice_runtime_data_dir()?
-        .join(".openwakeword-silero-ready")
-        .is_file())
-}
-
-fn whisper_binary() -> Result<PathBuf, String> {
-    Ok(voice_runtime_data_dir()?.join("whisper-cli"))
-}
-
-fn whisper_model() -> Result<PathBuf, String> {
-    Ok(voice_runtime_data_dir()?
-        .join("models")
-        .join("ggml-base.en.bin"))
+    Ok(base_release_ready(
+        &voice_runtime_paths()?.base_release_directory(),
+    ))
 }
 
 fn high_accuracy_voice_available() -> bool {
-    whisper_binary().is_ok_and(|binary| binary.is_file())
-        && whisper_model().is_ok_and(|model| model.is_file())
+    voice_runtime_paths()
+        .is_ok_and(|paths| high_release_ready(&paths.high_release_directory(), false))
 }
 
 fn voice_listener_config_file() -> Result<PathBuf, String> {
-    Ok(voice_runtime_data_dir()?.join("listener-config.json"))
+    Ok(voice_runtime_paths()?.listener_config())
 }
 
 fn normalize_voice_phrase(value: String, fallback: &str) -> String {
@@ -438,18 +552,9 @@ fn save_voice_listener_config_file(config: VoiceListenerConfig) -> Result<(), St
         ),
     };
     let config_file = voice_listener_config_file()?;
-    let directory = config_file
-        .parent()
-        .ok_or_else(|| "Could not create the Lucy configuration directory.".to_string())?;
-    fs::create_dir_all(directory)
-        .map_err(|error| format!("Could not save Lucy configuration: {error}"))?;
     let contents = serde_json::to_string(&config)
         .map_err(|error| format!("Could not encode Lucy configuration: {error}"))?;
-    let temporary_file = config_file.with_extension("json.tmp");
-    fs::write(&temporary_file, contents)
-        .map_err(|error| format!("Could not save Lucy configuration: {error}"))?;
-    fs::rename(&temporary_file, config_file)
-        .map_err(|error| format!("Could not activate the Lucy configuration: {error}"))
+    write_private_atomic(&config_file, contents.as_bytes())
 }
 
 fn ensure_voice_listener_config() -> Result<PathBuf, String> {
@@ -472,11 +577,15 @@ fn ensure_voice_listener_config() -> Result<PathBuf, String> {
 }
 
 fn desktop_control_token_file() -> Result<PathBuf, String> {
-    Ok(voice_runtime_data_dir()?.join("desktop-control-restore-token"))
+    Ok(voice_runtime_paths()?.desktop_control_token())
 }
 
 fn saved_desktop_control_token() -> Option<String> {
     let token_file = desktop_control_token_file().ok()?;
+    let metadata = fs::symlink_metadata(&token_file).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 4_096 {
+        return None;
+    }
     fs::read_to_string(token_file)
         .ok()
         .map(|token| token.trim().to_string())
@@ -484,63 +593,88 @@ fn saved_desktop_control_token() -> Option<String> {
 }
 
 fn save_desktop_control_token(token: &str) -> Result<(), String> {
+    if token.is_empty() || token.len() > 4_096 || token.chars().any(char::is_control) {
+        return Err(
+            "DESKTOP_CONTROL_TOKEN_INVALID: KDE returned an invalid restore token.".to_string(),
+        );
+    }
     let token_file = desktop_control_token_file()?;
-    let directory = token_file
-        .parent()
-        .ok_or_else(|| "Could not create the desktop input settings directory.".to_string())?;
-    fs::create_dir_all(directory)
-        .map_err(|error| format!("Could not save desktop input permission: {error}"))?;
-    fs::write(token_file, token)
-        .map_err(|error| format!("Could not save desktop input permission: {error}"))
+    write_private_atomic(&token_file, token.as_bytes())
 }
 
-fn listener_is_running(listener: &VoiceListener) -> Result<bool, String> {
-    let mut child = listener
-        .child
-        .lock()
-        .map_err(|_| "The voice listener registry is unavailable.".to_string())?;
-    let Some(process) = child.as_mut() else {
-        return Ok(false);
-    };
-    match process
-        .try_wait()
-        .map_err(|error| format!("Could not inspect the voice listener: {error}"))?
-    {
-        Some(_) => {
-            *child = None;
-            Ok(false)
-        }
-        None => Ok(true),
+fn remove_desktop_control_token() -> Result<(), String> {
+    let token_file = desktop_control_token_file()?;
+    match fs::remove_file(token_file) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(
+            "DESKTOP_CONTROL_TOKEN_REMOVE_FAILED: Could not remove the private restore token."
+                .to_string(),
+        ),
     }
 }
 
-fn stop_voice_listener_process(listener: &VoiceListener) {
-    let child = listener
-        .child
-        .lock()
-        .ok()
-        .and_then(|mut active_child| active_child.take());
-    if let Some(mut process) = child {
-        let _ = process.kill();
-        let _ = process.wait();
+fn emit_desktop_control_status(app: &AppHandle, desktop_control: &DesktopControl) {
+    if let Ok(status) = desktop_control.status() {
+        let _ = app.emit("desktop-control-status", status);
     }
 }
 
-fn emit_voice_runtime_status(
-    app: &AppHandle,
-    installed: bool,
-    listening: bool,
-    message: impl Into<String>,
+async fn close_desktop_control_generation(
+    desktop_control: &DesktopControl,
+    active_session: &Arc<DesktopControlSession>,
+    lifecycle: &str,
+    message: &str,
+    remove_token: bool,
 ) {
-    let _ = app.emit(
-        "voice-runtime-status",
-        VoiceRuntimeStatus {
-            installed,
-            listening,
-            high_accuracy_available: high_accuracy_voice_available(),
-            message: message.into(),
-        },
-    );
+    let cleared =
+        desktop_control.clear_generation(active_session.generation, lifecycle, message.to_string());
+    let _ = active_session.session.close().await;
+    if cleared && remove_token {
+        let _ = remove_desktop_control_token();
+    }
+}
+
+fn voice_runtime_status_value(runtime: &VoiceRuntime) -> Result<VoiceRuntimeStatus, String> {
+    let installed = voice_runtime_installed()?;
+    let listening = runtime.listener_is_running()?;
+    let snapshot = runtime.snapshot()?;
+    let install_state = if snapshot.operation_id.is_some() {
+        snapshot.install_state.clone()
+    } else if snapshot.install_state == "failed" {
+        "failed".to_string()
+    } else if installed {
+        "ready".to_string()
+    } else {
+        "missing".to_string()
+    };
+    let message = if snapshot.operation_id.is_some()
+        || snapshot.listener_state != "stopped"
+        || snapshot.install_state == "failed"
+    {
+        snapshot.message.clone()
+    } else if !installed {
+        "Offline voice is not installed. Select Install offline voice engine to download the pinned local model."
+            .to_string()
+    } else {
+        "Offline voice is installed and ready to start.".to_string()
+    };
+    Ok(VoiceRuntimeStatus {
+        installed,
+        listening,
+        high_accuracy_available: high_accuracy_voice_available(),
+        install_state,
+        listener_state: snapshot.listener_state,
+        operation_id: snapshot.operation_id,
+        can_cancel: snapshot.can_cancel,
+        message,
+    })
+}
+
+fn emit_voice_runtime_status(app: &AppHandle, runtime: &VoiceRuntime) {
+    if let Ok(status) = voice_runtime_status_value(runtime) {
+        let _ = app.emit("voice-runtime-status", status);
+    }
 }
 
 pub fn remove_stored_credentials_for_uninstall() {
@@ -1982,6 +2116,7 @@ async fn execute_portal_action(
     runtime_directory: &Path,
     execution: &linux_desktop::DesktopExecution,
     desktop_control: &DesktopControl,
+    agent_id: i64,
 ) -> Result<bool, GatewayExecutionError> {
     use linux_desktop::DesktopExecution;
     let (window_id, input_kind) = match execution {
@@ -1991,8 +2126,7 @@ async fn execute_portal_action(
         _ => return Ok(false),
     };
     let active_session = desktop_control
-        .session
-        .lock()
+        .session()
         .map_err(|_| GatewayExecutionError {
             error: gateway_persistence_error(
                 "DESKTOP_CONTROL_UNAVAILABLE",
@@ -2001,7 +2135,6 @@ async fn execute_portal_action(
             ),
             outcome_uncertain: false,
         })?
-        .clone()
         .ok_or_else(|| GatewayExecutionError {
             error: gateway_persistence_error(
                 "PORTAL_SESSION_REQUIRED",
@@ -2012,6 +2145,24 @@ async fn execute_portal_action(
             ),
             outcome_uncertain: false,
         })?;
+    if active_session.agent_id != agent_id {
+        close_desktop_control_generation(
+            desktop_control,
+            &active_session,
+            "closed",
+            "Desktop input was closed because the authorized agent no longer matches the portal session.",
+            true,
+        )
+        .await;
+        return Err(GatewayExecutionError {
+            error: gateway_persistence_error(
+                "PORTAL_SESSION_AGENT_MISMATCH",
+                "Enable KDE desktop input for the currently authorized Full PC Control agent before retrying.",
+                true,
+            ),
+            outcome_uncertain: false,
+        });
+    }
     if let Some(window_id) = window_id {
         linux_desktop::ensure_active_window(runtime_directory, window_id)
             .await
@@ -2023,23 +2174,30 @@ async fn execute_portal_action(
 
     match execution {
         DesktopExecution::Pointer { action, .. } => {
-            send_gateway_pointer_action(&active_session, action).await?;
+            send_gateway_pointer_action(desktop_control, &active_session, action).await?;
         }
         DesktopExecution::Keyboard { action, .. } => {
-            send_gateway_keyboard_action(&active_session, action).await?;
+            send_gateway_keyboard_action(desktop_control, &active_session, action).await?;
         }
         DesktopExecution::TypeText { text, .. } => {
+            let mut dispatched = false;
             for character in text.chars() {
                 let keysym = if character == '\n' {
                     0xff0d
                 } else {
                     character as i32
                 };
-                send_gateway_key_events(
+                if let Err(mut error) = send_gateway_key_events(
+                    desktop_control,
                     &active_session,
                     &[(keysym, KeyState::Pressed), (keysym, KeyState::Released)],
                 )
-                .await?;
+                .await
+                {
+                    error.outcome_uncertain |= dispatched;
+                    return Err(error);
+                }
+                dispatched = true;
             }
         }
         _ => unreachable!("portal execution is filtered before dispatch"),
@@ -2048,7 +2206,8 @@ async fn execute_portal_action(
 }
 
 async fn send_gateway_pointer_action(
-    session: &DesktopControlSession,
+    desktop_control: &DesktopControl,
+    session: &Arc<DesktopControlSession>,
     action: &PointerAction,
 ) -> Result<(), GatewayExecutionError> {
     let portal_error = |error: ashpd::Error, uncertain: bool| GatewayExecutionError {
@@ -2064,22 +2223,22 @@ async fn send_gateway_pointer_action(
             .portal
             .notify_pointer_motion(&session.session, -90.0, 0.0, Default::default())
             .await
-            .map_err(|error| portal_error(error, false)),
+            .map_err(|error| portal_error(error, true)),
         PointerAction::MoveRight => session
             .portal
             .notify_pointer_motion(&session.session, 90.0, 0.0, Default::default())
             .await
-            .map_err(|error| portal_error(error, false)),
+            .map_err(|error| portal_error(error, true)),
         PointerAction::MoveUp => session
             .portal
             .notify_pointer_motion(&session.session, 0.0, -90.0, Default::default())
             .await
-            .map_err(|error| portal_error(error, false)),
+            .map_err(|error| portal_error(error, true)),
         PointerAction::MoveDown => session
             .portal
             .notify_pointer_motion(&session.session, 0.0, 90.0, Default::default())
             .await
-            .map_err(|error| portal_error(error, false)),
+            .map_err(|error| portal_error(error, true)),
         PointerAction::ScrollUp | PointerAction::ScrollDown => session
             .portal
             .notify_pointer_axis_discrete(
@@ -2093,7 +2252,7 @@ async fn send_gateway_pointer_action(
                 NotifyPointerAxisDiscreteOptions::default(),
             )
             .await
-            .map_err(|error| portal_error(error, false)),
+            .map_err(|error| portal_error(error, true)),
         PointerAction::Click | PointerAction::DoubleClick => {
             let count = if action == &PointerAction::DoubleClick {
                 2
@@ -2101,7 +2260,7 @@ async fn send_gateway_pointer_action(
                 1
             };
             for _ in 0..count {
-                session
+                if let Err(error) = session
                     .portal
                     .notify_pointer_button(
                         &session.session,
@@ -2110,7 +2269,28 @@ async fn send_gateway_pointer_action(
                         NotifyPointerButtonOptions::default(),
                     )
                     .await
-                    .map_err(|error| portal_error(error, false))?;
+                {
+                    let cleanup = session
+                        .portal
+                        .notify_pointer_button(
+                            &session.session,
+                            0x110,
+                            KeyState::Released,
+                            NotifyPointerButtonOptions::default(),
+                        )
+                        .await;
+                    if cleanup.is_err() {
+                        close_desktop_control_generation(
+                            desktop_control,
+                            session,
+                            "failed",
+                            "KDE input cleanup failed, so the portal session was closed.",
+                            true,
+                        )
+                        .await;
+                    }
+                    return Err(portal_error(error, true));
+                }
                 if let Err(error) = session
                     .portal
                     .notify_pointer_button(
@@ -2121,7 +2301,7 @@ async fn send_gateway_pointer_action(
                     )
                     .await
                 {
-                    let _ = session
+                    let cleanup = session
                         .portal
                         .notify_pointer_button(
                             &session.session,
@@ -2130,6 +2310,16 @@ async fn send_gateway_pointer_action(
                             NotifyPointerButtonOptions::default(),
                         )
                         .await;
+                    if cleanup.is_err() {
+                        close_desktop_control_generation(
+                            desktop_control,
+                            session,
+                            "failed",
+                            "KDE input cleanup failed, so the portal session was closed.",
+                            true,
+                        )
+                        .await;
+                    }
                     return Err(portal_error(error, true));
                 }
             }
@@ -2215,18 +2405,25 @@ fn control_key_events(keysym: i32, shift: bool) -> Vec<(i32, KeyState)> {
 }
 
 async fn send_gateway_keyboard_action(
-    session: &DesktopControlSession,
+    desktop_control: &DesktopControl,
+    session: &Arc<DesktopControlSession>,
     action: &KeyboardAction,
 ) -> Result<(), GatewayExecutionError> {
-    send_gateway_key_events(session, &gateway_keyboard_events(action)).await
+    send_gateway_key_events(desktop_control, session, &gateway_keyboard_events(action)).await
 }
 
 async fn send_gateway_key_events(
-    session: &DesktopControlSession,
+    desktop_control: &DesktopControl,
+    session: &Arc<DesktopControlSession>,
     events: &[(i32, KeyState)],
 ) -> Result<(), GatewayExecutionError> {
-    let mut pressed = Vec::<i32>::new();
+    let mut pressed = desktop_control::PressedInputTracker::default();
     for (keysym, state) in events {
+        if matches!(state, KeyState::Pressed) {
+            // A failed D-Bus reply does not prove that KDE did not receive the
+            // press, so track it before dispatch and release conservatively.
+            pressed.record_pressed(*keysym);
+        }
         if let Err(error) = session
             .portal
             .notify_keyboard_keysym(
@@ -2237,16 +2434,32 @@ async fn send_gateway_key_events(
             )
             .await
         {
-            for pressed_keysym in pressed.iter().rev() {
-                let _ = session
+            let outcome_uncertain = !pressed.is_empty();
+            let mut cleanup_failed = false;
+            for pressed_keysym in pressed.release_order().collect::<Vec<_>>() {
+                if session
                     .portal
                     .notify_keyboard_keysym(
                         &session.session,
-                        *pressed_keysym,
+                        pressed_keysym,
                         KeyState::Released,
                         NotifyKeyboardKeysymOptions::default(),
                     )
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    cleanup_failed = true;
+                }
+            }
+            if cleanup_failed {
+                close_desktop_control_generation(
+                    desktop_control,
+                    session,
+                    "failed",
+                    "KDE input cleanup failed, so the portal session was closed.",
+                    true,
+                )
+                .await;
             }
             return Err(GatewayExecutionError {
                 error: gateway_persistence_error(
@@ -2254,13 +2467,11 @@ async fn send_gateway_key_events(
                     format!("KDE could not send the exact keyboard action: {error}"),
                     true,
                 ),
-                outcome_uncertain: !pressed.is_empty(),
+                outcome_uncertain,
             });
         }
-        if matches!(state, KeyState::Pressed) {
-            pressed.push(*keysym);
-        } else if let Some(index) = pressed.iter().rposition(|pressed| pressed == keysym) {
-            pressed.remove(index);
+        if matches!(state, KeyState::Released) {
+            pressed.record_released(*keysym);
         }
     }
     Ok(())
@@ -2270,6 +2481,7 @@ async fn execute_prepared_system_action(
     runtime_directory: &Path,
     prepared: &linux_desktop::PreparedSystemAction,
     desktop_control: &DesktopControl,
+    agent_id: i64,
 ) -> Result<(), GatewayExecutionError> {
     if linux_desktop::execute_xdg_action(&prepared.execution).map_err(|error| {
         GatewayExecutionError {
@@ -2290,7 +2502,14 @@ async fn execute_prepared_system_action(
             });
         }
     }
-    if execute_portal_action(runtime_directory, &prepared.execution, desktop_control).await? {
+    if execute_portal_action(
+        runtime_directory,
+        &prepared.execution,
+        desktop_control,
+        agent_id,
+    )
+    .await?
+    {
         return Ok(());
     }
     Err(GatewayExecutionError {
@@ -2562,11 +2781,11 @@ async fn submit_voice_intent(
     }
 
     let pc_agent = resolve_active_template_agent(&envelope.state, "pc-control")?;
-    let runtime_directory = voice_runtime_data_dir()
+    let runtime_directory = linux_paths::LinuxPaths::discover()
         .map_err(|message| {
             gateway_persistence_error("VOICE_RUNTIME_PATH_UNAVAILABLE", message, true)
         })?
-        .join("kwin");
+        .kwin_runtime_directory();
     let prepared =
         match linux_desktop::prepare_system_action(&request.intent, &runtime_directory).await {
             Ok(prepared) => prepared,
@@ -2676,8 +2895,13 @@ async fn submit_voice_intent(
             },
         ))
         .await?;
-    match execute_prepared_system_action(&runtime_directory, &prepared, desktop_control.inner())
-        .await
+    match execute_prepared_system_action(
+        &runtime_directory,
+        &prepared,
+        desktop_control.inner(),
+        pc_agent.id,
+    )
+    .await
     {
         Ok(()) => {
             let audit = persistence
@@ -2725,54 +2949,103 @@ async fn query_system_action_audits(
     persistence.inner().query_system_action_audits(limit).await
 }
 
+async fn reconcile_desktop_control_after_state_change(
+    desktop_control: &DesktopControl,
+    app: &AppHandle,
+    application_state: &ApplicationState,
+) {
+    let Ok(Some(active_session)) = desktop_control.session() else {
+        return;
+    };
+    if desktop_control::state_retains_desktop_control(application_state, active_session.agent_id) {
+        return;
+    }
+    close_desktop_control_generation(
+        desktop_control,
+        &active_session,
+        "closed",
+        "Desktop input was closed because its exact Full PC Control agent disappeared or lost permission.",
+        true,
+    )
+    .await;
+    emit_desktop_control_status(app, desktop_control);
+}
+
+async fn ensure_current_desktop_control_agent(
+    persistence: &PersistenceService,
+    agent_id: i64,
+) -> Result<(), String> {
+    let envelope = persistence
+        .load()
+        .await
+        .map_err(|_| {
+            "DESKTOP_CONTROL_STATE_UNAVAILABLE: Current agent authority could not be confirmed."
+                .to_string()
+        })?
+        .ok_or_else(|| {
+            "DESKTOP_CONTROL_STATE_UNAVAILABLE: Current agent authority could not be confirmed."
+                .to_string()
+        })?;
+    if !desktop_control::state_retains_desktop_control(&envelope.state, agent_id) {
+        return Err("DESKTOP_CONTROL_AGENT_INELIGIBLE: The exact Full PC Control agent disappeared or lost permission while KDE authorization was open.".to_string());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn desktop_control_status(
     state: State<'_, DesktopControl>,
 ) -> Result<DesktopControlStatus, String> {
-    let enabled = state
-        .session
-        .lock()
-        .map_err(|_| "The desktop control registry is unavailable.".to_string())?
-        .is_some();
-    Ok(DesktopControlStatus {
-        enabled,
-        message: if enabled {
-            "KDE desktop input permission is active. Voice pointer commands can control the active application.".to_string()
-        } else {
-            "Enable KDE desktop input before using voice pointer commands. KDE will ask you to approve this permission.".to_string()
-        },
-    })
+    state.status()
 }
 
 #[tauri::command]
 async fn enable_desktop_control(
     agent_id: i64,
+    app: AppHandle,
     state: State<'_, DesktopControl>,
     persistence: State<'_, PersistenceService>,
 ) -> Result<DesktopControlStatus, String> {
-    consume_authorization(
-        persistence.inner(),
-        ActionIntent::EnableDesktopControl { agent_id },
-    )
-    .await?;
-    if state
-        .session
-        .lock()
-        .map_err(|_| "The desktop control registry is unavailable.".to_string())?
-        .is_some()
-    {
-        return desktop_control_status(state);
+    if state.session()?.is_some() {
+        return state.status();
     }
-
-    let portal = RemoteDesktop::new()
+    let (_, application_state) = persistence
+        .inner()
+        .authorize_intent_and_state(ActionIntent::EnableDesktopControl { agent_id })
         .await
-        .map_err(|error| format!("KDE desktop input is unavailable: {error}"))?;
-    let session = portal
-        .create_session(Default::default())
-        .await
-        .map_err(|error| format!("Could not create a KDE desktop input session: {error}"))?;
+        .map_err(authorization_error_message)?;
+    if !desktop_control::state_retains_desktop_control(&application_state, agent_id) {
+        return Err("DESKTOP_CONTROL_AGENT_INELIGIBLE: KDE desktop input requires the exact active Full PC Control agent.".to_string());
+    }
+    if !state.begin_start()? {
+        return state.status();
+    }
+    emit_desktop_control_status(&app, state.inner());
+    let portal = match RemoteDesktop::new().await {
+        Ok(portal) => portal,
+        Err(_) => {
+            state.fail_start(
+                "KDE's RemoteDesktop portal is unavailable. Check xdg-desktop-portal-kde.",
+            );
+            emit_desktop_control_status(&app, state.inner());
+            return Err(
+                "DESKTOP_CONTROL_PORTAL_UNAVAILABLE: KDE desktop input is unavailable.".to_string(),
+            );
+        }
+    };
+    let session = match portal.create_session(Default::default()).await {
+        Ok(session) => session,
+        Err(_) => {
+            state.fail_start("KDE could not create a desktop input portal session.");
+            emit_desktop_control_status(&app, state.inner());
+            return Err(
+                "DESKTOP_CONTROL_SESSION_FAILED: Could not create a KDE desktop input session."
+                    .to_string(),
+            );
+        }
+    };
     let restore_token = saved_desktop_control_token();
-    portal
+    if portal
         .select_devices(
             &session,
             SelectDevicesOptions::default()
@@ -2781,57 +3054,317 @@ async fn enable_desktop_control(
                 .set_restore_token(restore_token.as_deref()),
         )
         .await
-        .map_err(|error| format!("Could not request keyboard and pointer access: {error}"))?;
-    let selected = portal
-        .start(&session, None, Default::default())
-        .await
-        .map_err(|error| format!("KDE could not start desktop input sharing: {error}"))?
-        .response()
-        .map_err(|error| format!("KDE desktop input permission was not granted: {error}"))?;
+        .is_err()
+    {
+        let _ = session.close().await;
+        state.fail_start("KDE could not select the exact keyboard and pointer devices.");
+        emit_desktop_control_status(&app, state.inner());
+        return Err(
+            "DESKTOP_CONTROL_SELECT_FAILED: Could not request keyboard and pointer access."
+                .to_string(),
+        );
+    }
+    let selected = match portal.start(&session, None, Default::default()).await {
+        Ok(request) => match request.response() {
+            Ok(selected) => selected,
+            Err(_) => {
+                let _ = session.close().await;
+                if restore_token.is_some() {
+                    let _ = remove_desktop_control_token();
+                }
+                state.fail_start(
+                    "KDE desktop input permission was not granted. Retry to request a fresh session.",
+                );
+                emit_desktop_control_status(&app, state.inner());
+                return Err(
+                    "DESKTOP_CONTROL_NOT_GRANTED: KDE desktop input permission was not granted."
+                        .to_string(),
+                );
+            }
+        },
+        Err(_) => {
+            let _ = session.close().await;
+            state.fail_start("KDE could not start desktop input sharing.");
+            emit_desktop_control_status(&app, state.inner());
+            return Err(
+                "DESKTOP_CONTROL_START_FAILED: KDE could not start desktop input sharing."
+                    .to_string(),
+            );
+        }
+    };
     if !selected.devices().contains(DeviceType::Pointer)
         || !selected.devices().contains(DeviceType::Keyboard)
     {
-        return Err("KDE did not grant keyboard and pointer control. Enable both permissions in the dialog.".to_string());
+        let _ = session.close().await;
+        state.fail_start(
+            "KDE did not grant both keyboard and pointer access; the partial session was closed.",
+        );
+        emit_desktop_control_status(&app, state.inner());
+        return Err(
+            "DESKTOP_CONTROL_PARTIAL_GRANT: KDE did not grant both keyboard and pointer control."
+                .to_string(),
+        );
+    }
+    if let Err(error) = ensure_current_desktop_control_agent(persistence.inner(), agent_id).await {
+        let _ = session.close().await;
+        state.fail_start(
+            "KDE desktop input was closed because current agent authority could not be confirmed.",
+        );
+        emit_desktop_control_status(&app, state.inner());
+        return Err(error);
     }
     if let Some(token) = selected.restore_token() {
-        save_desktop_control_token(token)?;
+        if let Err(error) = save_desktop_control_token(token) {
+            let _ = session.close().await;
+            let _ = remove_desktop_control_token();
+            state.fail_start(
+                "The KDE restore token could not be protected, so the portal session was closed.",
+            );
+            emit_desktop_control_status(&app, state.inner());
+            return Err(error);
+        }
     }
-    *state
-        .session
-        .lock()
-        .map_err(|_| "The desktop control registry is unavailable.".to_string())? =
-        Some(Arc::new(DesktopControlSession { portal, session }));
-    desktop_control_status(state)
+    let active_session = Arc::new(DesktopControlSession {
+        portal,
+        session,
+        agent_id,
+        generation: state.next_generation(),
+    });
+    if let Err(error) = state.install_session(active_session.clone()) {
+        let _ = active_session.session.close().await;
+        let _ = remove_desktop_control_token();
+        return Err(error);
+    }
+    if let Err(error) = ensure_current_desktop_control_agent(persistence.inner(), agent_id).await {
+        close_desktop_control_generation(
+            state.inner(),
+            &active_session,
+            "failed",
+            "KDE desktop input was closed because current agent authority could not be confirmed.",
+            true,
+        )
+        .await;
+        emit_desktop_control_status(&app, state.inner());
+        return Err(error);
+    }
+    emit_desktop_control_status(&app, state.inner());
+
+    let desktop_control = state.inner().clone();
+    let monitor_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        use ashpd::zbus::export::futures_core::Stream as _;
+        let events = active_session.session.receive_closed().await;
+        match events {
+            Ok(events) => {
+                let mut events = std::pin::pin!(events);
+                let _ = std::future::poll_fn(|context| events.as_mut().poll_next(context)).await;
+                if desktop_control.clear_generation(
+                    active_session.generation,
+                    "closed",
+                    "KDE closed the desktop input session. Enable it again before retrying input.",
+                ) {
+                    let _ = remove_desktop_control_token();
+                }
+            }
+            Err(_) => {
+                close_desktop_control_generation(
+                    &desktop_control,
+                    &active_session,
+                    "failed",
+                    "The KDE session monitor failed, so desktop input was closed.",
+                    true,
+                )
+                .await;
+            }
+        }
+        emit_desktop_control_status(&monitor_app, &desktop_control);
+    });
+    state.status()
 }
 
 #[tauri::command]
-fn voice_runtime_status(state: State<'_, VoiceListener>) -> Result<VoiceRuntimeStatus, String> {
-    let installed = voice_runtime_installed()?;
-    let listening = listener_is_running(&state)?;
-    let message = if !installed {
-        "Offline voice is not installed. Select Install offline voice engine to download the local model.".to_string()
-    } else if listening {
-        "Offline voice is listening through PipeWire on this device.".to_string()
+async fn disable_desktop_control(
+    app: AppHandle,
+    state: State<'_, DesktopControl>,
+) -> Result<DesktopControlStatus, String> {
+    let active = state.take_session(
+        "stopping",
+        "Closing the KDE desktop input session and forgetting its local restore token…",
+    );
+    let close_failed = if let Some(active) = active {
+        active.session.close().await.is_err()
     } else {
-        "Offline voice is installed and ready to start.".to_string()
+        false
     };
-    Ok(VoiceRuntimeStatus {
-        installed,
-        listening,
-        high_accuracy_available: high_accuracy_voice_available(),
-        message,
-    })
+    let token_result = remove_desktop_control_token();
+    if close_failed {
+        state.set_lifecycle(
+            "failed",
+            "The app stopped sending input, but KDE did not confirm portal-session closure.",
+        );
+        emit_desktop_control_status(&app, state.inner());
+        return Err(
+            "DESKTOP_CONTROL_CLOSE_UNCONFIRMED: KDE did not confirm portal-session closure."
+                .to_string(),
+        );
+    }
+    if let Err(error) = token_result {
+        state.set_lifecycle(
+            "failed",
+            "Desktop input stopped, but the private restore token could not be removed.",
+        );
+        emit_desktop_control_status(&app, state.inner());
+        return Err(error);
+    }
+    state.set_lifecycle(
+        "disabled",
+        "KDE desktop input is disabled and the local restore token was forgotten. KDE System Settings owns persistent permission revocation.",
+    );
+    emit_desktop_control_status(&app, state.inner());
+    state.status()
+}
+
+#[tauri::command]
+fn voice_runtime_status(state: State<'_, VoiceRuntime>) -> Result<VoiceRuntimeStatus, String> {
+    voice_runtime_status_value(state.inner())
+}
+
+fn start_voice_runtime_install(
+    app: AppHandle,
+    runtime: VoiceRuntime,
+    paths: VoiceRuntimePaths,
+    setup_script: PathBuf,
+    kind: InstallKind,
+) -> Result<VoiceRuntimeStatus, String> {
+    let reservation = runtime.begin_install(kind)?;
+    let stage = match prepare_install(&paths, kind, &reservation.operation_id) {
+        Ok(stage) => stage,
+        Err(error) => {
+            runtime.finish_install(
+                &reservation.operation_id,
+                "failed",
+                "The private voice installation staging area could not be prepared.",
+            );
+            return Err(error);
+        }
+    };
+    let mut command = Command::new("bash");
+    command
+        .arg(setup_script)
+        .env("VOICE_STAGE_DIR", &stage)
+        .env("VOICE_CACHE_DIR", paths.cache_directory())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = cleanup_stage(&paths, kind, &reservation.operation_id);
+            runtime.finish_install(
+                &reservation.operation_id,
+                "failed",
+                "The pinned voice installer could not be started.",
+            );
+            return Err(
+                "VOICE_INSTALL_START_FAILED: Could not start the pinned voice installer."
+                    .to_string(),
+            );
+        }
+    };
+    let process_group = child.id() as i32;
+    if let Err(error) = runtime.attach_install_process(&reservation.operation_id, process_group) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = cleanup_stage(&paths, kind, &reservation.operation_id);
+        runtime.finish_install(
+            &reservation.operation_id,
+            "failed",
+            "The voice installer registry changed before startup completed.",
+        );
+        return Err(error);
+    }
+    let stderr = child.stderr.take();
+    emit_voice_runtime_status(&app, &runtime);
+    let operation_id = reservation.operation_id.clone();
+    let worker_runtime = runtime.clone();
+    thread::spawn(move || {
+        let runtime = worker_runtime;
+        let diagnostics = stderr.map(|stderr| {
+            thread::spawn(move || drain_bounded(stderr, 8 * 1024).unwrap_or_default())
+        });
+        let wait_result = child.wait();
+        let diagnostic_bytes = diagnostics
+            .and_then(|worker| worker.join().ok())
+            .map_or(0, |diagnostics| diagnostics.len());
+        if diagnostic_bytes > 0 {
+            log::warn!(
+                "voice {} installer returned {} bounded diagnostic bytes",
+                kind.as_str(),
+                diagnostic_bytes
+            );
+        }
+        let cancelled =
+            reservation.cancel.load(Ordering::Acquire) || runtime.install_cancelled(&operation_id);
+        if cancelled {
+            let _ = cleanup_stage(&paths, kind, &operation_id);
+            runtime.finish_install(
+                &operation_id,
+                "failed",
+                "Voice runtime installation was cancelled; the previous runtime was preserved.",
+            );
+        } else if wait_result.is_ok_and(|status| status.success()) {
+            match promote_install(&paths, kind, &operation_id) {
+                Ok(()) => runtime.finish_install(
+                    &operation_id,
+                    "ready",
+                    match kind {
+                        InstallKind::Base => "Offline voice is installed and ready to start.",
+                        InstallKind::High => "Optional high-accuracy voice is installed and ready.",
+                    },
+                ),
+                Err(_) => {
+                    let _ = cleanup_stage(&paths, kind, &operation_id);
+                    runtime.finish_install(
+                        &operation_id,
+                        "failed",
+                        "The staged voice runtime failed validation; the previous runtime was preserved.",
+                    );
+                }
+            }
+        } else {
+            let _ = cleanup_stage(&paths, kind, &operation_id);
+            runtime.finish_install(
+                &operation_id,
+                "failed",
+                match kind {
+                    InstallKind::Base => {
+                        "Offline voice installation failed. Check the required local tools and network, then retry."
+                    }
+                    InstallKind::High => {
+                        "High-accuracy installation failed. The base offline listener remains available."
+                    }
+                },
+            );
+        }
+        emit_voice_runtime_status(&app, &runtime);
+    });
+    voice_runtime_status_value(&runtime)
 }
 
 #[tauri::command]
 async fn install_voice_runtime(
     agent_id: i64,
     app: AppHandle,
+    state: State<'_, VoiceRuntime>,
     persistence: State<'_, PersistenceService>,
-) -> Result<(), String> {
+) -> Result<VoiceRuntimeStatus, String> {
     if voice_runtime_installed()? {
-        emit_voice_runtime_status(&app, true, false, "Offline voice is already installed.");
-        return Ok(());
+        return voice_runtime_status_value(state.inner());
     }
     consume_authorization(
         persistence.inner(),
@@ -2839,66 +3372,29 @@ async fn install_voice_runtime(
     )
     .await?;
     let setup_script = voice_runtime_file(&app, "setup.sh")?;
-    let runtime_dir = voice_runtime_data_dir()?;
-
-    emit_voice_runtime_status(
-        &app,
-        false,
-        false,
-        "Downloading and installing the offline voice engine...",
-    );
-    thread::spawn(move || {
-        let result = Command::new("bash")
-            .arg(setup_script)
-            .env("VOICE_RUNTIME_DIR", &runtime_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output();
-        match result {
-            Ok(output) if output.status.success() => emit_voice_runtime_status(
-                &app,
-                true,
-                false,
-                "Offline voice is installed. Select Listen to start the microphone.",
-            ),
-            Ok(output) => {
-                let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                emit_voice_runtime_status(
-                    &app,
-                    false,
-                    false,
-                    if detail.is_empty() {
-                        "Offline voice installation failed. Ensure Python, curl, and unzip are installed.".to_string()
-                    } else {
-                        format!("Offline voice installation failed: {detail}")
-                    },
-                );
-            }
-            Err(error) => emit_voice_runtime_status(
-                &app,
-                false,
-                false,
-                format!("Could not start the offline voice installer: {error}"),
-            ),
-        }
-    });
-    Ok(())
+    start_voice_runtime_install(
+        app,
+        state.inner().clone(),
+        voice_runtime_paths()?,
+        setup_script,
+        InstallKind::Base,
+    )
 }
 
 #[tauri::command]
 async fn install_high_accuracy_voice_runtime(
     agent_id: i64,
     app: AppHandle,
+    state: State<'_, VoiceRuntime>,
     persistence: State<'_, PersistenceService>,
-) -> Result<(), String> {
-    if high_accuracy_voice_available() {
-        emit_voice_runtime_status(
-            &app,
-            true,
-            false,
-            "High-accuracy offline voice is already installed.",
+) -> Result<VoiceRuntimeStatus, String> {
+    if !voice_runtime_installed()? {
+        return Err(
+            "VOICE_RUNTIME_REQUIRED: Install the base offline voice runtime first.".to_string(),
         );
-        return Ok(());
+    }
+    if high_accuracy_voice_available() {
+        return voice_runtime_status_value(state.inner());
     }
     consume_authorization(
         persistence.inner(),
@@ -2906,56 +3402,149 @@ async fn install_high_accuracy_voice_runtime(
     )
     .await?;
     let setup_script = voice_runtime_file(&app, "setup-high-accuracy.sh")?;
-    let runtime_dir = voice_runtime_data_dir()?;
-    emit_voice_runtime_status(
-        &app,
-        voice_model_dir()?.is_dir(),
-        false,
-        "Building the high-accuracy offline speech engine and downloading its model...",
-    );
-    thread::spawn(move || {
-        let result = Command::new("bash")
-            .arg(setup_script)
-            .env("VOICE_RUNTIME_DIR", &runtime_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output();
-        match result {
-            Ok(output) if output.status.success() => emit_voice_runtime_status(
-                &app,
-                true,
-                false,
-                "High-accuracy offline voice is installed. Restart listening to use it.",
-            ),
-            Ok(output) => emit_voice_runtime_status(
-                &app,
-                voice_model_dir().is_ok_and(|model| model.is_dir()),
-                false,
-                format!(
-                    "High-accuracy voice installation failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-            ),
-            Err(error) => emit_voice_runtime_status(
-                &app,
-                false,
-                false,
-                format!("Could not start the high-accuracy voice installer: {error}"),
-            ),
+    start_voice_runtime_install(
+        app,
+        state.inner().clone(),
+        voice_runtime_paths()?,
+        setup_script,
+        InstallKind::High,
+    )
+}
+
+#[tauri::command]
+fn cancel_voice_runtime_install(
+    operation_id: String,
+    app: AppHandle,
+    state: State<'_, VoiceRuntime>,
+) -> Result<VoiceRuntimeStatus, String> {
+    state.cancel_install(&operation_id)?;
+    emit_voice_runtime_status(&app, state.inner());
+    voice_runtime_status_value(state.inner())
+}
+
+fn read_bounded_voice_line<R: BufRead>(
+    reader: &mut R,
+    maximum_bytes: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    let mut overflow = false;
+    let mut received = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if !received {
+                return Ok(None);
+            }
+            return if overflow {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "voice runtime line exceeds its limit",
+                ))
+            } else {
+                Ok(Some(line))
+            };
         }
-    });
-    Ok(())
+        received = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        let content_length = newline.unwrap_or(available.len());
+        if !overflow {
+            if line.len().saturating_add(content_length) > maximum_bytes {
+                overflow = true;
+            } else {
+                line.extend_from_slice(&available[..content_length]);
+            }
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return if overflow {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "voice runtime line exceeds its limit",
+                ))
+            } else {
+                Ok(Some(line))
+            };
+        }
+    }
+}
+
+fn parse_voice_transcript_event(line: &[u8]) -> Option<VoiceTranscriptEvent> {
+    let event = serde_json::from_slice::<VoiceTranscriptEvent>(line).ok()?;
+    if !matches!(
+        event.kind.as_str(),
+        "activated"
+            | "command"
+            | "deactivated"
+            | "error"
+            | "heard"
+            | "listening"
+            | "off_requested"
+            | "ready"
+            | "transcribing"
+            | "warning"
+    ) || event.transcript.chars().count() > 2_048
+        || event
+            .transcript
+            .chars()
+            .any(|character| character.is_control() && !character.is_whitespace())
+    {
+        return None;
+    }
+    Some(event)
+}
+
+fn apply_voice_listener_event(runtime: &VoiceRuntime, event: &VoiceTranscriptEvent) {
+    match event.kind.as_str() {
+        "ready" => runtime.set_listener_state(
+            "passive",
+            "The local wake listener is active through PipeWire.",
+        ),
+        "activated" => {
+            runtime.set_listener_state("active", "Lucy is active and accepting local commands.")
+        }
+        "listening" => runtime.set_listener_state(
+            "listening",
+            "Lucy is collecting a bounded local command utterance.",
+        ),
+        "transcribing" => runtime.set_listener_state(
+            "transcribing",
+            "The optional local high-accuracy engine is transcribing.",
+        ),
+        "deactivated" => {
+            runtime.set_listener_state("passive", "Lucy returned to local wake-only listening.")
+        }
+        "heard" | "command" => {
+            runtime.set_listener_state("active", "Lucy accepted a bounded local transcript.")
+        }
+        "off_requested" => {
+            runtime.set_listener_state("stopping", "Lucy requested listener shutdown.")
+        }
+        "error" => runtime.set_listener_state(
+            "failed",
+            if event.transcript.is_empty() {
+                "The offline voice listener stopped unexpectedly."
+            } else {
+                event.transcript.as_str()
+            },
+        ),
+        "warning" => {}
+        _ => {}
+    }
 }
 
 #[tauri::command]
 async fn start_voice_listener(
     agent_id: i64,
     app: AppHandle,
-    state: State<'_, VoiceListener>,
+    state: State<'_, VoiceRuntime>,
     persistence: State<'_, PersistenceService>,
-) -> Result<(), String> {
-    if listener_is_running(&state)? {
-        return Ok(());
+) -> Result<VoiceRuntimeStatus, String> {
+    if state.listener_is_running()? {
+        return voice_runtime_status_value(state.inner());
     }
     let (_, application_state) = persistence
         .inner()
@@ -2979,90 +3568,162 @@ async fn start_voice_listener(
         open_phrases: phrase_list(&application_state.preferences.voice_open_phrases),
         close_phrases: phrase_list(&application_state.preferences.voice_close_phrases),
     })?;
-    let model = voice_model_dir()?;
-    if !model.is_dir() {
+    let paths = voice_runtime_paths()?;
+    if !base_release_ready(&paths.base_release_directory()) {
         return Err(
             "Offline voice is not installed. Select Install offline voice engine first."
                 .to_string(),
         );
     }
-    let runtime_dir = voice_runtime_data_dir()?;
-    let python = runtime_dir.join("venv").join("bin").join("python");
-    if !python.is_file() {
-        return Err(
-            "The offline voice installation is incomplete. Install the voice engine again."
-                .to_string(),
-        );
-    }
-    if !voice_runtime_upgrade_ready()? {
-        return Err("Lucy needs a one-time voice runtime upgrade. Select Install offline voice engine, then try again.".to_string());
-    }
-    if !high_accuracy_voice_available() {
-        return Err("Install High-accuracy voice before starting Lucy. Whisper.cpp is required for command transcription.".to_string());
-    }
+    let python = paths.python();
+    let model = paths.vosk_model();
     if find_in_path("pw-record").is_none() {
         return Err("PipeWire's pw-record command is unavailable. Install PipeWire utilities, then restart Lucy.".to_string());
     }
     let dependency_status = Command::new(&python)
-        .args(["-c", "import numpy, openwakeword, silero_vad, torch, vosk"])
+        .args(["-c", "import vosk"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
-        .map_err(|error| format!("Could not verify the offline voice installation: {error}"))?;
+        .map_err(|_| {
+            "VOICE_RUNTIME_VERIFICATION_FAILED: Could not verify the offline voice installation."
+                .to_string()
+        })?;
     if !dependency_status.success() {
         return Err("The offline voice Python packages are incomplete. Install the offline voice engine again.".to_string());
     }
     let listener_script = voice_runtime_file(&app, "listener.py")?;
     let config_file = ensure_voice_listener_config()?;
+    ensure_private_directory(paths.runtime_directory())?;
+    let high_accuracy = high_release_ready(&paths.high_release_directory(), true);
+    let whisper_binary = if high_accuracy {
+        paths.whisper_binary()
+    } else {
+        Default::default()
+    };
+    let whisper_model = if high_accuracy {
+        paths.whisper_model()
+    } else {
+        Default::default()
+    };
+    state.begin_listener_start()?;
+    emit_voice_runtime_status(&app, state.inner());
     let mut command = Command::new(python);
     command
         .arg(listener_script)
         .arg(model)
         .arg(config_file)
-        .arg(whisper_binary()?)
-        .arg(whisper_model()?);
-    let mut child = command
+        .arg(whisper_binary)
+        .arg(whisper_model)
+        .arg(paths.runtime_directory())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("Could not start the offline voice listener: {error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "The offline voice listener did not provide output.".to_string())?;
+        .stderr(Stdio::null());
+    #[cfg(target_os = "linux")]
     {
-        let mut active_child = state
-            .child
-            .lock()
-            .map_err(|_| "The voice listener registry is unavailable.".to_string())?;
-        *active_child = Some(child);
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
     }
-    emit_voice_runtime_status(&app, true, false, "Starting the offline voice listener...");
-    thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let event = match serde_json::from_str::<VoiceTranscriptEvent>(&line) {
-                Ok(event) => event,
-                Err(_) => VoiceTranscriptEvent {
-                    kind: "error".to_string(),
-                    transcript: format!(
-                        "Lucy returned an invalid runtime message: {}",
-                        line.trim()
-                    ),
-                },
-            };
-            if !event.transcript.is_empty() || event.kind != "command" {
-                let _ = app.emit("voice-transcript", event);
-            }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            state.cancel_listener_start(
+                "failed",
+                "The offline voice listener could not be started safely.",
+            );
+            emit_voice_runtime_status(&app, state.inner());
+            return Err(
+                "VOICE_LISTENER_START_FAILED: Could not start the offline voice listener."
+                    .to_string(),
+            );
         }
-        emit_voice_runtime_status(&app, true, false, "Offline voice listener stopped.");
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            state.cancel_listener_start(
+                "failed",
+                "The offline voice listener did not provide bounded output.",
+            );
+            emit_voice_runtime_status(&app, state.inner());
+            return Err(
+                "VOICE_LISTENER_OUTPUT_UNAVAILABLE: The offline voice listener did not provide output."
+                    .to_string(),
+            );
+        }
+    };
+    if let Err(error) = state.store_listener(child) {
+        state.cancel_listener_start(
+            "failed",
+            "The offline voice listener start was cancelled or overlapped.",
+        );
+        emit_voice_runtime_status(&app, state.inner());
+        return Err(error);
+    }
+    emit_voice_runtime_status(&app, state.inner());
+    let runtime = state.inner().clone();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let line = match read_bounded_voice_line(&mut reader, 8 * 1024) {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(_) => {
+                    runtime.stop_listener();
+                    runtime.set_listener_state(
+                        "failed",
+                        "The offline listener returned an oversized runtime message.",
+                    );
+                    let _ = app.emit(
+                        "voice-transcript",
+                        VoiceTranscriptEvent {
+                            kind: "error".to_string(),
+                            transcript: "The offline listener returned an invalid runtime message."
+                                .to_string(),
+                        },
+                    );
+                    emit_voice_runtime_status(&app, &runtime);
+                    return;
+                }
+            };
+            let Some(event) = parse_voice_transcript_event(&line) else {
+                runtime.stop_listener();
+                runtime.set_listener_state(
+                    "failed",
+                    "The offline listener returned an invalid runtime message.",
+                );
+                let _ = app.emit(
+                    "voice-transcript",
+                    VoiceTranscriptEvent {
+                        kind: "error".to_string(),
+                        transcript: "The offline listener returned an invalid runtime message."
+                            .to_string(),
+                    },
+                );
+                emit_voice_runtime_status(&app, &runtime);
+                return;
+            };
+            apply_voice_listener_event(&runtime, &event);
+            let _ = app.emit("voice-transcript", event);
+            emit_voice_runtime_status(&app, &runtime);
+        }
+        runtime.reap_listener();
+        emit_voice_runtime_status(&app, &runtime);
     });
-    Ok(())
+    voice_runtime_status_value(state.inner())
 }
 
 #[tauri::command]
-fn stop_voice_listener(app: AppHandle, state: State<'_, VoiceListener>) -> Result<(), String> {
-    stop_voice_listener_process(&state);
-    let installed = voice_model_dir()?.is_dir();
-    emit_voice_runtime_status(&app, installed, false, "Offline voice listener stopped.");
-    Ok(())
+fn stop_voice_listener(
+    app: AppHandle,
+    state: State<'_, VoiceRuntime>,
+) -> Result<VoiceRuntimeStatus, String> {
+    state.stop_listener();
+    emit_voice_runtime_status(&app, state.inner());
+    voice_runtime_status_value(state.inner())
 }
 
 #[tauri::command]
@@ -3083,8 +3744,11 @@ async fn initialize_application_state(
 #[tauri::command]
 async fn save_application_state(
     state: State<'_, PersistenceService>,
+    desktop_control: State<'_, DesktopControl>,
+    app: AppHandle,
     request: SaveApplicationStateRequest,
 ) -> Result<SaveReceipt, PersistenceError> {
+    let next_application_state = request.state.clone();
     let security_change = state
         .inner()
         .security_change_summary(request.expected_revision, request.state.clone())
@@ -3112,15 +3776,24 @@ async fn save_application_state(
     } else {
         false
     };
-    state
+    let receipt = state
         .inner()
         .save(request.expected_revision, request.state, confirmed)
-        .await
+        .await?;
+    reconcile_desktop_control_after_state_change(
+        desktop_control.inner(),
+        &app,
+        &next_application_state,
+    )
+    .await;
+    Ok(receipt)
 }
 
 #[tauri::command]
 async fn reset_application_state(
     state: State<'_, PersistenceService>,
+    desktop_control: State<'_, DesktopControl>,
+    app: AppHandle,
     request: ResetApplicationStateRequest,
 ) -> Result<StateEnvelope, PersistenceError> {
     let confirmed = tauri::async_runtime::spawn_blocking(|| {
@@ -3145,24 +3818,32 @@ async fn reset_application_state(
             true,
         ));
     }
-    state
+    let envelope = state
         .inner()
         .reset(request.expected_revision, request.confirmation)
-        .await
+        .await?;
+    reconcile_desktop_control_after_state_change(desktop_control.inner(), &app, &envelope.state)
+        .await;
+    Ok(envelope)
 }
 
 #[tauri::command]
 async fn import_legacy_backup(
     state: State<'_, PersistenceService>,
+    desktop_control: State<'_, DesktopControl>,
+    app: AppHandle,
     request: ImportLegacyBackupRequest,
 ) -> Result<StateEnvelope, PersistenceError> {
-    confirm_and_apply_backup(
+    let envelope = confirm_and_apply_backup(
         state.inner(),
         request.expected_revision,
         request.backup_json,
         "Confirm legacy backup import",
     )
-    .await
+    .await?;
+    reconcile_desktop_control_after_state_change(desktop_control.inner(), &app, &envelope.state)
+        .await;
+    Ok(envelope)
 }
 
 #[tauri::command]
@@ -3221,15 +3902,20 @@ async fn confirm_and_apply_backup(
 #[tauri::command]
 async fn apply_backup_import(
     state: State<'_, PersistenceService>,
+    desktop_control: State<'_, DesktopControl>,
+    app: AppHandle,
     request: BackupImportRequest,
 ) -> Result<StateEnvelope, PersistenceError> {
-    confirm_and_apply_backup(
+    let envelope = confirm_and_apply_backup(
         state.inner(),
         request.expected_revision,
         request.backup_json,
         "Confirm portable backup import",
     )
-    .await
+    .await?;
+    reconcile_desktop_control_after_state_change(desktop_control.inner(), &app, &envelope.state)
+        .await;
+    Ok(envelope)
 }
 
 #[tauri::command]
@@ -3360,25 +4046,40 @@ async fn create_agent(
 #[tauri::command]
 async fn update_agent(
     state: State<'_, PersistenceService>,
+    desktop_control: State<'_, DesktopControl>,
+    app: AppHandle,
     request: UpdateAgentRequest,
 ) -> Result<StateEnvelope, PersistenceError> {
-    state.inner().update_agent(request).await
+    let envelope = state.inner().update_agent(request).await?;
+    reconcile_desktop_control_after_state_change(desktop_control.inner(), &app, &envelope.state)
+        .await;
+    Ok(envelope)
 }
 
 #[tauri::command]
 async fn delete_agent(
     state: State<'_, PersistenceService>,
+    desktop_control: State<'_, DesktopControl>,
+    app: AppHandle,
     request: DeleteAgentRequest,
 ) -> Result<StateEnvelope, PersistenceError> {
-    state.inner().delete_agent(request).await
+    let envelope = state.inner().delete_agent(request).await?;
+    reconcile_desktop_control_after_state_change(desktop_control.inner(), &app, &envelope.state)
+        .await;
+    Ok(envelope)
 }
 
 #[tauri::command]
 async fn restore_agent_template(
     state: State<'_, PersistenceService>,
+    desktop_control: State<'_, DesktopControl>,
+    app: AppHandle,
     request: RestoreAgentTemplateRequest,
 ) -> Result<StateEnvelope, PersistenceError> {
-    state.inner().restore_agent_template(request).await
+    let envelope = state.inner().restore_agent_template(request).await?;
+    reconcile_desktop_control_after_state_change(desktop_control.inner(), &app, &envelope.state)
+        .await;
+    Ok(envelope)
 }
 
 #[tauri::command]
@@ -3933,7 +4634,7 @@ pub fn run() {
             open_voice_control(app)
         }))
         .manage(ActiveRuns::default())
-        .manage(VoiceListener::default())
+        .manage(VoiceRuntime::default())
         .manage(DesktopControl::default())
         .setup(|app| {
             let repository = app
@@ -4004,9 +4705,24 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "voice-control" => open_voice_control(app),
                     "quit" => {
-                        let listener = app.state::<VoiceListener>();
-                        stop_voice_listener_process(&listener);
-                        app.exit(0);
+                        let runtime = app.state::<VoiceRuntime>();
+                        runtime.stop_listener();
+                        let desktop_control = app.state::<DesktopControl>();
+                        let active_session = desktop_control
+                            .take_session("stopping", "Closing KDE desktop input before exit…");
+                        if let Some(active_session) = active_session {
+                            let app = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(2),
+                                    active_session.session.close(),
+                                )
+                                .await;
+                                app.exit(0);
+                            });
+                        } else {
+                            app.exit(0);
+                        }
                     }
                     _ => {}
                 })
@@ -4059,9 +4775,11 @@ pub fn run() {
             query_system_action_audits,
             desktop_control_status,
             enable_desktop_control,
+            disable_desktop_control,
             voice_runtime_status,
             install_voice_runtime,
             install_high_accuracy_voice_runtime,
+            cancel_voice_runtime_install,
             start_voice_listener,
             stop_voice_listener,
             run_agent_task
@@ -4840,5 +5558,91 @@ mod tests {
 
         assert!(!has_write_tool(&read_only));
         assert!(has_write_tool(&writable));
+    }
+
+    #[test]
+    fn task_0016_voice_runtime_messages_are_bounded_and_fail_closed() {
+        let valid = b"{\"kind\":\"ready\",\"transcript\":\"\"}\n";
+        let mut reader = BufReader::new(io::Cursor::new(valid));
+        let line = read_bounded_voice_line(&mut reader, 128).unwrap().unwrap();
+        assert_eq!(parse_voice_transcript_event(&line).unwrap().kind, "ready");
+        assert!(
+            parse_voice_transcript_event(br#"{"kind":"ready","transcript":"","extra":true}"#)
+                .is_none()
+        );
+        assert!(parse_voice_transcript_event(br#"{"kind":"unknown","transcript":""}"#).is_none());
+
+        let oversized = format!(
+            "{}\n{{\"kind\":\"ready\",\"transcript\":\"\"}}\n",
+            "x".repeat(256)
+        );
+        let mut reader = BufReader::new(io::Cursor::new(oversized.into_bytes()));
+        assert_eq!(
+            read_bounded_voice_line(&mut reader, 64).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let recovered = read_bounded_voice_line(&mut reader, 64).unwrap().unwrap();
+        assert_eq!(
+            parse_voice_transcript_event(&recovered).unwrap().kind,
+            "ready"
+        );
+    }
+
+    #[test]
+    fn task_0016_desktop_control_lifecycle_rejects_overlap_and_preserves_disable() {
+        let desktop_control = DesktopControl::default();
+        assert!(desktop_control.begin_start().unwrap());
+        let starting = desktop_control.status().unwrap();
+        assert!(!starting.enabled);
+        assert_eq!(starting.state, "starting");
+        assert_eq!(
+            desktop_control.begin_start().unwrap_err(),
+            "DESKTOP_CONTROL_BUSY: A KDE desktop-input lifecycle change is already active."
+        );
+
+        assert!(desktop_control
+            .take_session("disabled", "Desktop input was explicitly disabled.")
+            .is_none());
+        desktop_control.fail_start("A stale start failed.");
+        let disabled = desktop_control.status().unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.state, "disabled");
+    }
+
+    #[test]
+    fn task_0016_listener_events_project_bounded_lifecycle_states() {
+        let runtime = VoiceRuntime::default();
+        runtime.begin_listener_start().unwrap();
+        assert_eq!(
+            runtime.begin_listener_start().unwrap_err(),
+            "VOICE_LISTENER_BUSY: The offline listener is already starting."
+        );
+        runtime.cancel_listener_start("stopped", "The listener start was cancelled.");
+        apply_voice_listener_event(
+            &runtime,
+            &VoiceTranscriptEvent {
+                kind: "ready".to_string(),
+                transcript: String::new(),
+            },
+        );
+        assert_eq!(runtime.snapshot().unwrap().listener_state, "passive");
+
+        apply_voice_listener_event(
+            &runtime,
+            &VoiceTranscriptEvent {
+                kind: "transcribing".to_string(),
+                transcript: String::new(),
+            },
+        );
+        assert_eq!(runtime.snapshot().unwrap().listener_state, "transcribing");
+
+        apply_voice_listener_event(
+            &runtime,
+            &VoiceTranscriptEvent {
+                kind: "error".to_string(),
+                transcript: "The bounded listener failed.".to_string(),
+            },
+        );
+        assert_eq!(runtime.snapshot().unwrap().listener_state, "failed");
     }
 }

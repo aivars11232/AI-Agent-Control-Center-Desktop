@@ -113,10 +113,15 @@ describe("VoiceControlPage unified gateway", () => {
       installed: true,
       listening: false,
       highAccuracyAvailable: true,
+      installState: "ready",
+      listenerState: "stopped",
+      operationId: null,
+      canCancel: false,
       message: "Voice runtime ready.",
     });
     vi.spyOn(desktopClient, "desktopControlStatus").mockResolvedValue({
       enabled: false,
+      state: "disabled",
       message: "Desktop input is disabled.",
     });
     vi.spyOn(desktopClient, "querySystemActionAudits").mockResolvedValue({
@@ -124,6 +129,9 @@ describe("VoiceControlPage unified gateway", () => {
       limit: 50,
     });
     vi.spyOn(desktopClient, "onVoiceRuntimeStatus").mockResolvedValue(
+      () => undefined,
+    );
+    vi.spyOn(desktopClient, "onDesktopControlStatus").mockResolvedValue(
       () => undefined,
     );
     vi.spyOn(desktopClient, "onVoiceTranscript").mockResolvedValue(
@@ -183,5 +191,86 @@ describe("VoiceControlPage unified gateway", () => {
     await waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
     expect(submit.mock.calls[1][0]).toEqual(firstRequest);
     expect(onGatewayMutation).toHaveBeenCalledOnce();
+  });
+
+  it("cancels only the reported install operation and explicitly disables KDE input", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    const state = createDefaultApplicationState();
+    state.preferences.backgroundVoiceEnabled = false;
+    const pcAgent = state.agents.find(
+      (agent) => agent.templateKey === "pc-control",
+    );
+    if (!pcAgent) throw new Error("PC Control fixture missing");
+    pcAgent.capabilities.system = "full";
+    const installing = {
+      installed: true,
+      listening: false,
+      highAccuracyAvailable: false,
+      installState: "installing" as const,
+      listenerState: "stopped" as const,
+      operationId: "install-high-fixture",
+      canCancel: true,
+      message: "Installing optional high accuracy.",
+    };
+    vi.spyOn(desktopClient, "voiceRuntimeStatus").mockResolvedValue(
+      installing,
+    );
+    vi.spyOn(desktopClient, "desktopControlStatus").mockResolvedValue({
+      enabled: true,
+      state: "enabled",
+      message: "Desktop input is active.",
+    });
+    vi.spyOn(desktopClient, "querySystemActionAudits").mockResolvedValue({
+      records: [],
+      limit: 50,
+    });
+    vi.spyOn(desktopClient, "onVoiceRuntimeStatus").mockResolvedValue(
+      () => undefined,
+    );
+    vi.spyOn(desktopClient, "onDesktopControlStatus").mockResolvedValue(
+      () => undefined,
+    );
+    vi.spyOn(desktopClient, "onVoiceTranscript").mockResolvedValue(
+      () => undefined,
+    );
+    const cancel = vi
+      .spyOn(desktopClient, "cancelVoiceRuntimeInstall")
+      .mockResolvedValue({
+        ...installing,
+        installState: "cancelling",
+        message: "Cancelling installation.",
+      });
+    const disable = vi
+      .spyOn(desktopClient, "disableDesktopControl")
+      .mockResolvedValue({
+        enabled: false,
+        state: "disabled",
+        message: "Desktop input is disabled.",
+      });
+    const user = userEvent.setup();
+
+    render(
+      <VoiceControlPage
+        agents={state.agents}
+        onGatewayMutation={vi.fn(async () => undefined)}
+        setApprovalRequests={vi.fn()}
+        preferences={state.preferences}
+        setPreferences={vi.fn()}
+      />,
+    );
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Cancel voice installation",
+      }),
+    );
+    expect(cancel).toHaveBeenCalledWith("install-high-fixture");
+    await user.click(
+      screen.getByRole("button", { name: "Disable KDE desktop input" }),
+    );
+    expect(disable).toHaveBeenCalledOnce();
   });
 });

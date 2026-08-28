@@ -113,7 +113,9 @@ also composes <code>app_state.rs</code>, <code>policy.rs</code>,
 <code>provider_runtime.rs</code>, <code>codex_runtime.rs</code>,
 <code>ollama_runtime.rs</code>, <code>workspace_tools.rs</code>,
 <code>workspace_evidence.rs</code>, <code>data_lifecycle.rs</code>,
-<code>system_actions.rs</code>, <code>linux_desktop.rs</code>, and
+<code>system_actions.rs</code>, <code>linux_paths.rs</code>,
+<code>linux_desktop.rs</code>, <code>voice_runtime.rs</code>,
+<code>desktop_control.rs</code>, and
 <code>persistence.rs</code>. Those modules
 own the versioned state contract, normalized action intents, fail-closed
 capability evaluation, authoritative approval lifecycle, legal run transitions
@@ -235,8 +237,20 @@ query is loading rather than falling back to renderer estimates.
 
 ### Voice runtime
 
-<code>voice-runtime/listener.py</code> is a bundled local Python listener. Setup
-scripts prepare its runtime and optional higher-accuracy support.
+<code>voice-runtime/listener.py</code> is a bundled local Python listener. Its
+base path imports only pinned Vosk dependencies, consumes exact 20 ms PipeWire
+PCM frames, retains a bounded pre-roll and 20-second utterance, reloads valid
+configuration at most once per second, and keeps audio in memory. Optional
+whisper.cpp transcription uses a private mode-0600 temporary WAV and falls
+back to the base transcript on failure. NDJSON and subprocess diagnostics are
+bounded and invalid listener messages fail closed.
+
+The setup scripts accept backend-created XDG staging/cache paths, use pinned
+artifact versions and SHA-256 verification, resume download caches, write the
+manifest last, and never replace an active release directly. The backend owns
+one install operation ID, rejects overlap, cancels its process group, validates
+the staged release, and atomically promotes or preserves the previous release.
+Base and optional high-accuracy releases remain independent.
 <code>src/voiceCommand.ts</code> maps local transcripts or typed commands to a
 closed canonical intent union. The backend—not the renderer—selects the current
 agent/workspace, resolves exact XDG/KWin targets, derives risk and scopes,
@@ -247,9 +261,13 @@ coding content are represented in the action audit only by SHA-256 and length,
 while configured workspace paths are bound by SHA-256 without storing the raw
 path.
 
-The existing offline listener, microphone, and RemoteDesktop-session lifecycle
-remain separate native boundaries. TASK-0015 did not execute them; TASK-0016
-owns their runtime reliability and TASK-0020 owns live/package acceptance.
+The listener, microphone, and RemoteDesktop session remain separate native
+boundaries. The portal session is bound to the exact active Full PC Control
+agent, subscribes to native <code>Closed</code>, supports explicit close, closes
+partial grants, and is reconciled after state import/reset or agent authority
+change. Failed pressed-input cleanup closes the session. TASK-0016 establishes
+these checked-in non-live contracts; TASK-0020 owns sequential live and
+packaged acceptance.
 
 ### Current voice/system-action flow
 
@@ -264,8 +282,10 @@ owns their runtime reliability and TASK-0020 owns live/package acceptance.
 5. The backend records <code>dispatched</code> before the platform/task side
    effect, then records <code>applied</code>, <code>taskCreated</code>,
    <code>failed</code>, or <code>uncertain</code>.
-6. XDG launch/folder actions use exact native metadata, bind configured folder
-   paths by SHA-256, and ignore relative base-directory values. KWin runs only its returned
+6. XDG launch/folder actions use precedence-aware localized native metadata,
+   visibility/TryExec rules, tombstones, configured user directories, and
+   absolute base-directory values. <code>gtk-launch</code> remains primary and
+   GIO launches the already-resolved desktop file as a native fallback. KWin runs only its returned
    <code>/Scripting/Script{id}</code> object and reports through a token-bound
    callback authenticated to KWin's current D-Bus owner. Portal input rechecks
    the active window, and coding work enters the normal queue.
@@ -483,7 +503,9 @@ bounded workspace evidence orchestration; TASK-0013 establishes the modular,
 accessible, responsive renderer; TASK-0014 establishes strict portable backup,
 bounded continuous retention, and truthful revision-bound monitoring.
 TASK-0015 establishes the unified system-action policy/audit gateway;
-TASK-0016 retains offline voice and live KDE/portal/XDG integration work.
+TASK-0016 establishes deterministic offline voice plus non-live
+KDE/portal/XDG integration contracts. TASK-0020 retains their sequential live
+and packaged acceptance.
 TASK-0017 through TASK-0020 complete bounded roles,
 packaging, acceptance, and release.
 
