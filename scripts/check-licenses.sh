@@ -50,7 +50,7 @@ printf '%s' "$evaluate" > "$evaluator"
 fail=0
 
 echo "== Rust crates (src-tauri/Cargo.lock) =="
-cargo metadata --format-version 1 --offline --manifest-path src-tauri/Cargo.toml \
+cargo metadata --format-version 1 --locked --manifest-path src-tauri/Cargo.toml \
   | node -e '
 const { acceptable, own } = require(process.argv[1]);
 const meta = JSON.parse(require("fs").readFileSync(0, "utf8"));
