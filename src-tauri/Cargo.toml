@@ -30,7 +30,7 @@ rusqlite = "=0.32.1"
 ashpd = { version = "0.13.13", features = ["notification", "remote_desktop", "screencast"] }
 jiff = "=0.2.35"
 log = "0.4"
-reqwest = { version = "=0.12.28", default-features = false, features = ["brotli", "deflate", "gzip", "json", "stream", "zstd"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["brotli", "deflate", "gzip", "json", "stream"] }
 sha2 = "=0.10.9"
 tauri = { version = "2.11.3", features = ["tray-icon"] }
 tauri-plugin-log = "2"
