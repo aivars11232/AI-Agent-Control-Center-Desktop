@@ -137,7 +137,7 @@ jobs:
           pacman -Syu --noconfirm --needed \
             base-devel git rust npm nodejs pkgconf \
             webkit2gtk-4.1 gtk3 libappindicator-gtk3 librsvg sqlite \
-            desktop-file-utils appstream namcap shellcheck sudo
+            desktop-file-utils appstream namcap shellcheck sudo dbus gnome-keyring
       - uses: actions/checkout@v4
       - name: Create non-root build user
         run: |
@@ -155,5 +155,8 @@ jobs:
       - name: Staged install / upgrade / remove / purge
         run: |
           sudo -u builder env \
-            AACC_TEST_BINARY="$GITHUB_WORKSPACE/src-tauri/target/release/ai-agent-control-center" \
-            bash scripts/staged-install-test.sh
+          AACC_TEST_BINARY="$GITHUB_WORKSPACE/src-tauri/target/release/ai-agent-control-center" \
+          dbus-run-session -- bash -c '
+          gnome-keyring-daemon --start --components=secrets >/dev/null
+          exec bash scripts/staged-install-test.sh
+          '
