@@ -42,6 +42,7 @@ allow-wildcard-paths = true
 [advisories]
 version = 2
 yanked = "deny"
+unmaintained = "workspace"
 ignore = []
 
 [sources]
