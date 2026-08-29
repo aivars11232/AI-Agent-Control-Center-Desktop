@@ -48,7 +48,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev libsoup-3.0-dev pkg-config
+            librsvg2-dev libsoup-3.0-dev pkg-config \
+            bubblewrap
+      - name: Enable unprivileged user namespaces for Bubblewrap containment
+        # The ubuntu-24.04 runner ships kernel.apparmor_restrict_unprivileged_userns=1,
+        # which denies unprivileged unshare(CLONE_NEWUSER) to every unconfined process.
+        # The TASK-0007 Codex runtime probes real `bwrap` containment (unshare-user,
+        # unshare-pid, cap-drop) before it will emit a CodexLaunch, so the deterministic
+        # fake-Codex tests need the same namespace capability that the production Linux
+        # targets provide by default. This only relaxes the ephemeral runner; no
+        # production code or test is changed. (Mirrors containers/bubblewrap's own CI.)
+        run: |
+          echo "kernel.apparmor_restrict_unprivileged_userns = 0" \
+            | sudo tee /etc/sysctl.d/99-userns.conf
+          sudo sysctl --system
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
