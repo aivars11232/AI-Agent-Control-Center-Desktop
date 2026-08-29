@@ -166,9 +166,17 @@ not start models, and handoffs do not create a free-form agent messaging swarm.
 
 ### M7 — Package and release
 
-TASK-0019 owns reproducible packaging, release metadata, CI security gates, and
-privacy-safe removal. TASK-0020 runs every mandatory live case sequentially and
-is the only production-readiness gate.
+TASK-0019 adds reproducible user-local (`install-kde.sh`) and Arch
+(`packaging/PKGBUILD`) packaging with idempotent upgrade and rollback and no
+PlasmaShell restart; backend-authoritative keep-data vs `--purge` removal that
+stops owned processes and clears the provider key and KDE portal restore token;
+the proprietary `LicenseRef-proprietary` root `LICENSE` with a permissive
+third-party inventory and validated AppStream metadata; and a strictly
+sequential `.github/workflows/ci.yml` gate (frontend, Rust with mandatory
+`cargo-deny`, scripts, third-party licenses, secret scan, and a containerised
+Arch `makepkg` + staged install/removal job) with no release step. TASK-0020
+runs every mandatory live case sequentially and is the only
+production-readiness gate.
 
 ## Cross-task requirements
 

@@ -1,0 +1,65 @@
+# Maintainer: Aivars Rocens <aivars.2024.rocens@gmail.com>
+#
+# Local / private PKGBUILD for AI Agent Control Center. It builds from the
+# checked-out repository that contains this file (packaging/PKGBUILD), so run
+# it as:  cd packaging && makepkg -f
+#
+# This is proprietary software (see LICENSE); it is not published to the AUR.
+
+pkgname=ai-agent-control-center
+pkgver=0.5.1
+pkgrel=1
+pkgdesc="Local desktop control center for governing, routing, and auditing bounded AI agents"
+arch=('x86_64')
+url="https://github.com/aivars11232/AI-Agent-Control-Center-Desktop"
+license=('LicenseRef-proprietary')
+depends=('webkit2gtk-4.1' 'gtk3' 'libappindicator-gtk3' 'librsvg' 'sqlite')
+makedepends=('rust' 'cargo' 'npm' 'nodejs' 'pkgconf')
+optdepends=('python: offline voice runtime (Vosk / optional whisper.cpp)'
+            'bubblewrap: Codex runtime sandbox containment')
+install="$pkgname.install"
+options=('!debug')
+
+# The repository root is the parent of the directory holding this PKGBUILD.
+_srcroot="$startdir/.."
+
+build() {
+  cd "$_srcroot"
+  npm ci --ignore-scripts
+  npm run tauri -- build --no-bundle
+}
+
+check() {
+  cd "$_srcroot"
+  "src-tauri/target/release/$pkgname" --version
+}
+
+package() {
+  cd "$_srcroot"
+
+  install -Dm755 "src-tauri/target/release/$pkgname" \
+    "$pkgdir/usr/lib/$pkgname/$pkgname"
+  install -Dm755 voice-runtime/setup.sh \
+    "$pkgdir/usr/lib/$pkgname/voice-runtime/setup.sh"
+  install -Dm755 voice-runtime/setup-high-accuracy.sh \
+    "$pkgdir/usr/lib/$pkgname/voice-runtime/setup-high-accuracy.sh"
+  install -Dm644 voice-runtime/listener.py \
+    "$pkgdir/usr/lib/$pkgname/voice-runtime/listener.py"
+
+  install -d "$pkgdir/usr/bin"
+  ln -s "/usr/lib/$pkgname/$pkgname" "$pkgdir/usr/bin/$pkgname"
+
+  sed -e "s|@EXEC@|/usr/bin/$pkgname|g" -e "s|@ICON@|$pkgname|g" \
+    "packaging/$pkgname.desktop.in" > "$srcdir/$pkgname.desktop"
+  install -Dm644 "$srcdir/$pkgname.desktop" \
+    "$pkgdir/usr/share/applications/$pkgname.desktop"
+
+  install -Dm644 src-tauri/icons/icon.png \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/$pkgname.png"
+  install -Dm644 packaging/com.aivarsrocens.aiagentcontrolcenter.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/com.aivarsrocens.aiagentcontrolcenter.metainfo.xml"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 THIRD-PARTY-NOTICES.md \
+    "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES.md"
+}

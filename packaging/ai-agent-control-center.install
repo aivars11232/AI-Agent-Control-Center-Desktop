@@ -1,0 +1,33 @@
+_refresh_caches() {
+  update-desktop-database -q /usr/share/applications 2>/dev/null || true
+  gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
+}
+
+post_install() {
+  _refresh_caches
+  cat <<'MSG'
+AI Agent Control Center is installed at /usr/bin/ai-agent-control-center.
+
+Per-user data is created on first run under ~/.local/share, ~/.config, and
+~/.cache. `pacman -R` cannot remove per-user data or stop a running instance.
+Before removing the package, run ONE of:
+
+    ai-agent-control-center --uninstall
+        stop the runtime and remove app state, KEEPING the database and any
+        downloaded offline-voice models
+
+    ai-agent-control-center --purge --confirm PURGE
+        stop the runtime and irreversibly delete ALL local data
+
+The persistent KDE screen-cast / remote-desktop permission is revoked in
+KDE System Settings, not by this package.
+MSG
+}
+
+post_upgrade() {
+  _refresh_caches
+}
+
+post_remove() {
+  _refresh_caches
+}

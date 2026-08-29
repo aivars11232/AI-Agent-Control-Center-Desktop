@@ -5,6 +5,10 @@ set -euo pipefail
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repository_root"
 
+# VERIFY_STRICT=1 (set by CI) turns "advisory tooling unavailable" into a hard
+# failure. Locally, missing optional tooling is reported but does not fail.
+strict="${VERIFY_STRICT:-0}"
+
 run() {
   printf "+"
   printf " %q" "$@"
@@ -18,6 +22,9 @@ run cargo clippy --manifest-path src-tauri/Cargo.toml --locked --offline --all-t
 run bash -n \
   scripts/verify-fast.sh \
   scripts/verify-full.sh \
+  scripts/check-packaging.sh \
+  scripts/check-licenses.sh \
+  scripts/staged-install-test.sh \
   install-kde.sh \
   uninstall-kde.sh \
   voice-runtime/setup.sh \
@@ -33,12 +40,36 @@ run cargo tree --manifest-path src-tauri/Cargo.toml --locked --offline
 run npm audit --omit=dev --audit-level=moderate
 run npm audit --audit-level=moderate
 
+# --- TASK-0019 packaging, licensing, and removal gates ---------------
+run env VERIFY_STRICT="$strict" bash scripts/check-licenses.sh
+run env VERIFY_STRICT="$strict" bash scripts/check-packaging.sh
+run bash scripts/staged-install-test.sh
+
+if command -v shellcheck >/dev/null 2>&1; then
+  run shellcheck -x -e SC2016,SC2317 \
+    scripts/verify-fast.sh scripts/verify-full.sh scripts/check-packaging.sh \
+    scripts/check-licenses.sh scripts/staged-install-test.sh \
+    install-kde.sh uninstall-kde.sh \
+    voice-runtime/setup.sh voice-runtime/setup-high-accuracy.sh
+elif [[ "$strict" == "1" ]]; then
+  printf "FAIL: shellcheck is required in strict mode.\n"
+  exit 1
+else
+  printf "SKIP: shellcheck is unavailable.\n"
+fi
+
 rust_advisory_status="INDETERMINATE"
 if command -v cargo-audit >/dev/null 2>&1; then
   run cargo audit --file src-tauri/Cargo.lock
   rust_advisory_status="PASSED"
+elif command -v cargo-deny >/dev/null 2>&1; then
+  run cargo deny --manifest-path src-tauri/Cargo.toml check advisories
+  rust_advisory_status="PASSED"
+elif [[ "$strict" == "1" ]]; then
+  printf "FAIL: cargo-audit or cargo-deny is required in strict mode.\n"
+  exit 1
 else
-  printf "SKIP: cargo-audit is unavailable; Rust advisory status is INDETERMINATE.\n"
+  printf "SKIP: cargo-audit/cargo-deny are unavailable; Rust advisory status is INDETERMINATE.\n"
 fi
 
 printf "Full non-live verification completed. Rust advisory status: %s.\n" "$rust_advisory_status"

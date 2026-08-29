@@ -22,7 +22,9 @@ acceptance and release gate may change that statement.
    state.
 6. The active task record or an instance of
    [planning/TASK_TEMPLATE.md](planning/TASK_TEMPLATE.md).
-7. Applicable decisions under [`planning/decisions/`](planning/decisions/0001-fixed-project-decisions.md).
+7. Applicable decisions under [`planning/decisions/`](planning/decisions/0001-fixed-project-decisions.md):
+   [0001 fixed project decisions](planning/decisions/0001-fixed-project-decisions.md)
+   and [0002 proprietary license and business model](planning/decisions/0002-proprietary-license-and-business-model.md).
 
 ## Source precedence
 

@@ -32,7 +32,9 @@
     "active": true,
     "targets": ["appimage"],
     "resources": {
-      "../voice-runtime": "voice-runtime"
+      "../voice-runtime/setup.sh": "voice-runtime/setup.sh",
+      "../voice-runtime/setup-high-accuracy.sh": "voice-runtime/setup-high-accuracy.sh",
+      "../voice-runtime/listener.py": "voice-runtime/listener.py"
     },
     "icon": [
       "icons/32x32.png",

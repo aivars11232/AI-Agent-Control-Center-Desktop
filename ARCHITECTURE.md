@@ -366,6 +366,29 @@ packaged acceptance.
 - Git evidence is read through direct hardened Git commands in a selected
   workspace; descriptor-confined filesystem evidence is the explicit fallback
   for non-Git roots or unusable Git state.
+- Removal is backend-authoritative: `src-tauri/src/lifecycle_removal.rs` owns
+  the inventory of every on-disk location across both the
+  `com.aivarsrocens.aiagentcontrolcenter` bundle identifier and the
+  `ai-agent-control-center` namespace, and the `--stop-runtime`, `--uninstall`
+  (keep-data), and `--purge --confirm PURGE` subcommands. The shell installers
+  never hard-code data paths; the persistent KDE portal permission is revoked
+  only in KDE System Settings.
+
+### Packaging and CI
+
+- Two install paths: `install-kde.sh` (user-local `~/.local`, idempotent
+  upgrade with rollback, no PlasmaShell restart) and `packaging/PKGBUILD` (Arch
+  system package, `/usr/lib` payload with a `/usr/bin` symlink, pacman hooks).
+- Release metadata: proprietary root `LICENSE` (`LicenseRef-proprietary`),
+  `THIRD-PARTY-NOTICES.md`, repository/license/engines fields in
+  `package.json` and `Cargo.toml`, a single-main-category desktop entry, and a
+  validated AppStream `metainfo.xml`.
+- `.github/workflows/ci.yml` runs one strictly sequential job chain
+  (`frontend → rust → scripts → licenses → secrets → packaging`) with no
+  release step and no live AI/microphone/portal/system action. `cargo-deny`,
+  `scripts/check-licenses.sh` (permissive-only), and `gitleaks` are mandatory;
+  the Arch `packaging` job exercises `makepkg`, `namcap`, and the staged
+  install/removal test in a container.
 
 ## Current run flow
 
@@ -607,9 +630,11 @@ TASK-0016 establishes deterministic offline voice plus non-live
 KDE/portal/XDG integration contracts. TASK-0017 establishes strict bounded
 Coding, Debugging, Browser Research, and Financial Analysis profiles.
 TASK-0018 establishes passive reminders/events, scoped structured memory, and
-sequential management handoffs. TASK-0020 retains their sequential live and
-packaged acceptance; TASK-0019 through TASK-0020 complete packaging,
-acceptance, and release.
+sequential management handoffs. TASK-0019 establishes reproducible user-local
+and Arch packaging, backend-authoritative keep-data / purge removal, proprietary
+release metadata with a permissive third-party inventory, and a sequential
+CI/security gate. TASK-0020 retains all sequential live and packaged acceptance
+and is the only production-readiness gate.
 
 Exact dependencies and gates are authoritative in
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).

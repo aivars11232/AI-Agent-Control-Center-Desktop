@@ -313,9 +313,23 @@ and a one-minute backlog retry. Backward clock movement skips age deletion and
 is recorded. Monitoring queries bind application/task/run/review/lifecycle
 revisions transactionally and stale tuples fail closed. Local activity clear
 requires native confirmation and cannot clear the authoritative run/review
-ledger. Remaining lifecycle ownership is physical database/file purge,
-installed removal evidence, mandatory advisory tooling, and live upgrade or
-packaged recovery acceptance under TASK-0019–TASK-0020.
+ledger.
+
+Privacy-safe removal (TASK-0019) is backend-authoritative:
+`src-tauri/src/lifecycle_removal.rs` enumerates every owned Linux location
+across both the `com.aivarsrocens.aiagentcontrolcenter` bundle identifier
+(database, WebKitGTK data/cache/cookies, debug logs) and the
+`ai-agent-control-center` namespace (voice models/venv, voice config and the
+KDE portal restore token, voice download cache, compositor/voice runtime).
+`--stop-runtime` escalates `SIGTERM` then `SIGKILL` over the tray process and an
+orphaned voice listener; `--uninstall` keeps only the database and voice models;
+`--purge --confirm PURGE` removes every location, clears the stored provider key
+from the OS keyring, deletes the portal restore token, and is idempotent. A
+safety check refuses any path that is not namespaced and strictly below a known
+XDG root. The persistent KDE screen-cast / remote-desktop *permission* is owned
+by KDE System Settings and every removal path states that it cannot revoke it.
+Live installed removal, purge, and packaged recovery acceptance remain with
+TASK-0020.
 
 Exact approval binding stores normalized intent JSON in the local database.
 Canonical text-input and coding-task approvals contain SHA-256 plus byte length,
@@ -338,10 +352,16 @@ event listeners behind a typed desktop client, but the backend remains the
 authority and persistence keeps its revision-aware injected invoke boundary.
 TASK-0015 removes the direct renderer application/window/input command surface
 and exposes one typed gateway plus a read-only redacted audit query. TASK-0016
-implements deterministic offline listener/portal integration reliability;
-TASK-0019 owns mandatory dependency/CI gates; TASK-0020 owns live installed and
-packaged platform acceptance. Current source tests do not replace those later
-live gates.
+implements deterministic offline listener/portal integration reliability.
+TASK-0019 adds the sequential `.github/workflows/ci.yml` gate: `cargo-deny`
+(advisories, licenses, bans, sources), `scripts/check-licenses.sh` (fails on any
+non-permissive dependency license), `gitleaks`, `shellcheck`, packaging
+validation, and a containerised Arch `makepkg` + staged install/removal test,
+all with no live AI/microphone/portal/system action and no release step.
+`scripts/verify-full.sh` runs the same gates locally and marks the Rust advisory
+result **indeterminate** when the tooling is absent rather than passing.
+TASK-0020 owns live installed and packaged platform acceptance. Current source
+tests do not replace those later live gates.
 
 ### Heuristic task-text checks
 
@@ -409,9 +429,14 @@ local time/DST/due windows/anchored recurrence, restart and delivery evidence,
 passive model behavior, schema-v11 migration, backup-v4 sanitization, scoped
 memory/provenance/exact bundles, sequential handoffs, bounded retention, and a
 fake notification sink; three frontend tests cover due-window and management-
-handoff presentation. These checks do not establish live
-end-to-end, packaging, upgrade, or live acceptance. Rust advisory status remains
-indeterminate when <code>cargo-audit</code> is unavailable.
+handoff presentation. Ten TASK-0019 Rust tests cover the owned-data-location
+inventory, the keep-data / purge scope split, idempotent re-purge, the
+hostile-<code>XDG</code> guard, and `SIGTERM → SIGKILL` process escalation;
+`scripts/staged-install-test.sh` and `scripts/check-licenses.sh` run in the full
+gate. These checks do not establish live end-to-end, packaging, upgrade,
+installed removal, or live acceptance. Rust advisory status is **indeterminate**
+locally when <code>cargo-audit</code>/<code>cargo-deny</code> is unavailable;
+CI installs and requires them.
 
 ## Target security invariants
 

@@ -3,8 +3,14 @@ name = "ai-agent-control-center"
 version = "0.5.1"
 description = "Desktop control center for managing AI agents"
 authors = ["Aivars Rocens"]
-license = ""
-repository = ""
+# Proprietary project license (SPDX: LicenseRef-proprietary). Cargo's `license`
+# field only accepts recognised SPDX-list identifiers, so the non-standard
+# license is declared through `license-file`, which points at the repository
+# root LICENSE. See THIRD-PARTY-NOTICES.md for bundled third-party licenses.
+license-file = "../LICENSE"
+repository = "https://github.com/aivars11232/AI-Agent-Control-Center-Desktop"
+homepage = "https://github.com/aivars11232/AI-Agent-Control-Center-Desktop"
+publish = false
 edition = "2021"
 rust-version = "1.77.2"
 

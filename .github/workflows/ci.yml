@@ -1,0 +1,146 @@
+name: CI
+
+# TASK-0019 deterministic CI / security / packaging gate.
+#
+# Jobs run strictly in sequence (each `needs:` the previous one) so the whole
+# workflow is a single ordered chain. No job starts a live AI provider,
+# microphone capture, KDE portal, installer against the real environment, or
+# any desktop/system-control action. There is no release or publish step.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  VERIFY_STRICT: "1"
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  rust:
+    needs: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libsoup-3.0-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+      - name: Dependency advisories, licenses, bans, sources
+        run: cargo deny --manifest-path src-tauri/Cargo.toml check
+
+  scripts:
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            shellcheck desktop-file-utils appstream
+      - name: Python voice-runtime tests
+        run: python3 -B -W error::ResourceWarning -m unittest discover -s tests/voice_runtime -p 'test_*.py'
+      - name: Packaging validation (shellcheck, desktop entry, AppStream)
+        run: bash scripts/check-packaging.sh
+
+  licenses:
+    needs: scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci --ignore-scripts
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+      - name: Third-party license gate
+        run: bash scripts/check-licenses.sh
+
+  secrets:
+    needs: licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          version=8.21.2
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          sudo install -Dm755 gitleaks /usr/local/bin/gitleaks
+      - name: Secret scan
+        run: gitleaks detect --source . --redact --no-banner --verbose
+
+  packaging:
+    needs: secrets
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install Arch build environment
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git rust npm nodejs pkgconf \
+            webkit2gtk-4.1 gtk3 libappindicator-gtk3 librsvg sqlite \
+            desktop-file-utils appstream namcap shellcheck sudo
+      - uses: actions/checkout@v4
+      - name: Create non-root build user
+        run: |
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          printf 'builder ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/builder
+      - name: Build the package with makepkg
+        run: sudo -u builder bash -c 'cd packaging && makepkg -f --noconfirm'
+      - name: namcap
+        run: |
+          namcap packaging/PKGBUILD || true
+          sudo -u builder bash -c 'cd packaging && namcap ./*.pkg.tar.zst' || true
+      - name: Strict packaging validation
+        run: sudo -u builder env VERIFY_STRICT=1 bash scripts/check-packaging.sh
+      - name: Staged install / upgrade / remove / purge
+        run: |
+          sudo -u builder env \
+            AACC_TEST_BINARY="$GITHUB_WORKSPACE/src-tauri/target/release/ai-agent-control-center" \
+            bash scripts/staged-install-test.sh

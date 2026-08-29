@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 Aivars Rocens -->
+<component type="desktop-application">
+  <id>com.aivarsrocens.aiagentcontrolcenter</id>
+
+  <name>AI Agent Control Center</name>
+  <summary>Govern, route, and audit bounded local AI agents</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary=https://github.com/aivars11232/AI-Agent-Control-Center-Desktop/blob/main/LICENSE</project_license>
+
+  <developer id="com.aivarsrocens">
+    <name>Aivars Rocens</name>
+  </developer>
+
+  <description>
+    <p>
+      AI Agent Control Center is a local desktop governance layer for a persistent
+      AI workforce. It creates, configures, monitors, routes, executes, reviews,
+      and audits bounded agents while the human owner stays authoritative over
+      permissions, approvals, external actions, and release decisions.
+    </p>
+    <p>
+      The Tauri and Rust backend owns durable state, capability policy, approval
+      authority, and single-run coordination. Agents run only through the
+      installed Codex CLI or a local Ollama instance, and the offline voice
+      runtime, KDE portal integration, reminders, and structured memory all
+      operate under the same backend policy boundary.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">ai-agent-control-center.desktop</launchable>
+
+  <provides>
+    <binary>ai-agent-control-center</binary>
+  </provides>
+
+  <url type="homepage">https://github.com/aivars11232/AI-Agent-Control-Center-Desktop</url>
+  <url type="bugtracker">https://github.com/aivars11232/AI-Agent-Control-Center-Desktop/issues</url>
+
+  <categories>
+    <category>Development</category>
+  </categories>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.5.1" type="development" date="2026-08-29">
+      <description>
+        <p>Development / pre-production build. Not production-ready.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -90,16 +90,38 @@ that own those state changes. Portable backup v4 carries sanitized schedules
 and unexpired structured memory while excluding notification authority and
 delivery evidence, management handoffs, and run/review history.
 
-TASK-0018 did **not** run a live Codex task, Ollama, hosted web search, or
-another model/provider. It also did not capture microphone input; import or
-start the Python listener;
-authorize a KDE/XDG portal; send a live desktop notification; execute voice/
-install/remove scripts; build a desktop package; or perform a desktop/system-
-control action. The retained TASK-0008
-Ollama tests use isolated numeric-loopback fake servers and temporary
-workspaces; TASK-0007's
-Codex subprocess tests use an isolated fake CLI. Earlier audit observations
-remain historical unless this document identifies a fresh result.
+TASK-0019 adds the proprietary root <code>LICENSE</code>
+(<code>LicenseRef-proprietary</code>), a third-party license inventory, and
+repository/license/engines metadata in <code>package.json</code>,
+<code>Cargo.toml</code>, the desktop entry, and a validated AppStream
+<code>metainfo.xml</code>. It adds a backend module that is the single source
+of truth for every owned Linux data location and binary subcommands
+(<code>--print-data-paths</code>, <code>--stop-runtime</code>,
+<code>--uninstall</code>, <code>--purge --confirm PURGE</code>) so removal
+scripts never hard-code paths. Keep-data removal preserves only the SQLite
+database and downloaded voice models; purge removes every owned location
+(both the <code>com.aivarsrocens.aiagentcontrolcenter</code> and
+<code>ai-agent-control-center</code> namespaces), the stored provider key, and
+the KDE portal restore token, and stops the tray process and any orphaned
+voice listener. <code>install-kde.sh</code> gains idempotent upgrade with
+rollback and no longer restarts PlasmaShell; a <code>packaging/PKGBUILD</code>
+builds the Arch system package. A sequential <code>.github/workflows/ci.yml</code>
+gate runs frontend, Rust, script, dependency-advisory, license, secret, and
+Arch-packaging checks with no live AI/microphone/portal/system action and no
+release step. The application version stays <code>0.5.1</code> and remains
+development / pre-production until TASK-0020.
+
+TASK-0019 did **not** run a live Codex task, Ollama, hosted web search, or
+another model/provider; capture microphone input; start the Python listener;
+authorize a KDE/XDG portal; run <code>install-kde.sh</code>,
+<code>uninstall-kde.sh</code>, or a purge against the real machine; restart the
+real PlasmaShell; build a package against the real system; or run the GitHub
+Actions workflow. Every packaging, license, and removal check ran against a
+throwaway <code>$HOME</code> and <code>$XDG_RUNTIME_DIR</code>. The retained
+TASK-0008 Ollama tests use isolated numeric-loopback fake servers and temporary
+workspaces; TASK-0007's Codex subprocess tests use an isolated fake CLI.
+Earlier audit observations remain historical unless this document identifies a
+fresh result.
 
 ## Product and release identity
 
@@ -107,6 +129,8 @@ remain historical unless this document identifies a fresh result.
 | --- | --- |
 | Product | AI Agent Control Center |
 | Version | <code>0.5.1</code> in <code>package.json</code> and <code>src-tauri/tauri.conf.json</code> |
+| License | Proprietary — <code>LicenseRef-proprietary</code>, root <code>LICENSE</code>; third-party components in <code>THIRD-PARTY-NOTICES.md</code> |
+| Repository | <code>https://github.com/aivars11232/AI-Agent-Control-Center-Desktop</code> in <code>package.json</code> and <code>src-tauri/Cargo.toml</code> |
 | Release state | Development/pre-production prototype |
 | Primary platform direction | Arch Linux, KDE Plasma, and Wayland |
 | Frontend | React 19, TypeScript, and Vite |
@@ -162,10 +186,15 @@ remain historical unless this document identifies a fresh result.
 | <code>src-tauri/src/voice_runtime.rs</code> | Private release paths, strict manifests, atomic promotion, cancellation/process-group state, listener lifecycle, and bounded diagnostics |
 | <code>src-tauri/src/desktop_control.rs</code> | Exact Full PC Control eligibility and pressed-input release tracking |
 | <code>src-tauri/src/persistence.rs</code> / <code>src-tauri/migrations/</code> | SQLite repository/service, schema migration, crash-safe transactions, and persistence tests |
-| <code>src-tauri/src/main.rs</code> | Desktop entry point |
+| <code>src-tauri/src/main.rs</code> | Desktop entry point and CLI subcommand dispatch |
+| <code>src-tauri/src/lifecycle_removal.rs</code> | Authoritative owned-data-location inventory, keep-data vs purge removal, and owned-process shutdown |
 | <code>src-tauri/tauri.conf.json</code> | Tauri window, security, bundle, and resource configuration |
 | <code>voice-runtime/</code> | Python offline listener plus setup scripts |
-| <code>install-kde.sh</code> / <code>uninstall-kde.sh</code> | KDE-oriented local install and removal scripts |
+| <code>LICENSE</code> / <code>THIRD-PARTY-NOTICES.md</code> | Proprietary project license and the permissive third-party inventory |
+| <code>install-kde.sh</code> / <code>uninstall-kde.sh</code> | User-local install/upgrade and keep-data / <code>--purge</code> removal |
+| <code>packaging/PKGBUILD</code> / <code>packaging/*.install</code> / <code>packaging/*.metainfo.xml</code> | Arch system package, pacman hooks, and AppStream metadata |
+| <code>.github/workflows/ci.yml</code> | Sequential frontend/Rust/script/advisory/license/secret/packaging gate |
+| <code>scripts/check-packaging.sh</code> / <code>scripts/check-licenses.sh</code> / <code>scripts/staged-install-test.sh</code> / <code>deny.toml</code> | Packaging validation, permissive-license gate, throwaway-home install/removal test, and cargo-deny policy |
 
 The renderer is now split by domain, service, shell, shared component, and
 feature responsibility. <code>src-tauri/src/lib.rs</code> remains a separate
@@ -715,6 +744,73 @@ coverage. Model download/install, microphone behavior, portal authorization,
 compositor actions, restored-session behavior, and packaged KDE/Wayland/XDG
 compatibility were not exercised; TASK-0020 owns those live acceptance gates.
 
+## Packaging and privacy-safe removal
+
+<code>src-tauri/src/lifecycle_removal.rs</code> is the authoritative inventory of
+every owned Linux location, spanning both the Tauri bundle identifier
+(<code>com.aivarsrocens.aiagentcontrolcenter</code>: SQLite database, WebKitGTK
+data/cache/cookies, debug logs) and the <code>ai-agent-control-center</code>
+namespace (voice models and virtual environment, voice configuration and the
+KDE portal restore token, voice download cache, and the compositor/voice
+runtime directory). The binary exposes <code>--print-data-paths</code>,
+<code>--stop-runtime</code>, <code>--uninstall</code>, and
+<code>--purge --confirm PURGE</code>; <code>--stop-runtime</code> escalates
+<code>SIGTERM</code> then <code>SIGKILL</code> over the tray process and an
+orphaned voice listener. Keep-data removal retains only the database and
+downloaded voice models; purge removes every owned location, clears the stored
+provider key, deletes the portal restore token, and is idempotent. A
+hostile-<code>XDG</code> safety check refuses any path that is not namespaced
+and strictly below a known root. The persistent KDE screen-cast / remote-desktop
+permission is revoked only in KDE System Settings and every removal path says so.
+
+<code>install-kde.sh</code> checks prerequisites, installs the payload under
+<code>~/.local/lib/ai-agent-control-center/</code> with a
+<code>~/.local/bin</code> launcher symlink, performs idempotent upgrades that
+preserve the previous binary and roll back on a failed post-install check,
+installs the license and AppStream metadata, and refreshes the freedesktop and
+KDE caches with <code>update-desktop-database</code>,
+<code>gtk-update-icon-cache</code>, and <code>kbuildsycoca6</code> — it no longer
+restarts PlasmaShell. <code>uninstall-kde.sh</code> delegates data removal to the
+binary and offers a <code>--purge</code> mode gated by a typed
+<code>PURGE</code> confirmation. <code>packaging/PKGBUILD</code> plus
+<code>packaging/ai-agent-control-center.install</code> build the Arch system
+package, install the binary to <code>/usr/lib</code> with a <code>/usr/bin</code>
+symlink, and instruct the user to run the removal subcommands before
+<code>pacman -R</code>. The desktop entry declares a single main category and a
+validated AppStream <code>metainfo.xml</code> carries
+<code>project_license LicenseRef-proprietary</code>.
+
+These behaviors have deterministic coverage from
+<code>scripts/staged-install-test.sh</code> (binary subcommands and both
+<code>uninstall-kde.sh</code> modes in a throwaway <code>$HOME</code>) and
+<code>scripts/check-packaging.sh</code>. Real installation, upgrade, removal,
+purge, PlasmaShell behavior, and packaged acceptance on the live machine remain
+with TASK-0020.
+
+## Continuous integration and license posture
+
+<code>.github/workflows/ci.yml</code> runs six jobs strictly in sequence
+(<code>frontend → rust → scripts → licenses → secrets → packaging</code>) under
+one concurrency group, with no release or publish step and no live
+AI/microphone/portal/system action. The Rust job makes <code>cargo-deny</code>
+(advisories, licenses, bans, sources) mandatory; the license job runs
+<code>scripts/check-licenses.sh</code>, which fails the build on any
+non-permissive dependency license; the secrets job runs <code>gitleaks</code>;
+the packaging job builds the Arch package with <code>makepkg</code>, runs
+<code>namcap</code>, and runs the staged install/removal test inside an
+<code>archlinux:latest</code> container. <code>scripts/verify-full.sh</code>
+adds the same packaging, license, staged-install, and (in
+<code>VERIFY_STRICT=1</code>) shellcheck / advisory gates locally; when the
+advisory tooling is absent it reports the skip and marks the Rust advisory
+status **indeterminate** rather than passing.
+
+The application and every dependency are cleared for proprietary distribution:
+545 third-party crates and all npm packages resolve to permissive licenses with
+no GPL/AGPL/standalone-LGPL. <code>THIRD-PARTY-NOTICES.md</code> records the
+inventory and notes that the LGPL relink/source obligation would apply only to a
+bundled artifact, which the supported Arch and user-local paths avoid by using
+system libraries.
+
 ## Current safety enforcement
 
 The backend currently:
@@ -895,24 +991,43 @@ plus full npm audits reporting zero vulnerabilities. No live provider,
 notification portal, microphone, installer, package, or desktop/system action
 was run.
 
-<code>cargo-audit</code> is not installed in the inspected environment. The
-full route therefore reports the Rust advisory result as **indeterminate** and
-does not represent the skip as a pass. Mandatory installed/CI security tooling
-belongs to TASK-0019.
+TASK-0019 checks passed on 2026-08-29: 10 new
+<code>lifecycle_removal</code> Rust tests cover XDG fallback resolution, the
+keep-data / purge scope split, idempotent re-purge, dry-run safety, the
+hostile-<code>XDG</code> guard, the <code>/proc</code> process-group parser, the
+listener-cmdline matcher, and <code>SIGTERM → SIGKILL</code> escalation.
+<code>scripts/staged-install-test.sh</code> passed 31 assertions across the
+binary subcommands and both <code>uninstall-kde.sh</code> modes in a throwaway
+<code>$HOME</code>. <code>scripts/check-packaging.sh</code> passed
+(<code>desktop-file-validate</code>, <code>appstreamcli validate</code>,
+<code>makepkg --printsrcinfo</code>, the single-main-category check, and the
+no-PlasmaShell-restart check). <code>scripts/check-licenses.sh</code> passed
+across 545 crates and every npm package. <code>npm run verify:fast</code>
+passed with 22 frontend files/69 tests, 7 Python tests, rustfmt, and 217
+locked/offline Rust tests; <code>npm run verify:full</code> repeated those,
+built 70 modules, passed Clippy with warnings denied, and reported zero npm
+vulnerabilities.
+
+<code>cargo-audit</code>, <code>cargo-deny</code>, and <code>shellcheck</code>
+are not installed on the development machine, so <code>verify:full</code>
+reports the Rust advisory result as **indeterminate** and does not represent
+the skip as a pass. The CI <code>rust</code>, <code>licenses</code>, and
+<code>scripts</code> jobs install and require them under
+<code>VERIFY_STRICT=1</code>, making the advisory, license, and shell-lint
+gates mandatory for the branch.
 
 ## Known gaps and roadmap ownership
 
 | Gap | Owning task |
 | --- | --- |
-| Mandatory installed/CI Rust advisory tooling | TASK-0019 |
 | Live Codex compatibility, authentication, model, and packaged-platform acceptance | TASK-0020 |
 | Live Ollama connectivity, installed-model behavior, cancellation, and packaged-platform acceptance | TASK-0020 |
 | Live core-specialist provider, hosted-search, structured-result, and adapter-limit acceptance | TASK-0020 |
 | Live installed reminder timer/tray, XDG notification portal, restart, and DST acceptance | TASK-0020 |
-| Physical database/file purge and installed removal evidence | TASK-0019 |
+| Live installed removal / purge evidence, real PlasmaShell behavior, and real `makepkg` package acceptance | TASK-0020 |
 | Installed WebView, packaged accessibility, and live platform acceptance | TASK-0020 |
 | Live installed voice, microphone, restored-session, and KDE/portal/XDG acceptance | TASK-0020 |
-| Packaging, CI, live acceptance, and production gate | TASK-0019–TASK-0020 |
+| Full sequential live acceptance and production gate | TASK-0020 |
 
 See [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for exact sequencing.
 

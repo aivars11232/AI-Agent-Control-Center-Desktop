@@ -4,6 +4,7 @@ mod authorization;
 mod codex_runtime;
 mod data_lifecycle;
 mod desktop_control;
+mod lifecycle_removal;
 mod linux_desktop;
 mod linux_paths;
 mod management_handoffs;
@@ -775,6 +776,173 @@ fn emit_voice_runtime_status(app: &AppHandle, runtime: &VoiceRuntime) {
 pub fn remove_stored_credentials_for_uninstall() {
     if let Ok(entry) = openai_entry() {
         let _ = entry.delete_credential();
+    }
+}
+
+fn clear_stored_credentials_for_removal() -> String {
+    match openai_entry() {
+        Ok(entry) => match entry.delete_credential() {
+            Ok(()) => {
+                "credentials: cleared the stored provider key from the OS keyring".to_string()
+            }
+            Err(keyring::Error::NoEntry) => "credentials: no stored provider key".to_string(),
+            Err(error) => format!("credentials: FAILED to clear the stored provider key ({error})"),
+        },
+        Err(message) => format!("credentials: FAILED ({message})"),
+    }
+}
+
+const PORTAL_PERMISSION_NOTE: &str = concat!(
+    "note: the persistent KDE screen-cast / remote-desktop permission grant is owned by ",
+    "KDE System Settings > Applications > Legacy X11 App Support (or the Flatpak portal ",
+    "permission store) and must be revoked there; the application cannot revoke it."
+);
+
+/// Handle command-line subcommands used by the packaging and removal scripts.
+///
+/// Returns `Some(exit_code)` when a subcommand was handled and the process
+/// should exit without launching the GUI, or `None` to continue to [`run`].
+pub fn run_cli(arguments: &[String]) -> Option<i32> {
+    let flags: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let has = |flag: &str| flags.contains(&flag);
+
+    if has("--help") || has("-h") {
+        println!(
+            "{} {}\n\n\
+             Usage: {} [SUBCOMMAND]\n\n\
+             With no subcommand the desktop application starts.\n\n\
+             Subcommands:\n  \
+             --help, -h            show this help\n  \
+             --version             print the version\n  \
+             --print-data-paths    list every owned data location and its status\n  \
+             --stop-runtime        stop the tray process and the offline-voice listener\n  \
+             --remove-credentials  clear the stored provider key from the OS keyring\n  \
+             --uninstall           stop the runtime and remove app state, keeping the\n                        \
+             database and downloaded voice models\n  \
+             --purge --confirm PURGE\n                        \
+             stop the runtime and irreversibly remove all owned data",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            env!("CARGO_PKG_NAME"),
+        );
+        return Some(0);
+    }
+
+    if has("--version") {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        return Some(0);
+    }
+
+    // Backwards compatibility: earlier install/uninstall scripts call this.
+    if has("--remove-credentials") {
+        println!("{}", clear_stored_credentials_for_removal());
+        return Some(0);
+    }
+
+    if has("--print-data-paths") {
+        return Some(match lifecycle_removal::RemovalPaths::discover() {
+            Ok(paths) => {
+                print!("{}", paths.inventory_text());
+                println!("{} owned location(s) tracked", paths.locations().len());
+                println!("database file: {}", paths.database_file().display());
+                println!(
+                    "portal restore token: {}",
+                    paths.portal_restore_token_file().display()
+                );
+                println!("{PORTAL_PERMISSION_NOTE}");
+                0
+            }
+            Err(message) => {
+                eprintln!("could not resolve owned data locations: {message}");
+                1
+            }
+        });
+    }
+
+    if has("--stop-runtime") {
+        let report = lifecycle_removal::stop_owned_processes();
+        print!("{}", report.to_text());
+        return Some(i32::from(report.had_failure()));
+    }
+
+    if has("--uninstall") {
+        return Some(run_removal_cli(
+            lifecycle_removal::RemovalScope::KeepUserData,
+            &flags,
+        ));
+    }
+
+    if has("--purge") {
+        return Some(run_removal_cli(
+            lifecycle_removal::RemovalScope::Purge,
+            &flags,
+        ));
+    }
+
+    None
+}
+
+fn run_removal_cli(scope: lifecycle_removal::RemovalScope, flags: &[&str]) -> i32 {
+    use lifecycle_removal::{RemovalScope, PURGE_CONFIRMATION_TOKEN};
+
+    let paths = match lifecycle_removal::RemovalPaths::discover() {
+        Ok(paths) => paths,
+        Err(message) => {
+            eprintln!("could not resolve owned data locations: {message}");
+            return 1;
+        }
+    };
+
+    if matches!(scope, RemovalScope::Purge) {
+        let confirmed = flags
+            .iter()
+            .position(|value| *value == "--confirm")
+            .and_then(|index| flags.get(index + 1))
+            .map(|value| *value == PURGE_CONFIRMATION_TOKEN)
+            .unwrap_or(false);
+        if !confirmed {
+            println!(
+                "Refusing to purge without confirmation. This irreversibly deletes all local\n\
+                 application data, including the database, downloaded voice models, logs, caches,\n\
+                 configuration, and the KDE portal restore token.\n\n\
+                 Dry run of what would be removed:\n"
+            );
+            print!("{}", paths.execute(RemovalScope::Purge, true).to_text());
+            println!(
+                "\nRe-run with:  ai-agent-control-center --purge --confirm {PURGE_CONFIRMATION_TOKEN}"
+            );
+            return 2;
+        }
+    }
+
+    let stop_report = lifecycle_removal::stop_owned_processes();
+    print!("{}", stop_report.to_text());
+
+    let removal_report = paths.execute(scope, false);
+    print!("{}", removal_report.to_text());
+
+    let credentials = clear_stored_credentials_for_removal();
+    println!("{credentials}");
+    println!("{PORTAL_PERMISSION_NOTE}");
+
+    let credentials_failed = credentials.contains("FAILED");
+    if stop_report.had_failure() || removal_report.had_failure || credentials_failed {
+        eprintln!("removal completed with errors; see the report above");
+        1
+    } else {
+        match scope {
+            RemovalScope::KeepUserData => println!(
+                "application removal complete; database and downloaded voice models were preserved"
+            ),
+            RemovalScope::Purge if removal_report.fully_removed() => {
+                println!("purge complete; no owned data remains within scope")
+            }
+            RemovalScope::Purge => {
+                eprintln!("purge finished but some owned locations still report data; see above");
+                return 1;
+            }
+        }
+        0
     }
 }
 

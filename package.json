@@ -2,6 +2,20 @@
   "name": "ai-agent-control-center",
   "private": true,
   "version": "0.5.1",
+  "description": "Local desktop control center for creating, governing, routing, and auditing bounded AI agents on Arch Linux and KDE Plasma.",
+  "license": "SEE LICENSE IN LICENSE",
+  "author": "Aivars Rocens",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aivars11232/AI-Agent-Control-Center-Desktop.git"
+  },
+  "homepage": "https://github.com/aivars11232/AI-Agent-Control-Center-Desktop",
+  "bugs": {
+    "url": "https://github.com/aivars11232/AI-Agent-Control-Center-Desktop/issues"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",

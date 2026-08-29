@@ -129,6 +129,7 @@ Other platforms are not current release targets.
 | [SECURITY_MODEL.md](SECURITY_MODEL.md) | Current trust boundaries, known gaps, and target invariants |
 | [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) | Ordered roadmap, dependencies, milestones, and release gates |
 | [planning/TASK_STATUS.md](planning/TASK_STATUS.md) | Status and closure evidence for every roadmap task |
+| [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | Third-party components and their licenses |
 
 ## Development
 
@@ -168,11 +169,14 @@ installation/removal, or desktop control. The full route accesses the npm
 advisory service, so its audit result is a fresh time-dependent check rather
 than offline evidence.
 
-If `cargo-audit` is available, the full route audits
-`src-tauri/Cargo.lock`. If it is unavailable, the route prints an explicit
-skip and reports the Rust advisory result as **indeterminate**; absence of the
-tool is never reported as a pass. Installing security tooling and making it a
-mandatory CI gate belongs to TASK-0019.
+If `cargo-audit` or `cargo-deny` is available, the full route runs the Rust
+advisory check; if neither is, it prints an explicit skip and reports the
+result as **indeterminate** — absence of the tool is never reported as a pass.
+The full route also runs the packaging validation, the third-party license
+gate, and the staged install/removal test. With `VERIFY_STRICT=1` (set by CI)
+the advisory, license, `shellcheck`, and packaging gates become hard failures
+when their tooling is missing. `.github/workflows/ci.yml` installs `cargo-deny`,
+`gitleaks`, `shellcheck`, and the Arch build environment and enforces them.
 
 Start or build the desktop application only when the active task explicitly
 owns that runtime action:
@@ -182,10 +186,44 @@ npm run desktop
 npm run desktop:build
 ```
 
-The repository also contains `install-kde.sh` and `uninstall-kde.sh`. Those
-scripts mutate the local desktop installation and must only be run as an
-explicitly approved live action. TASK-0002 syntax-checks them but does not
-execute them.
+## Packaging and removal
+
+Two install paths, both under `$HOME` unless noted:
+
+```bash
+bash install-kde.sh                 # build + user-local install / upgrade
+bash uninstall-kde.sh               # remove the app, keep the database + voice models
+bash uninstall-kde.sh --purge       # also delete ALL local data (asks for a typed PURGE)
+```
+
+`packaging/PKGBUILD` builds the Arch system package (`cd packaging && makepkg`).
+Data removal is delegated to the binary so paths never drift:
+
+```bash
+ai-agent-control-center --print-data-paths        # list every owned location
+ai-agent-control-center --stop-runtime            # stop the tray + voice listener
+ai-agent-control-center --uninstall               # keep-data removal
+ai-agent-control-center --purge --confirm PURGE   # full, irreversible purge
+```
+
+Keep-data removal preserves only the SQLite database and downloaded voice
+models. Purge additionally clears the stored provider key and the KDE portal
+restore token. The persistent KDE screen-cast / remote-desktop *permission* is
+revoked in KDE System Settings, not by the app. These scripts mutate the local
+desktop installation and must only be run as an explicitly approved live action.
+
+`.github/workflows/ci.yml` runs a single sequential gate — frontend, Rust
+(`cargo-deny` mandatory), scripts, third-party licenses, secret scan, and an
+Arch `makepkg` + staged install/removal job — with no live AI/microphone/portal
+action and no release step.
+
+## License
+
+AI Agent Control Center is proprietary, commercial, subscription software. See
+[LICENSE](LICENSE) (`LicenseRef-proprietary`, Copyright © 2026 Aivars Rocens,
+all rights reserved). Visibility of this repository grants no license. Bundled
+third-party components keep their own permissive licenses; see
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Working on the project
 

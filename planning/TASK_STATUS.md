@@ -39,8 +39,8 @@ ready merely because its predecessor's code was edited.
 | TASK-0015 | TASK-0014 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Unified voice intent and system-action policy gateway |
 | TASK-0016 | TASK-0015 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Offline voice runtime, KDE portal control, and XDG integration |
 | TASK-0017 | TASK-0016 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Bounded Coding, Debugging, Browser, and Financial agent capabilities |
-| TASK-0018 | TASK-0017 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Reminder scheduler, structured memory, and management handoff workspaces |
-| TASK-0019 | TASK-0018 | NOT STARTED | NO | NOT STARTED | — | — | Packaging, privacy-safe removal, release metadata, and CI security gates |
+| TASK-0018 | TASK-0017 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Reminder scheduler, structured memory, and management handoff workspaces |
+| TASK-0019 | TASK-0018 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Packaging, privacy-safe removal, release metadata, and CI security gates |
 | TASK-0020 | TASK-0019 | NOT STARTED | NO | NOT STARTED | — | — | Sequential live acceptance and version 1.0 release gate |
 
 ## TASK-0001 evidence
@@ -1332,7 +1332,136 @@ ready merely because its predecessor's code was edited.
   and legacy TASK-0011/TASK-0014 fixtures now exercise the v11 authority without
   assuming generic reminder saves or backup v3. No unapproved subsystem,
   migration class, provider action, or security-boundary expansion was added
-- Git closure: pending TASK-0018 user review, commit, push, and successor
+- Git closure: implementation commit
+  <code>fd4b4f5bc7faaa80c60b50c2ecd024379b4d3e71</code> (<code>task18</code>) was
+  identified from actual Git history at the TASK-0019 preflight. It was the
+  checked-out <code>main</code> HEAD, reachable from <code>origin/main</code>,
+  and both refs matched with zero ahead/behind and a clean tree. Its actual
+  28-file scope (reminder scheduler, structured memory, management handoffs,
+  migration <code>0011</code>, Reminders/Agents UI, portable backup v4) matched
+  the reported TASK-0018 implementation with no unexplained intervening state;
+  all seven successor-preflight closure conditions passed and this row was
+  backfilled to <code>COMPLETE</code> in the TASK-0019 implementation commit.
+
+## TASK-0019 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>fd4b4f5bc7faaa80c60b50c2ecd024379b4d3e71</code>
+  (<code>task18</code>)
+- Starting status: clean; checked-out <code>main</code> and
+  <code>origin/main</code> matched with zero ahead/behind
+- Dependency: TASK-0018 satisfied every successor-preflight condition, as
+  recorded and backfilled above
+- Phase A outcome: <code>PHASE_A_READY</code> (after a
+  <code>PHASE_A_DECISION_REQUIRED</code> pass resolved the project license)
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0019 AS PLANNED.</code>
+- Owner license decision: proprietary
+  <code>LicenseRef-proprietary</code> ("AI Agent Control Center Proprietary
+  License", Copyright (c) 2026 Aivars Rocens). Root <code>LICENSE</code> added
+  verbatim; <code>package.json</code> uses
+  <code>"license": "SEE LICENSE IN LICENSE"</code>;
+  <code>Cargo.toml</code> uses <code>license-file = "../LICENSE"</code> with the
+  repository URL; the PKGBUILD uses <code>license=('LicenseRef-proprietary')</code>
+  and installs the text under <code>/usr/share/licenses/</code>; the AppStream
+  metainfo uses <code>metadata_license CC0-1.0</code> plus
+  <code>project_license LicenseRef-proprietary=&lt;LICENSE URL&gt;</code>
+- Dependency-license evidence: <code>cargo metadata</code> over 545 third-party
+  crates and every installed npm package resolved to permissive licenses
+  (MIT / Apache-2.0 / BSD / ISC / Zlib / Unicode-3.0 / Unlicense / 0BSD /
+  BSL-1.0 / MPL-2.0). No GPL/AGPL/standalone-LGPL/SSPL dependency exists, so no
+  additional owner legal decision was required.
+  <code>THIRD-PARTY-NOTICES.md</code> records the inventory and the LGPL
+  obligation that would apply only to a bundled artifact (the supported 0.5.x
+  paths use system libraries)
+- Slice 1 — release/license metadata: added <code>LICENSE</code>,
+  <code>THIRD-PARTY-NOTICES.md</code>, <code>.nvmrc</code>
+  (<code>22.12.0</code>), <code>deny.toml</code>, and
+  <code>packaging/com.aivarsrocens.aiagentcontrolcenter.metainfo.xml</code>;
+  set <code>package.json</code>/<code>Cargo.toml</code> license, repository,
+  description, and engines metadata; narrowed the desktop entry to one main
+  category (<code>Development</code>); listed <code>bundle.resources</code> as
+  explicit files so <code>__pycache__</code> is excluded. Version stays
+  <code>0.5.1</code>. Checks: <code>desktop-file-validate</code>,
+  <code>appstreamcli validate</code>, <code>cargo metadata</code>,
+  <code>npm run build</code>
+- Slice 2 — backend removal core: added
+  <code>src-tauri/src/lifecycle_removal.rs</code> (single source of truth for
+  every owned Linux data location across both the
+  <code>com.aivarsrocens.aiagentcontrolcenter</code> and
+  <code>ai-agent-control-center</code> namespaces) and CLI subcommands in
+  <code>lib.rs</code>/<code>main.rs</code>:
+  <code>--help</code>, <code>--version</code>, <code>--print-data-paths</code>,
+  <code>--stop-runtime</code> (SIGTERM→SIGKILL escalation over the tray process
+  and an orphaned voice listener), <code>--uninstall</code> (keep-data), and
+  <code>--purge --confirm PURGE</code>. Keep-data retains only the SQLite
+  database and downloaded voice models; purge removes everything in scope and
+  is idempotent. 10 new Rust tests (217 total). fmt + Clippy clean
+- Slice 3 — install/upgrade/remove/purge flows: hardened
+  <code>install-kde.sh</code> (prerequisite checks, XDG launcher symlink,
+  idempotent upgrade with previous-binary rollback, license/metainfo install,
+  <strong>removed the unconditional PlasmaShell restart</strong> — desktop and
+  icon caches are refreshed with <code>update-desktop-database</code>,
+  <code>gtk-update-icon-cache</code>, and <code>kbuildsycoca6</code>);
+  rewrote <code>uninstall-kde.sh</code> to delegate data removal to the binary,
+  with a <code>--purge</code> mode gated by a typed <code>PURGE</code>
+  confirmation; added <code>packaging/PKGBUILD</code> and
+  <code>packaging/ai-agent-control-center.install</code> for the Arch system
+  package. Checks: <code>bash -n</code>,
+  <code>scripts/check-packaging.sh</code> (<code>desktop-file-validate</code>,
+  <code>appstreamcli</code>, <code>makepkg --printsrcinfo</code>),
+  <code>scripts/staged-install-test.sh</code> (31 assertions across
+  print-data-paths, stop-runtime, keep-data, purge-without-confirm,
+  purge-with-confirm, idempotent re-purge, and both <code>uninstall-kde.sh</code>
+  modes in a throwaway <code>$HOME</code>)
+- Slice 4 — CI and security gate: added
+  <code>.github/workflows/ci.yml</code> — six jobs
+  (<code>frontend → rust → scripts → licenses → secrets → packaging</code>)
+  chained strictly with <code>needs:</code> under one
+  <code>concurrency</code> group, no release/publish step, and no live
+  AI/microphone/portal/system action. Added
+  <code>scripts/check-licenses.sh</code> (permissive-only allowlist, fails on
+  copyleft), extended <code>scripts/verify-full.sh</code> with the packaging,
+  license, staged-install, and (strict-mode) shellcheck/advisory gates. The
+  Arch <code>packaging</code> job runs <code>makepkg</code>, <code>namcap</code>,
+  strict packaging validation, and the staged install/removal test in an
+  <code>archlinux:latest</code> container. <code>cargo-deny</code> makes the
+  Rust advisory/license/bans/sources check mandatory in CI
+- Slice 5 — documentation: this file plus
+  <code>CURRENT_STATE.md</code>, <code>ARCHITECTURE.md</code>,
+  <code>SECURITY_MODEL.md</code>, <code>README.md</code>, and
+  <code>IMPLEMENTATION_PLAN.md</code> now describe packaging, privacy-safe
+  removal, and the CI gate as current, while keeping every
+  "development / pre-production, not production-ready before TASK-0020" claim
+- Full non-live gate: <code>npm run verify:fast</code> passed with 22 frontend
+  files/69 tests, 7 Python voice-runtime tests, rustfmt, and 217
+  locked/offline Rust tests; <code>npm run verify:full</code> additionally
+  passed the 70-module build, Clippy with warnings denied,
+  shell/Python/strict-JSON checks, dependency trees, production plus full npm
+  audits reporting zero vulnerabilities, the third-party license gate, the
+  packaging validation, and the staged install/upgrade/remove/keep-data/purge
+  test
+- Rust advisory result locally: **indeterminate** —
+  <code>cargo-audit</code>/<code>cargo-deny</code> and <code>shellcheck</code>
+  are not installed on the development machine, so
+  <code>verify:full</code> reports the skip explicitly. The CI
+  <code>rust</code>, <code>licenses</code>, and <code>scripts</code> jobs
+  install and require them (<code>VERIFY_STRICT=1</code>), making the advisory,
+  license, and shell-lint gates mandatory for the branch
+- Live/external actions: no live Codex/Ollama generation, provider
+  authentication, microphone capture, KDE portal authorization, real
+  <code>install-kde.sh</code>/<code>uninstall-kde.sh</code>/purge run against
+  the real machine, real PlasmaShell restart, package build against the real
+  system, or GitHub Actions execution was performed. Every removal/packaging
+  check ran against a throwaway <code>$HOME</code> and
+  <code>$XDG_RUNTIME_DIR</code>. Live installed/packaged acceptance remains
+  with TASK-0020
+- No product-data schema, migration, backup-format, or runtime dependency
+  change was made. <code>PRAGMA user_version</code> stays 11
+- Git closure: pending TASK-0019 user review, commit, push, and successor
   evidence
 
 ## Successor-preflight closure rule
