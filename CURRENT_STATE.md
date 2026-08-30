@@ -889,16 +889,16 @@ and WebSocket endpoints.
 
 ## Verification inventory
 
-Twenty-four Vitest files contain 81 deterministic frontend tests for renderer
+Twenty-five Vitest files contain 83 deterministic frontend tests for renderer
 domain characterization, voice, persistence, revision/fail-closed writer
 behavior, authoritative run/provider/registry/queue/review projections, readable
-rendering of serialized backend error payloads, exact desktop command/event
-mappings, native-dialog focus and cancellation, APG tab keyboard behavior,
-keyboard agent-card activation, skip navigation, page-focus transfer,
-deterministic axe checks, and responsive provider/reduced-motion style
-contracts.
+rendering of serialized backend error payloads, editing a created agent from its
+workspace, exact desktop command/event mappings, native-dialog focus and
+cancellation, APG tab keyboard behavior, keyboard agent-card activation, skip
+navigation, page-focus transfer, deterministic axe checks, and responsive
+provider/reduced-motion style contracts.
 
-The Rust library contains 240 passing tests. They add Codex compatibility,
+The Rust library contains 241 passing tests. They add Codex compatibility,
 command-isolation, bounded protocol, fake-process descendant cleanup, provider
 registry, fake-adapter dispatch, exact identity, typed failure, run-state,
 concurrent admission, idempotency, approval-boundary, cancellation, timeout,
@@ -1040,14 +1040,18 @@ orchestration, review, run, and registry snapshot projections stay mutually
 consistent with backend truth; replay, stale, idempotency-conflict, expired,
 denial, renderer-forgery, and hard-filter-override cases all fail closed, and
 one active run stays authoritative across execute and review. The composed
-matrix found no backend defect. The shared renderer helper
-<code>errorMessage</code> now unpacks a serialized backend rejection
+matrix found no backend defect. Two renderer projection defects surfaced in the
+live pass and were fixed: the shared helper <code>errorMessage</code> now
+unpacks a serialized backend rejection
 (<code>{ code, message, recoverable }</code>) into readable text instead of the
-literal <code>[object Object]</code>, with a new
-<code>src/domain/errors.test.ts</code>. Post-dispatch provider execution
-transport is verified with a fake adapter here and owned live by TASK-0020 /
-TASK-0024. <code>npm run verify:fast</code> passed with 24 frontend files / 81
-tests, 7 Python tests, rustfmt, and 240 locked/offline Rust tests;
+literal <code>[object Object]</code>; and the agent-workspace view gained an
+"Edit agent" action so a created agent's role, category, and reporting line can
+be changed from where it is opened rather than only from the agent list. New
+<code>src/domain/errors.test.ts</code> and
+<code>src/features/agents/AgentsPage.test.tsx</code>. Post-dispatch provider
+execution transport is verified with a fake adapter here and owned live by
+TASK-0020 / TASK-0024. <code>npm run verify:fast</code> passed with 25 frontend
+files / 83 tests, 7 Python tests, rustfmt, and 241 locked/offline Rust tests;
 <code>npm run verify:full</code> repeated those, built 71 modules, passed Clippy
 with warnings denied, the shell/Python/strict-JSON checks, both npm audits with
 zero vulnerabilities, the license gate, packaging validation, and the staged

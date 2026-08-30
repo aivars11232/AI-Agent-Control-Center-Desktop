@@ -592,6 +592,14 @@ export function AgentsPage({
     setEditingAgentId(agent.id);
   }
 
+  // The edit dialog lives in the agent-list view; opening it from an agent
+  // workspace returns to the list with the dialog focused on that agent so its
+  // name, role, category, and reporting line can be changed in one place.
+  function editAgentFromWorkspace(agent: Agent) {
+    setSelectedAgentId(null);
+    openEditAgent(agent);
+  }
+
   async function saveAgent() {
     const trimmedName = agentName.trim();
     const trimmedDescription = agentDescription.trim();
@@ -1547,6 +1555,13 @@ export function AgentsPage({
                 <span className="eyebrow">OVERVIEW</span>
                 <h2>Agent details</h2>
               </div>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => editAgentFromWorkspace(selectedAgent)}
+              >
+                Edit agent
+              </button>
             </div>
 
             <div className="summary-grid">

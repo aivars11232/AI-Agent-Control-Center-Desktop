@@ -14,7 +14,7 @@
 //! TASK-0024: the dispatch boundary is driven with synthetic completions,
 //! exactly as the real provider layer reports them.
 
-use crate::agent_registry::{CreateAgentRequest, DeleteAgentRequest};
+use crate::agent_registry::{CreateAgentRequest, DeleteAgentRequest, UpdateAgentRequest};
 use crate::app_state::WorkspaceDefinition;
 use crate::authorization::{ApprovalResolution, AuthorizationDecision};
 use crate::persistence::{StateEnvelope, StateRepository};
@@ -878,6 +878,85 @@ fn s4_restart_preserves_queue_age_and_escalates_uncertain_dispatch() {
             .any(|entry| entry.enqueue_sequence == head_sequence),
         "the interrupted head must retain its enqueue sequence"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A — a freshly created custom agent can be edited (role / category / manager)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s4_custom_agent_can_be_edited_after_creation() {
+    let (mut repository, revision) = base_repository();
+
+    let created = repository
+        .create_agent(CreateAgentRequest {
+            expected_revision: revision,
+            name: "Linguistics".to_string(),
+            description: "Research, create, work with all sorts of languages.".to_string(),
+            role: "Specialist".to_string(),
+            category: "Research".to_string(),
+            reports_to: Some(9),
+        })
+        .unwrap();
+    let custom_id = created
+        .state
+        .agents
+        .iter()
+        .find(|agent| agent.name == "Linguistics")
+        .unwrap()
+        .id;
+
+    // Change its name, category, role, and reporting line in one update.
+    let updated = repository
+        .update_agent(UpdateAgentRequest {
+            expected_revision: created.revision,
+            agent_id: custom_id,
+            name: "Applied Linguistics".to_string(),
+            description: "Research and tooling for natural language.".to_string(),
+            role: "Senior Agent".to_string(),
+            category: "Research".to_string(),
+            reports_to: Some(6),
+        })
+        .unwrap();
+    let agent = updated
+        .state
+        .agents
+        .iter()
+        .find(|agent| agent.id == custom_id)
+        .unwrap();
+    assert_eq!(agent.name, "Applied Linguistics");
+    assert_eq!(agent.role, "Senior Agent");
+    assert_eq!(agent.reports_to, Some(6));
+    assert_eq!(agent.authority_level, 2);
+    assert_eq!(agent.registry_state, "active");
+
+    // The change survives a database reload and the registry projection agrees.
+    let reloaded = repository.load().unwrap().unwrap().state;
+    assert_eq!(
+        reloaded
+            .agents
+            .iter()
+            .find(|agent| agent.id == custom_id)
+            .unwrap()
+            .reports_to,
+        Some(6)
+    );
+
+    // Self-parenting is still rejected without changing state.
+    let before = repository.load().unwrap().unwrap().revision;
+    let error = repository
+        .update_agent(UpdateAgentRequest {
+            expected_revision: before,
+            agent_id: custom_id,
+            name: "Applied Linguistics".to_string(),
+            description: "Research and tooling for natural language.".to_string(),
+            role: "Senior Agent".to_string(),
+            category: "Research".to_string(),
+            reports_to: Some(custom_id),
+        })
+        .unwrap_err();
+    assert_eq!(error.code, "STATE_VALIDATION_FAILED");
+    assert_eq!(repository.load().unwrap().unwrap().revision, before);
 }
 
 // ---------------------------------------------------------------------------

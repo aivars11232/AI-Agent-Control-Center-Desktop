@@ -1779,25 +1779,38 @@ roadmap.
   <code>agent_registry</code> / <code>task_orchestration</code> /
   <code>run_coordinator</code> / <code>policy</code> / <code>authorization</code>
   / <code>review_orchestration</code> / <code>persistence</code>. No filter,
-  fingerprint bind, one-use consumption, or one-active-run guard was weakened
-- Slice 3 — frontend projection truth: hardened
-  <code>src/domain/errors.ts::errorMessage</code> so a serialized backend
-  rejection object (<code>{ code, message, recoverable }</code> from
-  persistence / policy / routing / review) renders as
-  <code>"&lt;message&gt; (&lt;code&gt;)"</code> instead of the literal
-  <code>[object Object]</code>; a bare code, a bare message, a plain string, and
-  an opaque object all degrade to readable text, and <code>null</code> /
-  <code>undefined</code> fall back to one generic sentence. This is the shared
-  helper used by the Approvals, Tasks, Agents, and orchestration surfaces
-  (matrix G). New <code>src/domain/errors.test.ts</code> (7 cases). No renderer
-  authority was added; the backend stays authoritative
+  fingerprint bind, one-use consumption, or one-active-run guard was weakened.
+  <code>update_agent</code> for a custom agent is now additionally covered by
+  <code>s4_custom_agent_can_be_edited_after_creation</code> (change name / role /
+  category / manager, survive reload, self-parent still rejected) — the backend
+  path was already correct
+- Slice 3 — frontend projection defects found in the live pass and fixed:
+  1. The shared <code>src/domain/errors.ts::errorMessage</code> helper returned
+     <code>String(value)</code> for a non-<code>Error</code> value, so a
+     serialized backend rejection (<code>{ code, message, recoverable }</code>
+     from persistence / policy / routing / review) rendered as the literal
+     <code>[object Object]</code> on the Approvals, Tasks, Agents, and
+     orchestration surfaces (matrix G). It now yields
+     <code>"&lt;message&gt; (&lt;code&gt;)"</code>, a bare code, a bare message,
+     or a plain string, and only falls back to one generic sentence for
+     <code>null</code> / opaque values. New <code>src/domain/errors.test.ts</code>
+     (7 cases).
+  2. <code>src/features/agents/AgentsPage.tsx</code> — after creating (or opening)
+     an agent, the agent-workspace view showed its role, category, and reporting
+     line as read-only text with no way to change them; the only editor was the
+     "Edit" button back in the agent list, which is unreachable once you are in
+     the workspace. Added an "Edit agent" action to the workspace Overview that
+     opens the existing authoritative <code>update_agent</code> editor focused on
+     that agent. New <code>src/features/agents/AgentsPage.test.tsx</code>
+     (2 cases). No renderer authority added; the backend registry stays
+     authoritative
 - Slice 4 — bounded live GUI S4 acceptance: <RECORD OUTCOME>
 - Slice 5 — documentation: this evidence section, the continuation-tracker rows
   for TASK-0022 (Git closure backfill) and TASK-0023, the
   <code>CURRENT_STATE.md</code> verification-inventory refresh and the S4
   stabilization paragraph
-- Full non-live gate on 2026-08-30: <code>npm run verify:fast</code> passed (24
-  frontend files / 81 tests, 7 Python voice-runtime tests, rustfmt, 240
+- Full non-live gate on 2026-08-30: <code>npm run verify:fast</code> passed (25
+  frontend files / 83 tests, 7 Python voice-runtime tests, rustfmt, 241
   locked/offline Rust tests); <code>npm run verify:full</code> passed the
   71-module build, <code>cargo clippy --locked --offline --all-targets -- -D
   warnings</code>, shell (<code>shellcheck</code> clean), Python, strict-JSON,
@@ -1807,9 +1820,9 @@ roadmap.
   <strong>indeterminate</strong> locally (<code>cargo-audit</code> /
   <code>cargo-deny</code> not installed; CI enforces them under
   <code>VERIFY_STRICT=1</code>)
-- Rust test delta: 231 → 240 (+9 <code>orchestration_acceptance</code>).
-  Frontend test delta: 74 → 81 (+7 <code>domain/errors</code>); frontend file
-  count 23 → 24
+- Rust test delta: 231 → 241 (+10 <code>orchestration_acceptance</code>).
+  Frontend test delta: 74 → 83 (+7 <code>domain/errors</code>, +2
+  <code>features/agents/AgentsPage</code>); frontend file count 23 → 25
 - Live/external actions: <RECORD>. No live Codex/Ollama generation, provider
   authentication, microphone, or KDE portal authorization. Post-dispatch
   provider execution transport remains owned by TASK-0024
