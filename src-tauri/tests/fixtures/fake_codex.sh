@@ -79,6 +79,16 @@ emit_success() {
     '{"type":"turn.completed","usage":{"input_tokens":11,"output_tokens":7}}'
 }
 
+emit_coding_result() {
+  # A minimal valid CodingResultV1 agent message (claims no workspace change).
+  # The agent_message text is the CodingResultV1 JSON, escaped as a JSON string.
+  printf '%s\n' \
+    '{"type":"thread.started","thread_id":"thread-fixture"}' \
+    '{"type":"turn.started"}' \
+    '{"type":"item.completed","item":{"id":"message-1","type":"agent_message","text":"{\"kind\":\"coding\",\"summary\":\"Reviewed the fixture workspace and confirmed no change was required.\",\"changes\":[],\"verification\":[],\"evidenceRefs\":[],\"limitations\":[]}"}}' \
+    '{"type":"turn.completed","usage":{"input_tokens":11,"output_tokens":7}}'
+}
+
 spawn_marker_child() {
   local marker="${FAKE_CODEX_MARKER:-task-0007-unmarked-child}"
   /bin/bash -c 'exec -a "$0" /usr/bin/sleep 30' "$marker" &
@@ -92,6 +102,9 @@ spawn_detached_marker_child() {
 case "$scenario" in
   success)
     emit_success
+    ;;
+  success_coding)
+    emit_coding_result
     ;;
   nonzero)
     printf '%s\n' 'bounded fixture failure' >&2

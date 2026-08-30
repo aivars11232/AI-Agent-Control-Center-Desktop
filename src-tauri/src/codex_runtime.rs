@@ -130,7 +130,7 @@ pub(crate) fn inspect_codex_runtime() -> CodexInspection {
     inspect_codex_runtime_at(find_codex_binary(), find_containment_binary(), Vec::new())
 }
 
-fn inspect_codex_runtime_at(
+pub(crate) fn inspect_codex_runtime_at(
     codex_binary: Option<PathBuf>,
     containment_binary: Option<PathBuf>,
     extra_environment: Vec<(OsString, OsString)>,

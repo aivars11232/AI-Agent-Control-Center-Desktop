@@ -70,7 +70,7 @@ impl Drop for TestDirectory {
     }
 }
 
-fn provider_snapshot() -> ProviderRegistrySnapshot {
+pub(crate) fn provider_snapshot() -> ProviderRegistrySnapshot {
     ProviderRegistrySnapshot {
         providers: vec![ProviderRuntimeStatus {
             provider: ollama_descriptor(),

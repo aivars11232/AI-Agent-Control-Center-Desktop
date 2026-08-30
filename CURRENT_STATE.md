@@ -601,7 +601,11 @@ rows, and classifies terminal failures from typed error codes rather than
 provider-specific message text. Historical ledger rows are retained unchanged.
 
 No live provider connectivity, authentication, model execution, or model output
-was checked in TASK-0008.
+was checked in TASK-0008. TASK-0024 later exercised the real Codex CLI and the
+real local Ollama service once through the production code paths (see the
+verification inventory); that live evidence is opt-in
+(<code>provider_review_acceptance::live</code>, <code>#[ignore]</code>d) and is
+not part of the deterministic gate.
 
 ## Current run, routing, and review behavior
 
@@ -898,13 +902,22 @@ cancellation, APG tab keyboard behavior, keyboard agent-card activation, skip
 navigation, page-focus transfer, deterministic axe checks, and responsive
 provider/reduced-motion style contracts.
 
-The Rust library contains 241 passing tests. They add Codex compatibility,
-command-isolation, bounded protocol, fake-process descendant cleanup, provider
-registry, fake-adapter dispatch, exact identity, typed failure, run-state,
-concurrent admission, idempotency, approval-boundary, cancellation, timeout,
-crash/restart, stale completion/event, truncation, and retention coverage to
-the earlier provider, workspace, run-safety, voice, state-validation,
-persistence, authorization, corruption, concurrency, and rollback tests.
+The Rust library contains 251 passing deterministic tests. They add Codex
+compatibility, command-isolation, bounded protocol, fake-process descendant
+cleanup, provider registry, fake-adapter dispatch, exact identity, typed
+failure, run-state, concurrent admission, idempotency, approval-boundary,
+cancellation, timeout, crash/restart, stale completion/event, truncation, and
+retention coverage to the earlier provider, workspace, run-safety, voice,
+state-validation, persistence, authorization, corruption, concurrency, and
+rollback tests. Ten TASK-0024 <code>provider_review_acceptance</code> scenarios
+compose the real post-dispatch path — fake Codex CLI under Bubblewrap or fake
+Ollama loopback transport, bounded workspace-evidence attach, specialist
+finalize, and the sequential review pipeline over a real repository — and assert
+cancellation / timeout / cleanup, one-active-run, evidence completeness, and the
+review verdict / revision / requeue path. A further five
+<code>provider_review_acceptance::live</code> scenarios are <code>#[ignore]</code>
+and exercise the real Codex CLI and the real local Ollama service against
+throwaway workspaces; they are excluded from the deterministic gate.
 Sixteen TASK-0008 tests cover fake-server discovery/transport/cancellation,
 large and conflicting workspace edits, path escape, and bounded tool turns;
 they do not contact a live provider. Twelve TASK-0010 Rust tests cover routing
@@ -1059,6 +1072,37 @@ files / 83 tests, 7 Python tests, rustfmt, and 241 locked/offline Rust tests;
 with warnings denied, the shell/Python/strict-JSON checks, both npm audits with
 zero vulnerabilities, the license gate, packaging validation, and the staged
 install/removal test.
+
+TASK-0024 stabilized the live provider/review slice (S5). Ten new
+<code>provider_review_acceptance</code> Rust scenarios compose the real
+post-dispatch path the way <code>run_agent_task</code> does it — admit → prepare
+→ dispatch through the fake Codex CLI under real Bubblewrap containment or the
+fake Ollama loopback transport → bounded workspace-evidence baseline / finish →
+<code>attach_workspace_evidence</code> → <code>finalize_specialist_result</code>
+→ <code>complete_run</code> → the sequential review pipeline over a real
+repository — filling the seam that <code>orchestration_acceptance</code>
+deliberately drives synthetically. They assert that a provider cancellation is a
+typed terminal <code>cancelled</code> that leaves no owned process and truthful
+evidence, that a timeout is terminal after containment cleanup, that a
+specialist-result kind mismatch fails the run with a typed protocol error while
+retaining the observed workspace mutation and opening no review flow, and that a
+review verdict parsed from real provider output requeues the task with a fresh
+sequence and a fresh approval. The composed matrix found no backend defect and
+required no renderer change; one behaviour-preserving helper
+(<code>provider_success_completion</code>) was extracted from
+<code>run_agent_task</code>. Five <code>#[ignore]</code>d
+<code>provider_review_acceptance::live</code> scenarios were run once against the
+real Codex CLI (<code>codex-cli 0.144.5</code>, ChatGPT-authenticated,
+Bubblewrap-contained) and the real local Ollama service (<code>0.32.3</code>,
+<code>qwen2.5-coder:7b</code>) in throwaway workspaces under an isolated
+<code>XDG_DATA_HOME</code>: identity and model availability resolve; a bounded
+read-only Codex run completes with a truthful capability report and zero
+workspace change; a Codex cancellation returns <code>PROVIDER_CANCELLED</code>
+in under half a second with the Bubblewrap process count back at baseline; a
+bounded Ollama coding run terminates with a typed
+<code>PROVIDER_PROTOCOL_ERROR</code> when the small local model does not emit a
+strict result; and an in-flight Ollama run cancels within milliseconds. The
+migrated prototype database and the S0 backup were not touched.
 
 <code>cargo-audit</code>, <code>cargo-deny</code>, and <code>shellcheck</code>
 are not installed on the development machine, so <code>verify:full</code>

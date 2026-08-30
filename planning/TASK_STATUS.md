@@ -54,8 +54,8 @@ roadmap.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | TASK-0021 | TASK-0020 S3 blocker | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Legacy state migration repair and duplicate identity recovery |
 | TASK-0022 | TASK-0021 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Startup persistence recovery and S3 migration completion |
-| TASK-0023 | TASK-0022 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Agent hierarchy, routing, queue, approvals, and policy live stabilization |
-| TASK-0024 | TASK-0023 | NOT STARTED | NO | NOT STARTED | — | — | Codex / Ollama cancellation, workspace evidence, and review stabilization |
+| TASK-0023 | TASK-0022 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Agent hierarchy, routing, queue, approvals, and policy live stabilization |
+| TASK-0024 | TASK-0023 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Codex / Ollama cancellation, workspace evidence, and review stabilization |
 | TASK-0025 | TASK-0024 | NOT STARTED | NO | NOT STARTED | — | — | Voice, KDE portal, PC control, and notification stabilization |
 | TASK-0026 | TASK-0025 | NOT STARTED | NO | NOT STARTED | — | — | Reminders, memory, backup/restore, and data-lifecycle stabilization |
 | TASK-0027 | TASK-0026 | NOT STARTED | NO | NOT STARTED | — | — | Install, upgrade, remove, purge, and Arch package stabilization |
@@ -1839,6 +1839,149 @@ roadmap.
   additive optional <code>model</code> field on <code>UpdateAgentRequest</code>
   (<code>#[serde(default)]</code>); it routes an already-permitted model change
   through the authoritative registry path
+- Git closure: <code>COMPLETE</code>. User implementation commits
+  <code>8fbdf31</code> + <code>fd05b6c</code> + <code>1200fba6924836244300b0769c435b544d74a0f4</code>
+  (<code>task23</code> / <code>task23.</code> / <code>task23..</code>) were
+  identified from Git history; <code>1200fba</code> is the checked-out
+  <code>main</code> HEAD, is reachable from <code>origin/main</code>, and
+  <code>main</code> vs <code>origin/main</code> is zero ahead / zero behind. The
+  cumulative <code>dfe7cbb..1200fba</code> scope (ten files, +1645 / −147:
+  <code>orchestration_acceptance.rs</code> new; <code>lib.rs</code> test-module
+  wiring; <code>persistence.rs</code> <code>force_expire_approval_for_tests</code>;
+  <code>agent_registry.rs</code>; <code>domain/errors.ts</code> / <code>.test.ts</code>;
+  <code>features/agents/AgentsPage.tsx</code> / <code>.test.tsx</code>;
+  <code>CURRENT_STATE.md</code>; <code>planning/TASK_STATUS.md</code>) matches the
+  TASK-0023 report with no unexplained intervening state, so all seven
+  successor-preflight closure conditions passed. Verified and backfilled during
+  the approved TASK-0024 Phase B on 2026-08-30.
+
+## TASK-0024 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>; starting HEAD
+  <code>1200fba6924836244300b0769c435b544d74a0f4</code> (<code>task23..</code>);
+  clean tree; <code>main</code> vs <code>origin/main</code> zero ahead / zero
+  behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0023 (see
+  its evidence above); its Git closure is backfilled to <code>COMPLETE</code> in
+  this task
+- Phase A outcome: <code>PHASE_A_READY</code>; approval received:
+  <code>APPROVED: IMPLEMENT TASK-0024 AS PLANNED.</code> (decisions D1–D5 accepted
+  as recommended: a bounded live provider batch in an isolated
+  <code>XDG_DATA_HOME</code> with throwaway workspaces; a new test-only module
+  with minimal <code>#[cfg(test)]</code> seams; the live acceptance run inside
+  this task; <code>qwen2.5-coder:7b</code> and a real Codex model; and a
+  <code>codex login</code> pause only if the CLI session were inactive — it was
+  not)
+- Slice 1 — composed post-dispatch provider/review acceptance harness (test
+  only): <code>src-tauri/src/provider_review_acceptance.rs</code>
+  (<code>#[cfg(test)] mod provider_review_acceptance;</code> in
+  <code>src/lib.rs</code>). Ten deterministic S5 scenarios wire the real
+  post-dispatch path the way <code>run_agent_task</code> does it — admit →
+  prepare → dispatch through a real provider adapter helper (the fake Codex CLI
+  <code>tests/fixtures/fake_codex.sh</code> under real Bubblewrap containment, or
+  the fake Ollama HTTP transport on <code>127.0.0.1</code>) → bounded
+  workspace-evidence baseline / finish → <code>attach_workspace_evidence</code> →
+  <code>finalize_specialist_result</code> → <code>complete_run</code> → the
+  sequential review pipeline over a real <code>StateRepository</code>. Covered:
+  Ollama execute produces bounded changed-file / diff evidence and opens a
+  review flow; Ollama execute cancellation is terminal <code>cancelled</code>
+  with retained evidence and no review flow; Codex execute cancellation returns
+  a typed <code>Cancelled</code> error and leaves no owned process; Codex
+  execute timeout is terminal <code>timed_out</code> after containment cleanup;
+  Codex execute success records usage / response and the validated specialist
+  result; a review verdict parsed from real provider output requeues the task
+  with a fresh queue sequence and a fresh approval requirement; a re-executed
+  revision returns the flow to <code>awaiting_review</code>; a specialist-result
+  kind mismatch fails the run with <code>PROVIDER_PROTOCOL_ERROR</code> while
+  retaining the observed workspace mutation and opening no review flow;
+  one-active-run blocks a second dispatch after a real prepare; and a restart
+  after a real dispatch interruption reconciles to
+  <code>manual_review_required</code> while the interrupted head keeps its queue
+  age. Check:
+  <code>cargo test --locked --offline --lib provider_review_acceptance</code> —
+  10 passed
+- Slice 1b — minimal seams (behaviour preserving): a pure
+  <code>provider_success_completion(&ProviderRunResult) -> RunCompletion</code>
+  helper extracted from the <code>run_agent_task</code> success arm (mirrors the
+  existing <code>provider_error_completion</code>); a <code>#[cfg(test)]</code>
+  visibility widening of <code>codex_runtime::inspect_codex_runtime_at</code> so
+  the harness can build a fake Codex launch; and an additive
+  <code>success_coding</code> scenario in the shared <code>fake_codex.sh</code>
+  fixture that emits a valid <code>CodingResultV1</code> agent message
+- Slice 2 — backend in-scope defects: none. The composed matrix confirmed the
+  cancellation / timeout / cleanup terminal-status mapping, the workspace-evidence
+  attach on both the success and error paths, the specialist finalize contract,
+  the one-active-run guard, the review verdict / revision / requeue path, and the
+  restart reconciliation all already hold in <code>provider_runtime</code> /
+  <code>codex_runtime</code> / <code>ollama_runtime</code> /
+  <code>workspace_evidence</code> / <code>specialist_capabilities</code> /
+  <code>review_orchestration</code> / <code>run_coordinator</code> /
+  <code>persistence</code>. No sandbox, approval, one-use, or one-active-run
+  boundary was weakened
+- Slice 3 — frontend provider/review projection defects: none observed. The
+  isolated live desktop session loaded cleanly on a fresh seed with no
+  <code>[object Object]</code> / <code>Command status: ERROR</code> banner on the
+  Dashboard, Providers, or Tasks surfaces (the shared
+  <code>errorMessage()</code> helper hardened under TASK-0023 already covers the
+  provider / review rejection shape). No <code>src/</code> change was required
+- Slice 4 — bounded live provider/review acceptance (S5): executed by the
+  approved workflow against the real Codex CLI and the real local Ollama service
+  in throwaway <code>/tmp</code> workspaces, driven through the production code
+  paths as <code>#[ignore]</code> tests in
+  <code>provider_review_acceptance::live</code> (run with
+  <code>-- --ignored --test-threads=1</code>; excluded from the deterministic
+  gate). Live observations recorded below
+- Slice 5 — documentation: this evidence section, the TASK-0023 Git-closure
+  backfill above, the continuation-tracker rows, and the
+  <code>CURRENT_STATE.md</code> verification-inventory refresh plus the
+  provider/review live-stabilization paragraph
+- Full non-live gate on 2026-08-30: <code>npm run verify:fast</code> passed (25
+  frontend files / 83 tests, 7 Python voice-runtime tests, rustfmt, 251
+  locked/offline Rust tests); <code>npm run verify:full</code> passed the
+  71-module build, <code>cargo clippy --locked --offline --all-targets -- -D
+  warnings</code>, shell (<code>shellcheck</code> clean), Python, strict-JSON,
+  dependency trees, both npm audits (0 vulnerabilities), the third-party license
+  gate, packaging validation, and the staged
+  install/upgrade/remove/keep-data/purge test. Rust advisory status
+  <strong>indeterminate</strong> locally (<code>cargo-audit</code> /
+  <code>cargo-deny</code> not installed; CI enforces them under
+  <code>VERIFY_STRICT=1</code>)
+- Rust test delta: 241 → 251 (+10 <code>provider_review_acceptance</code>
+  deterministic scenarios; a further five <code>#[ignore]</code> live scenarios
+  under <code>provider_review_acceptance::live</code> are excluded from the gate).
+  Frontend test count unchanged at 83 / 25 files
+- Live/external actions on 2026-08-30 (isolated
+  <code>XDG_DATA_HOME=/tmp/aacc-s5</code>; the migrated prototype database and
+  the S0 backup were not touched):
+  - Identity: <code>codex-cli 0.144.5</code> — installed, ChatGPT-authenticated,
+    compatible, Bubblewrap-contained. Local Ollama <code>0.32.3</code> —
+    connected, catalog ready; <code>qwen2.5-coder:7b</code> Ready with
+    <code>["completion","insert","tools"]</code> and a 32768 context
+  - Bounded read-only Codex run (<code>gpt-5.6-sol</code>, throwaway git
+    workspace, no terminal/file tools): completed in ~7 s with a truthful
+    response that it lacked file-reading capability, response id recorded, usage
+    7704 / 143 tokens; bounded workspace evidence <code>Filesystem</code> /
+    <code>Complete</code> / <code>AgentEligible</code> with zero changes
+  - Codex cancellation: the flag was tripped at <code>Codex turn started.</code>;
+    <code>run_codex_task</code> returned a typed <code>PROVIDER_CANCELLED</code>
+    in under half a second and the <code>bwrap</code> process count returned to
+    its pre-run baseline (no owned process survived)
+  - Bounded Ollama coding run (<code>qwen2.5-coder:7b</code>, throwaway
+    workspace): the model answered in ~38 s but returned prose rather than a
+    strict <code>CodingResultV1</code>, so <code>finalize_specialist_result</code>
+    failed the run with a typed <code>PROVIDER_PROTOCOL_ERROR</code>
+    (<code>SPECIALIST_RESULT_INVALID</code>) and bounded evidence recorded zero
+    workspace changes — the contract enforcement held, no partial or hallucinated
+    result was accepted
+  - Ollama cancellation: with a chat request in flight, setting the flag aborted
+    and awaited the request task, and <code>run_ollama_task</code> returned a
+    typed <code>PROVIDER_CANCELLED</code> within ~8 ms; no request worker was
+    left detached
+- No new runtime dependency, no Cargo/npm manifest or lock change, no schema /
+  <code>PRAGMA user_version</code> change, no new migration file, no
+  security-authority or IPC-contract change
 - Git closure: <code>PENDING USER</code>
 
 ## Successor-preflight closure rule

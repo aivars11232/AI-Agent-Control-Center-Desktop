@@ -13,6 +13,8 @@ mod ollama_runtime;
 mod orchestration_acceptance;
 mod persistence;
 mod policy;
+#[cfg(test)]
+mod provider_review_acceptance;
 mod provider_runtime;
 mod reminder_scheduler;
 mod review_orchestration;
@@ -5047,6 +5049,30 @@ fn run_truncation_from_provider(evidence: &ProviderRunEvidence) -> RunTruncation
     }
 }
 
+fn provider_success_completion(runtime: &ProviderRunResult) -> RunCompletion {
+    RunCompletion {
+        status: RunAttemptStatus::Succeeded,
+        output_summary: Some(runtime.output.clone()),
+        stderr_excerpt: runtime.evidence.stderr_excerpt.clone(),
+        response_id: runtime.response_id.clone(),
+        runtime_model: Some(runtime.model.clone()),
+        usage: RunUsage {
+            input_tokens: runtime.usage.input_tokens,
+            output_tokens: runtime.usage.output_tokens,
+            total_tokens: runtime.usage.total_tokens,
+        },
+        changed_files: runtime.changed_files.clone(),
+        diff: runtime.diff.clone(),
+        workspace_changes: runtime.evidence.workspace_changes.clone(),
+        specialist_result: runtime.specialist_result.clone(),
+        duration_seconds: runtime.duration_seconds,
+        error_code: None,
+        error_message: None,
+        truncation: run_truncation_from_provider(&runtime.evidence),
+        recovery_disposition: None,
+    }
+}
+
 fn provider_error_completion(
     status: RunAttemptStatus,
     error: &ProviderError,
@@ -5295,29 +5321,8 @@ async fn run_agent_task(
 
     match worker {
         Ok(Ok(runtime)) => {
-            let completion = RunCompletion {
-                status: RunAttemptStatus::Succeeded,
-                output_summary: Some(runtime.output.clone()),
-                stderr_excerpt: runtime.evidence.stderr_excerpt.clone(),
-                response_id: runtime.response_id.clone(),
-                runtime_model: Some(runtime.model.clone()),
-                usage: RunUsage {
-                    input_tokens: runtime.usage.input_tokens,
-                    output_tokens: runtime.usage.output_tokens,
-                    total_tokens: runtime.usage.total_tokens,
-                },
-                changed_files: runtime.changed_files.clone(),
-                diff: runtime.diff.clone(),
-                workspace_changes: runtime.evidence.workspace_changes.clone(),
-                specialist_result: runtime.specialist_result.clone(),
-                duration_seconds: runtime.duration_seconds,
-                error_code: None,
-                error_message: None,
-                truncation: run_truncation_from_provider(&runtime.evidence),
-                recovery_disposition: None,
-            };
             let completed = persistence
-                .complete_run(attempt_id, completion)
+                .complete_run(attempt_id, provider_success_completion(&runtime))
                 .await
                 .map_err(authorization_error_message)?;
             emit_run_snapshot(&app, &persistence);
