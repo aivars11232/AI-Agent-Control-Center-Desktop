@@ -155,8 +155,24 @@ jobs:
       - name: Staged install / upgrade / remove / purge
         run: |
           sudo -u builder env \
-          AACC_TEST_BINARY="$GITHUB_WORKSPACE/src-tauri/target/release/ai-agent-control-center" \
-          dbus-run-session -- bash -c '
-          eval "$(printf '%s' 'aacc-ci-keyring' | gnome-keyring-daemon --unlock --components=secrets)"
-          exec bash scripts/staged-install-test.sh
-          '
+            AACC_TEST_BINARY="$GITHUB_WORKSPACE/src-tauri/target/release/ai-agent-control-center" \
+            dbus-run-session -- bash -c '
+              set -euo pipefail
+
+              mkdir -p "$HOME/.local/share/keyrings"
+              printf "%s\n" \
+                "[keyring]" \
+                "display-name=login" \
+                "ctime=$(date +%s)" \
+                "mtime=0" \
+                "lock-on-idle=false" \
+                "lock-after=false" \
+                > "$HOME/.local/share/keyrings/login.keyring"
+              chmod 600 "$HOME/.local/share/keyrings/login.keyring"
+
+              gnome-keyring-daemon --start --components=secrets >/dev/null
+
+              test -n "${DBUS_SESSION_BUS_ADDRESS:-}"
+
+              exec bash scripts/staged-install-test.sh
+            '
