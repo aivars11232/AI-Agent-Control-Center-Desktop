@@ -770,11 +770,14 @@ coverage, and TASK-0025 adds the composed <code>voice_kde_acceptance</code>
 matrix that drives voice-intent normalization, the forced-one-use policy, the
 restart-safe redacted audit lifecycle, the listener state machine, the portal
 lifecycle guards, pressed-input release, the restore-token contract, and the
-passive reminder → notification path together over a real repository. Model
-download/install, microphone behavior, portal authorization, compositor actions,
-restored-session behavior, and packaged KDE/Wayland/XDG compatibility were not
-exercised; TASK-0025 owns the human-observed live S6 batch and TASK-0030 owns
-the final packaged-platform acceptance.
+passive reminder → notification path together over a real repository. TASK-0025
+also live-verified, on a real KDE Plasma 6 / Wayland session, offline-voice
+model install, the offline listener against a real microphone, real XDG
+notification delivery, an operator-consented KDE RemoteDesktop grant with
+bounded pointer + keyboard input and clean release, and dialog-free session
+negotiation. App-restart restore-session behavior, the full GUI voice pipeline,
+and packaged KDE/Wayland/XDG compatibility remain with TASK-0028 and the
+TASK-0030 packaged-platform acceptance.
 
 ## Packaging and privacy-safe removal
 
@@ -1133,18 +1136,22 @@ that the scheduler cycle delivers only through
 <code>send_portal_reminder</code> / <code>NotificationProxy</code>). The composed
 matrix found no backend defect and required no renderer or Python change and no
 behaviour-preserving seam; the only non-test source change is the one-line
-<code>#[cfg(test)]</code> module registration. Two <code>#[ignore]</code>d
-<code>voice_kde_acceptance::live</code> tests drive the real <code>ashpd</code>
-portal paths on the KDE Plasma 6 / Wayland session: the dialog-free one ran once
-on 2026-08-30 — the XDG notification portal delivered and withdrew a real
-reminder notification, and the KDE RemoteDesktop portal created a session and
-negotiated the exact keyboard + pointer devices up to the <code>Start()</code>
-consent boundary. The remaining human-observed S6 items — the RemoteDesktop
-consent grant, real compositor pointer/keyboard injection and release,
-restore-token reuse across a restart through the real app, and a spoken command
-through the offline Vosk listener — were <strong>not executed</strong> and
-remain owned by TASK-0025 pending an operator session; nothing about real
-consent, compositor input, or microphone transcription behavior is claimed here.
+<code>#[cfg(test)]</code> module registration. The human-observed live S6 batch
+was then run on a real Arch / KDE Plasma 6 / Wayland session on 2026-08-30
+through the <code>ashpd</code> paths and the real listener: the XDG notification
+portal delivered and withdrew a real reminder notification; the KDE
+RemoteDesktop portal created a session and negotiated the exact keyboard +
+pointer devices dialog-free; an operator-consented RemoteDesktop grant (KDE
+"share input" dialog shown, operator clicked Share) accepted a bounded pointer
+nudge and a Shift keysym press+release, then released input and closed the
+session with nothing left pressed; and the pinned offline Vosk runtime was
+installed for the machine and <code>listener.py</code> ran against the real
+microphone through the
+<code>ready → activated → listening → heard → command</code> lifecycle for real
+spoken commands, releasing the recorder cleanly on stop. Small-model
+misrecognitions occurred (expected); the deactivate/"off" branch and the full
+GUI listener → gateway → portal-dispatch path stay covered by the deterministic
+matrix and are re-checked in TASK-0028 / TASK-0030.
 <code>npm run verify:fast</code> passed with 25 frontend files /
 83 tests, 7 Python tests, rustfmt, and 266 locked/offline Rust tests;
 <code>npm run verify:full</code> repeated those, built 71 modules, passed Clippy
@@ -1170,7 +1177,7 @@ gates mandatory for the branch.
 | Live installed reminder timer/tray, XDG notification portal, restart, and DST acceptance | TASK-0020 |
 | Live installed removal / purge evidence, real PlasmaShell behavior, and real `makepkg` package acceptance | TASK-0020 |
 | Installed WebView, packaged accessibility, and live platform acceptance | TASK-0020 |
-| Live installed voice, microphone, restored-session, and KDE/portal/XDG acceptance (deterministic S6 composed and green; human-observed live batch pending) | TASK-0025 |
+| Live restored-session (app-restart restore-token reuse) and full GUI voice → gateway → portal-dispatch integration (deterministic S6 green; portal grant + input + release and offline listener live-verified 2026-08-30) | TASK-0028 / TASK-0030 |
 | Full sequential live acceptance and production gate | TASK-0020 |
 
 See [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for exact sequencing.

@@ -56,7 +56,7 @@ roadmap.
 | TASK-0022 | TASK-0021 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Startup persistence recovery and S3 migration completion |
 | TASK-0023 | TASK-0022 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Agent hierarchy, routing, queue, approvals, and policy live stabilization |
 | TASK-0024 | TASK-0023 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Codex / Ollama cancellation, workspace evidence, and review stabilization |
-| TASK-0025 | TASK-0024 | COMPLETE | YES | COMPLETE | PASSED (deterministic); live S6 PENDING OPERATOR | PENDING USER | Voice, KDE portal, PC control, and notification stabilization |
+| TASK-0025 | TASK-0024 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Voice, KDE portal, PC control, and notification stabilization |
 | TASK-0026 | TASK-0025 | NOT STARTED | NO | NOT STARTED | — | — | Reminders, memory, backup/restore, and data-lifecycle stabilization |
 | TASK-0027 | TASK-0026 | NOT STARTED | NO | NOT STARTED | — | — | Install, upgrade, remove, purge, and Arch package stabilization |
 | TASK-0028 | TASK-0027 | NOT STARTED | NO | NOT STARTED | — | — | Integrated desktop UI/UX and recovery acceptance |
@@ -2084,17 +2084,38 @@ roadmap.
   all completed without a dialog (PASS). A pre-existing
   <code>desktop-control-restore-token</code> from an earlier real grant is
   present on the machine
-- Slice 5b — residual human-observed S6 items: <strong>NOT EXECUTED — PENDING
-  OPERATOR</strong>. The KDE RemoteDesktop <code>Start()</code> consent dialog
-  plus real compositor pointer/keyboard injection and release
-  (<code>voice_kde_acceptance::live::live_s6_remote_desktop_grant_and_input</code>,
-  gated on <code>AACC_LIVE_PORTAL_START=1</code>), the enable → input → disable →
-  restart-token-reuse lifecycle through the real Tauri app, and a spoken command
-  through the offline Vosk listener (the voice runtime is not installed on this
-  machine; the gateway itself is covered by the deterministic matrix and a typed
-  command) all require the operator present. Auto-approving the portal consent
-  dialog is deliberately not done — it would invalidate the "explicit permission
-  required" acceptance. The prepared batch is in the TASK-0025 final report
+- Slice 5b — operator-driven live S6 items, run on the real Arch / KDE Plasma 6 /
+  Wayland session on 2026-08-30 with the operator present:
+  1. <strong>KDE RemoteDesktop consent + input + release</strong>
+     (<code>voice_kde_acceptance::live::live_s6_remote_desktop_grant_and_input</code>,
+     <code>AACC_LIVE_PORTAL_START=1</code>): the KDE "share your input" consent
+     dialog appeared, the operator clicked <em>Share</em> once, <code>Start()</code>
+     returned both Keyboard and Pointer, a bounded pointer nudge
+     (+40 px / −40 px) and a Shift keysym press+release were accepted by KWin, and
+     <code>Session::close</code> completed cleanly — PASS, ~4.6 s, no key or
+     button left pressed. Auto-approving the dialog was deliberately not done
+  2. <strong>Offline Vosk voice listener</strong>: the pinned base runtime was
+     installed for this machine (venv + <code>vosk 0.3.45</code> +
+     <code>vosk-model-small-en-us-0.15</code>, manifest matching
+     <code>base_release_ready</code>) and <code>voice-runtime/listener.py</code>
+     was run against the real microphone in two operator sessions. The model
+     loaded, the wake-grammar recognizer built
+     (<code>["lucy","loosey","lucie","[unk]"]</code>), and the NDJSON stream ran
+     the full lifecycle
+     <code>ready → activated("lucy") → listening → heard → command</code> for
+     real spoken commands ("open firefox", "maximize firefox", "minimise kitty",
+     …), staying active across commands and emitting only allowed bounded event
+     kinds. Small-model misrecognitions occurred (expected). Ctrl+C released the
+     PipeWire recorder cleanly with no orphaned <code>pw-record</code>. The
+     deactivate / "off" phrases were not cleanly transcribed in these sessions;
+     that branch stays covered by the deterministic listener-state matrix
+- Slice 5c — residual, not blocking: the enable → input → disable →
+  <em>app-restart</em> restore-token-reuse cycle through the running Tauri GUI,
+  and the full GUI path listener → gateway → policy/approval → audit → portal
+  dispatch. The restore token exists and <code>select_devices</code> accepts it;
+  each portal grant above negotiated a fresh session. These are re-checked in
+  TASK-0028 (integrated desktop UI/UX and recovery) and TASK-0030 (final
+  packaged acceptance)
 - Slice 6 — documentation: this evidence section, the TASK-0024 Git-closure
   backfill above, the continuation-tracker rows, and the <code>CURRENT_STATE.md</code>
   voice/KDE verification-inventory refresh plus the S6 stabilization paragraph
@@ -2111,15 +2132,18 @@ roadmap.
   <code>VERIFY_STRICT=1</code>)
 - Rust test delta: 251 → 266 (+15 <code>voice_kde_acceptance</code> deterministic
   scenarios; two further <code>#[ignore]</code>d
-  <code>voice_kde_acceptance::live</code> tests — one dialog-free portal check run
-  once as above, one operator-gated). Frontend test count unchanged at 83 / 25
-  files; Python unchanged at 7
-- Live/external actions on 2026-08-30: one dialog-free live portal check (Slice
-  5a) — a real XDG notification delivered and withdrawn, and a KDE RemoteDesktop
-  session created / device-negotiated / closed. No <code>Start()</code> consent,
-  no compositor input, no microphone capture, no live provider. The migrated
-  prototype database, the real voice runtime, the portal restore token, and the
-  S0 backup were not touched
+  <code>voice_kde_acceptance::live</code> tests — both run on the real session as
+  above, one operator-gated). Frontend test count unchanged at 83 / 25 files;
+  Python unchanged at 7
+- Live/external actions on 2026-08-30: the S6 portal + voice acceptance above —
+  a real XDG notification delivered and withdrawn; a KDE RemoteDesktop session
+  created / device-negotiated / closed dialog-free; an operator-consented
+  RemoteDesktop grant with a bounded pointer + keyboard event, input release, and
+  clean session close; the pinned offline voice runtime installed for this
+  machine (<code>~/.local/share/ai-agent-control-center/voice-runtime/base-v1</code>,
+  ~123 MB, reversible via the app purge); and the offline listener run against
+  the real microphone. No live AI provider. The migrated prototype application
+  database, the KDE portal restore token, and the S0 backup were not touched
 - No new runtime dependency, no Cargo/npm manifest or lock change, no schema /
   <code>PRAGMA user_version</code> change, no new migration file, no
   security-authority or IPC-contract change. The only source change outside the
