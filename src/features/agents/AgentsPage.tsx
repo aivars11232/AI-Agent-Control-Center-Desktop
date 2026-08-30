@@ -374,6 +374,7 @@ export function AgentsPage({
   const [agentCategory, setAgentCategory] =
     useState<AgentCategory>("General");
   const [agentReportsTo, setAgentReportsTo] = useState<number | null>(null);
+  const [agentModel, setAgentModel] = useState("None");
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [newTaskCategory, setNewTaskCategory] =
     useState<TaskCategory>(preferences.defaultTaskCategory);
@@ -568,6 +569,7 @@ export function AgentsPage({
     setAgentRole("Specialist");
     setAgentCategory("General");
     setAgentReportsTo(null);
+    setAgentModel("None");
     setIsCreating(false);
     setEditingAgentId(null);
   }
@@ -578,6 +580,7 @@ export function AgentsPage({
     setAgentRole("Specialist");
     setAgentCategory("General");
     setAgentReportsTo(null);
+    setAgentModel(preferences.defaultModel);
     setEditingAgentId(null);
     setIsCreating(true);
   }
@@ -588,16 +591,9 @@ export function AgentsPage({
     setAgentRole(agent.role);
     setAgentCategory(agent.category);
     setAgentReportsTo(agent.reportsTo);
+    setAgentModel(agent.model);
     setIsCreating(false);
     setEditingAgentId(agent.id);
-  }
-
-  // The edit dialog lives in the agent-list view; opening it from an agent
-  // workspace returns to the list with the dialog focused on that agent so its
-  // name, role, category, and reporting line can be changed in one place.
-  function editAgentFromWorkspace(agent: Agent) {
-    setSelectedAgentId(null);
-    openEditAgent(agent);
   }
 
   async function saveAgent() {
@@ -643,7 +639,9 @@ export function AgentsPage({
       if (authoritativeRegistry) {
         await onRegistryMutation(
           editingAgentId === null ? "create_agent" : "update_agent",
-          editingAgentId === null ? request : { ...request, agentId: editingAgentId },
+          editingAgentId === null
+            ? request
+            : { ...request, agentId: editingAgentId, model: agentModel },
         );
       } else if (editingAgentId !== null) {
         setAgents((currentAgents) =>
@@ -652,6 +650,7 @@ export function AgentsPage({
               ? {
                   ...agent,
                   ...request,
+                  model: agentModel,
                   authorityLevel: authorityForRole(agentRole),
                   registryState: "active",
                   registryIssue: null,
@@ -1500,6 +1499,158 @@ export function AgentsPage({
     }
   }
 
+  const agentEditorDialog = (
+    <Dialog
+      open={isModalOpen}
+      labelledBy="agent-editor-title"
+      onClose={resetForm}
+    >
+      <div className="modal-heading">
+        <div>
+          <span className="eyebrow">
+            {isEditing ? "EDIT AGENT" : "NEW AGENT"}
+          </span>
+          <h2 id="agent-editor-title">
+            {isEditing ? "Edit agent" : "Create agent"}
+          </h2>
+        </div>
+
+        <button
+          type="button"
+          className="modal-close"
+          aria-label="Close agent editor"
+          onClick={resetForm}
+        >
+          ×
+        </button>
+      </div>
+
+      <label className="form-field">
+        <span>Agent name</span>
+        <input
+          type="text"
+          data-dialog-initial-focus
+          value={agentName}
+          onChange={(event) => setAgentName(event.target.value)}
+          placeholder="Example: Research Agent"
+        />
+      </label>
+
+      <label className="form-field">
+        <span>What should this agent do?</span>
+        <textarea
+          rows={5}
+          value={agentDescription}
+          onChange={(event) => setAgentDescription(event.target.value)}
+          placeholder="Describe the agent's responsibilities"
+        />
+      </label>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+          gap: "14px",
+        }}
+      >
+        <label className="form-field">
+          <span>Role</span>
+          <select
+            value={agentRole}
+            onChange={(event) => setAgentRole(event.target.value as AgentRole)}
+          >
+            <option value="Supervisor">Supervisor</option>
+            <option value="Team Leader">Team Leader</option>
+            <option value="Senior Agent">Senior Agent</option>
+            <option value="Specialist">Specialist</option>
+          </select>
+        </label>
+
+        <label className="form-field">
+          <span>Category</span>
+          <select
+            value={agentCategory}
+            onChange={(event) =>
+              setAgentCategory(event.target.value as AgentCategory)
+            }
+          >
+            <option value="Management">Management</option>
+            <option value="Development">Development</option>
+            <option value="Research">Research</option>
+            <option value="Browsing">Browsing</option>
+            <option value="Finance">Finance</option>
+            <option value="Business">Business</option>
+            <option value="Communication">Communication</option>
+            <option value="System Control">System Control</option>
+            <option value="General">General</option>
+          </select>
+        </label>
+
+        <label className="form-field">
+          <span>Reports to</span>
+          <select
+            value={agentReportsTo ?? ""}
+            onChange={(event) =>
+              setAgentReportsTo(
+                event.target.value ? Number(event.target.value) : null,
+              )
+            }
+          >
+            <option value="">
+              {agentRole === "Supervisor" ? "Top level" : "Select a manager"}
+            </option>
+            {validManagerCandidates(agents, agentRole, editingAgentId).map(
+              (agent) => (
+                <option value={agent.id} key={agent.id}>
+                  {agent.name} · {agent.role}
+                </option>
+              ),
+            )}
+          </select>
+        </label>
+
+        {isEditing && (
+          <label className="form-field">
+            <span>Model</span>
+            <select
+              value={agentModel}
+              onChange={(event) => setAgentModel(event.target.value)}
+            >
+              <option value="None">None</option>
+              {agentModel.toLowerCase() !== "none" &&
+                !availableModels.some((model) => model.name === agentModel) && (
+                  <option value={agentModel} disabled>
+                    {agentModel} · unavailable
+                  </option>
+                )}
+              {availableModels.map((model) => (
+                <option value={model.name} key={model.id}>
+                  {model.name} · {model.provider}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+
+        <label className="form-field">
+          <span>Authority level</span>
+          <input value={authorityForRole(agentRole)} readOnly />
+          <small>Authority is derived from the selected role.</small>
+        </label>
+      </div>
+
+      <div className="modal-actions">
+        <button type="button" className="secondary-button" onClick={resetForm}>
+          Cancel
+        </button>
+
+        <button type="button" className="primary-button" onClick={saveAgent}>
+          {isEditing ? "Save changes" : "Create agent"}
+        </button>
+      </div>
+    </Dialog>
+  );
+
   if (selectedAgent) {
     return (
       <>
@@ -1558,7 +1709,7 @@ export function AgentsPage({
               <button
                 type="button"
                 className="secondary-button"
-                onClick={() => editAgentFromWorkspace(selectedAgent)}
+                onClick={() => openEditAgent(selectedAgent)}
               >
                 Edit agent
               </button>
@@ -2641,6 +2792,7 @@ export function AgentsPage({
           </section>
         ) : null}
         </div>
+        {agentEditorDialog}
       </>
     );
   }
@@ -2850,140 +3002,7 @@ export function AgentsPage({
         </section>
       )}
 
-      <Dialog
-        open={isModalOpen}
-        labelledBy="agent-editor-title"
-        onClose={resetForm}
-      >
-            <div className="modal-heading">
-              <div>
-                <span className="eyebrow">
-                  {isEditing ? "EDIT AGENT" : "NEW AGENT"}
-                </span>
-                <h2 id="agent-editor-title">
-                  {isEditing ? "Edit agent" : "Create agent"}
-                </h2>
-              </div>
-
-              <button
-                type="button"
-                className="modal-close"
-                aria-label="Close agent editor"
-                onClick={resetForm}
-              >
-                ×
-              </button>
-            </div>
-
-            <label className="form-field">
-              <span>Agent name</span>
-              <input
-                type="text"
-                data-dialog-initial-focus
-                value={agentName}
-                onChange={(event) => setAgentName(event.target.value)}
-                placeholder="Example: Research Agent"
-              />
-            </label>
-
-            <label className="form-field">
-              <span>What should this agent do?</span>
-              <textarea
-                rows={5}
-                value={agentDescription}
-                onChange={(event) =>
-                  setAgentDescription(event.target.value)
-                }
-                placeholder="Describe the agent's responsibilities"
-              />
-            </label>
-
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns:
-                  "repeat(auto-fit, minmax(200px, 1fr))",
-                gap: "14px",
-              }}
-            >
-              <label className="form-field">
-                <span>Role</span>
-                <select
-                  value={agentRole}
-                  onChange={(event) =>
-                    setAgentRole(event.target.value as AgentRole)
-                  }
-                >
-                  <option value="Supervisor">Supervisor</option>
-                  <option value="Team Leader">Team Leader</option>
-                  <option value="Senior Agent">Senior Agent</option>
-                  <option value="Specialist">Specialist</option>
-                </select>
-              </label>
-
-              <label className="form-field">
-                <span>Category</span>
-                <select
-                  value={agentCategory}
-                  onChange={(event) =>
-                    setAgentCategory(
-                      event.target.value as AgentCategory,
-                    )
-                  }
-                >
-                  <option value="Management">Management</option>
-                  <option value="Development">Development</option>
-                  <option value="Research">Research</option>
-                  <option value="Browsing">Browsing</option>
-                  <option value="Finance">Finance</option>
-                  <option value="Business">Business</option>
-                  <option value="Communication">Communication</option>
-                  <option value="System Control">System Control</option>
-                  <option value="General">General</option>
-                </select>
-              </label>
-
-              <label className="form-field">
-                <span>Reports to</span>
-                <select
-                  value={agentReportsTo ?? ""}
-                  onChange={(event) =>
-                    setAgentReportsTo(
-                      event.target.value
-                        ? Number(event.target.value)
-                        : null,
-                    )
-                  }
-                >
-                  <option value="">
-                    {agentRole === "Supervisor" ? "Top level" : "Select a manager"}
-                  </option>
-                  {validManagerCandidates(agents, agentRole, editingAgentId)
-                    .map((agent) => (
-                      <option value={agent.id} key={agent.id}>
-                        {agent.name} · {agent.role}
-                      </option>
-                    ))}
-                </select>
-              </label>
-
-              <label className="form-field">
-                <span>Authority level</span>
-                <input value={authorityForRole(agentRole)} readOnly />
-                <small>Authority is derived from the selected role.</small>
-              </label>
-            </div>
-
-            <div className="modal-actions">
-              <button type="button" className="secondary-button" onClick={resetForm}>
-                Cancel
-              </button>
-
-              <button type="button" className="primary-button" onClick={saveAgent}>
-                {isEditing ? "Save changes" : "Create agent"}
-              </button>
-            </div>
-      </Dialog>
+      {agentEditorDialog}
     </>
   );
 }

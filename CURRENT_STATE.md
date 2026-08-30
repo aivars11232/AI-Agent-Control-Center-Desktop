@@ -1045,8 +1045,11 @@ live pass and were fixed: the shared helper <code>errorMessage</code> now
 unpacks a serialized backend rejection
 (<code>{ code, message, recoverable }</code>) into readable text instead of the
 literal <code>[object Object]</code>; and the agent-workspace view gained an
-"Edit agent" action so a created agent's role, category, and reporting line can
-be changed from where it is opened rather than only from the agent list. New
+"Edit agent" action that opens the authoritative agent editor in place, with the
+editor extended to cover the model, so a created agent's role, category,
+reporting line, and model can all be changed from where it is opened rather than
+only from the agent list. <code>UpdateAgentRequest</code> gained an additive
+optional <code>model</code> field (no schema or migration change). New
 <code>src/domain/errors.test.ts</code> and
 <code>src/features/agents/AgentsPage.test.tsx</code>. Post-dispatch provider
 execution transport is verified with a fake adapter here and owned live by

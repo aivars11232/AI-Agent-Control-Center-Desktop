@@ -69,10 +69,16 @@ describe("AgentsPage — editing after creation", () => {
     const nameField = within(dialog).getByLabelText("Agent name") as HTMLInputElement;
     expect(nameField.value).toBe("Coding Agent");
 
-    // The editor exposes role and reporting-line controls that the read-only
-    // workspace summary does not.
+    // The editor exposes role, reporting-line, and model controls that the
+    // read-only workspace summary does not offer together.
     expect(within(dialog).getByLabelText("Role")).toBeTruthy();
     expect(within(dialog).getByLabelText("Reports to")).toBeTruthy();
+    expect(within(dialog).getByLabelText("Model")).toBeTruthy();
+
+    // Editing happens in place — the workspace is not left to reach the editor.
+    expect(
+      screen.getByRole("heading", { name: "Agent details" }),
+    ).toBeTruthy();
   });
 
   it("submits a reporting-line change through the authoritative registry", async () => {
@@ -96,7 +102,11 @@ describe("AgentsPage — editing after creation", () => {
 
     expect(onRegistryMutation).toHaveBeenCalledWith(
       "update_agent",
-      expect.objectContaining({ agentId: 2, role: "Specialist" }),
+      expect.objectContaining({
+        agentId: 2,
+        role: "Specialist",
+        model: expect.any(String),
+      }),
     );
   });
 });

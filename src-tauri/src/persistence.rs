@@ -1030,6 +1030,12 @@ impl StateRepository {
             agent.description = request.description.trim().to_string();
             agent.role = request.role;
             agent.category = request.category;
+            if let Some(model) = &request.model {
+                let model = model.trim();
+                if !model.is_empty() {
+                    agent.model = model.to_string();
+                }
+            }
             agent.reports_to = if agent.role == "Supervisor" {
                 None
             } else {
@@ -14828,6 +14834,7 @@ mod tests {
                 role: "Specialist".to_string(),
                 category: "General".to_string(),
                 reports_to: Some(3),
+                model: None,
             })
             .unwrap();
         assert_eq!(
@@ -14982,6 +14989,7 @@ mod tests {
                 role: "Specialist".to_string(),
                 category: "Development".to_string(),
                 reports_to: Some(2),
+                model: None,
             })
             .unwrap_err();
         assert_eq!(error.code, "STATE_VALIDATION_FAILED");

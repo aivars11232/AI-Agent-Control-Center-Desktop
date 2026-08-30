@@ -46,6 +46,9 @@ pub struct UpdateAgentRequest {
     pub role: String,
     pub category: String,
     pub reports_to: Option<i64>,
+    /// Optional so older callers keep working; `None` leaves the model unchanged.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

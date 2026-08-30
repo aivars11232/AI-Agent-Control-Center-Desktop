@@ -1798,12 +1798,19 @@ roadmap.
   2. <code>src/features/agents/AgentsPage.tsx</code> — after creating (or opening)
      an agent, the agent-workspace view showed its role, category, and reporting
      line as read-only text with no way to change them; the only editor was the
-     "Edit" button back in the agent list, which is unreachable once you are in
-     the workspace. Added an "Edit agent" action to the workspace Overview that
-     opens the existing authoritative <code>update_agent</code> editor focused on
-     that agent. New <code>src/features/agents/AgentsPage.test.tsx</code>
-     (2 cases). No renderer authority added; the backend registry stays
-     authoritative
+     "Edit" button in the agent list, which is unreachable once you are in the
+     workspace (the editor dialog only rendered in the list-view branch). Hoisted
+     the agent-editor <code>&lt;Dialog&gt;</code> so it renders from both the list
+     and the workspace, added an "Edit agent" action to the workspace Overview
+     that opens it in place, and added a Model field to the editor. The backend
+     <code>UpdateAgentRequest</code> gained an optional <code>model</code>
+     (<code>#[serde(default)]</code>, <code>None</code> = unchanged); no schema or
+     migration change (the <code>agents.model</code> column already exists) and
+     no new authority — generic saves already permitted a model change, this
+     routes it through the authoritative <code>update_agent</code> path.
+     New <code>src/features/agents/AgentsPage.test.tsx</code> (2 cases) and an
+     <code>agent.model</code> assertion in
+     <code>s4_custom_agent_can_be_edited_after_creation</code>
 - Slice 4 — bounded live GUI S4 acceptance: <RECORD OUTCOME>
 - Slice 5 — documentation: this evidence section, the continuation-tracker rows
   for TASK-0022 (Git closure backfill) and TASK-0023, the
@@ -1828,7 +1835,10 @@ roadmap.
   provider execution transport remains owned by TASK-0024
 - No new runtime dependency, no Cargo/npm manifest or lock change, no schema /
   <code>PRAGMA user_version</code> change, no new migration file, no
-  security-authority boundary change
+  security-authority boundary change. The only IPC-contract change is an
+  additive optional <code>model</code> field on <code>UpdateAgentRequest</code>
+  (<code>#[serde(default)]</code>); it routes an already-permitted model change
+  through the authoritative registry path
 - Git closure: <code>PENDING USER</code>
 
 ## Successor-preflight closure rule

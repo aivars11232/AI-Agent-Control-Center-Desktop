@@ -906,7 +906,7 @@ fn s4_custom_agent_can_be_edited_after_creation() {
         .unwrap()
         .id;
 
-    // Change its name, category, role, and reporting line in one update.
+    // Change its name, category, role, reporting line, and model in one update.
     let updated = repository
         .update_agent(UpdateAgentRequest {
             expected_revision: created.revision,
@@ -916,6 +916,7 @@ fn s4_custom_agent_can_be_edited_after_creation() {
             role: "Senior Agent".to_string(),
             category: "Research".to_string(),
             reports_to: Some(6),
+            model: Some(REVIEW_MODEL.to_string()),
         })
         .unwrap();
     let agent = updated
@@ -928,6 +929,7 @@ fn s4_custom_agent_can_be_edited_after_creation() {
     assert_eq!(agent.role, "Senior Agent");
     assert_eq!(agent.reports_to, Some(6));
     assert_eq!(agent.authority_level, 2);
+    assert_eq!(agent.model, REVIEW_MODEL);
     assert_eq!(agent.registry_state, "active");
 
     // The change survives a database reload and the registry projection agrees.
@@ -953,6 +955,7 @@ fn s4_custom_agent_can_be_edited_after_creation() {
             role: "Senior Agent".to_string(),
             category: "Research".to_string(),
             reports_to: Some(custom_id),
+            model: None,
         })
         .unwrap_err();
     assert_eq!(error.code, "STATE_VALIDATION_FAILED");
