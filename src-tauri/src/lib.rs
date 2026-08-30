@@ -9,6 +9,8 @@ mod linux_desktop;
 mod linux_paths;
 mod management_handoffs;
 mod ollama_runtime;
+#[cfg(test)]
+mod orchestration_acceptance;
 mod persistence;
 mod policy;
 mod provider_runtime;

@@ -53,8 +53,8 @@ roadmap.
 | Task | Depends | Phase A | Approved | Phase B | Verification | Git closure | Title |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | TASK-0021 | TASK-0020 S3 blocker | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Legacy state migration repair and duplicate identity recovery |
-| TASK-0022 | TASK-0021 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Startup persistence recovery and S3 migration completion |
-| TASK-0023 | TASK-0022 | NOT STARTED | NO | NOT STARTED | — | — | Agent hierarchy, routing, queue, approvals, and policy live stabilization |
+| TASK-0022 | TASK-0021 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Startup persistence recovery and S3 migration completion |
+| TASK-0023 | TASK-0022 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Agent hierarchy, routing, queue, approvals, and policy live stabilization |
 | TASK-0024 | TASK-0023 | NOT STARTED | NO | NOT STARTED | — | — | Codex / Ollama cancellation, workspace evidence, and review stabilization |
 | TASK-0025 | TASK-0024 | NOT STARTED | NO | NOT STARTED | — | — | Voice, KDE portal, PC control, and notification stabilization |
 | TASK-0026 | TASK-0025 | NOT STARTED | NO | NOT STARTED | — | — | Reminders, memory, backup/restore, and data-lifecycle stabilization |
@@ -1713,7 +1713,109 @@ roadmap.
   (<code>voice_runtime_status</code> / <code>desktop_control_status</code> /
   <code>query_system_action_audits</code>) fails; <code>errorMessage()</code>
   does not handle that error shape. Pre-existing, unmasked now that the shell
-  loads; not caused by TASK-0021 or TASK-0022
+  loads; not caused by TASK-0021 or TASK-0022. The shared
+  <code>errorMessage()</code> helper was hardened under TASK-0023; the
+  Voice-Control-specific projection wiring remains owned by TASK-0025
+- Git closure: user implementation commit
+  <code>dfe7cbbd7bbac35f0fb26befe7912167701bd223</code> (<code>task22</code>) was
+  identified from Git history, is the checked-out <code>main</code> HEAD, is
+  reachable from <code>origin/main</code>, and <code>main</code> vs
+  <code>origin/main</code> is zero ahead / zero behind with a clean tree. Its
+  seven-file scope (<code>persistence.rs</code> startup self-heal + four tests;
+  <code>src/app/PersistenceStatusView.tsx</code> / <code>.test.tsx</code>
+  extracted from <code>AppController.tsx</code>; <code>install-kde.sh</code>
+  stop-before-build; <code>CURRENT_STATE.md</code>;
+  <code>planning/TASK_STATUS.md</code>) matches the TASK-0022 report with no
+  unexplained intervening state, so all seven successor-preflight closure
+  conditions passed. Verified and backfilled to <code>COMPLETE</code> during the
+  approved TASK-0023 Phase B on 2026-08-30.
+
+## TASK-0023 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>; starting HEAD
+  <code>dfe7cbbd7bbac35f0fb26befe7912167701bd223</code> (<code>task22</code>);
+  clean tree; <code>main</code> vs <code>origin/main</code> zero ahead / zero
+  behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0022 (see
+  its evidence above); its Git closure is backfilled to <code>COMPLETE</code> in
+  this task
+- Phase A outcome: <code>PHASE_A_READY</code>; approval received:
+  <code>APPROVED: IMPLEMENT TASK-0023 AS PLANNED.</code> (decisions D1–D4 all
+  accepted as recommended: post-dispatch legs headless via a fake adapter, an
+  isolated throwaway data dir for the live GUI session, a new test-only module
+  file, and a short batched live session in this task)
+- Slice 1 — composed headless S4 acceptance harness (test only):
+  <code>src-tauri/src/orchestration_acceptance.rs</code>
+  (<code>#[cfg(test)] mod orchestration_acceptance;</code> in
+  <code>src/lib.rs</code>). Nine end-to-end scenarios wire the whole
+  registry → routing → queue → one-active-run → approval/policy →
+  sequential review → human adjudication → restart-reconciliation path over a
+  real <code>StateRepository</code> with synthetic Git/non-Git workspaces, and
+  assert that the <code>task_orchestration_snapshot</code>,
+  <code>review_orchestration_snapshot</code>, <code>run_snapshot</code>, and
+  <code>agent_registry_snapshot</code> projections stay mutually consistent with
+  backend truth at every transition. Covered: full green path; one-active-run
+  authoritative across execute and review; consumed / replayed / idempotency-
+  conflict / expired approvals fail closed; renderer forgery rejected across
+  registry / queue / lifecycle / routing-evidence / review-status; a manual
+  routing override cannot bypass a hard eligibility filter; a changes verdict
+  requeues with a fresh policy/approval evaluation and a fresh queue age; the
+  three-revision cap escalates to human adjudication and a fourth revision
+  cannot be queued; an uncertain-dispatch restart is reconciled to
+  <code>manual_review_required</code> while the interrupted head keeps its queue
+  age. Check:
+  <code>cargo test --locked --offline --lib orchestration_acceptance</code> — 9
+  passed
+- Slice 1b — minimal test-only infra:
+  <code>StateRepository::force_expire_approval_for_tests</code>
+  (<code>#[cfg(test)]</code>) so the fail-closed approval-expiry path can be
+  exercised without waiting out a real retention window; it keeps the
+  <code>expires_at_unix_ms &gt; created_at_unix_ms</code> table constraint
+  satisfied
+- Slice 2 — backend in-scope defects: none. The composed matrix confirmed every
+  fail-closed sequence and projection invariant already holds in
+  <code>agent_registry</code> / <code>task_orchestration</code> /
+  <code>run_coordinator</code> / <code>policy</code> / <code>authorization</code>
+  / <code>review_orchestration</code> / <code>persistence</code>. No filter,
+  fingerprint bind, one-use consumption, or one-active-run guard was weakened
+- Slice 3 — frontend projection truth: hardened
+  <code>src/domain/errors.ts::errorMessage</code> so a serialized backend
+  rejection object (<code>{ code, message, recoverable }</code> from
+  persistence / policy / routing / review) renders as
+  <code>"&lt;message&gt; (&lt;code&gt;)"</code> instead of the literal
+  <code>[object Object]</code>; a bare code, a bare message, a plain string, and
+  an opaque object all degrade to readable text, and <code>null</code> /
+  <code>undefined</code> fall back to one generic sentence. This is the shared
+  helper used by the Approvals, Tasks, Agents, and orchestration surfaces
+  (matrix G). New <code>src/domain/errors.test.ts</code> (7 cases). No renderer
+  authority was added; the backend stays authoritative
+- Slice 4 — bounded live GUI S4 acceptance: <RECORD OUTCOME>
+- Slice 5 — documentation: this evidence section, the continuation-tracker rows
+  for TASK-0022 (Git closure backfill) and TASK-0023, the
+  <code>CURRENT_STATE.md</code> verification-inventory refresh and the S4
+  stabilization paragraph
+- Full non-live gate on 2026-08-30: <code>npm run verify:fast</code> passed (24
+  frontend files / 81 tests, 7 Python voice-runtime tests, rustfmt, 240
+  locked/offline Rust tests); <code>npm run verify:full</code> passed the
+  71-module build, <code>cargo clippy --locked --offline --all-targets -- -D
+  warnings</code>, shell (<code>shellcheck</code> clean), Python, strict-JSON,
+  dependency trees, both npm audits (0 vulnerabilities), the third-party license
+  gate, packaging validation, and the staged
+  install/upgrade/remove/keep-data/purge test. Rust advisory status
+  <strong>indeterminate</strong> locally (<code>cargo-audit</code> /
+  <code>cargo-deny</code> not installed; CI enforces them under
+  <code>VERIFY_STRICT=1</code>)
+- Rust test delta: 231 → 240 (+9 <code>orchestration_acceptance</code>).
+  Frontend test delta: 74 → 81 (+7 <code>domain/errors</code>); frontend file
+  count 23 → 24
+- Live/external actions: <RECORD>. No live Codex/Ollama generation, provider
+  authentication, microphone, or KDE portal authorization. Post-dispatch
+  provider execution transport remains owned by TASK-0024
+- No new runtime dependency, no Cargo/npm manifest or lock change, no schema /
+  <code>PRAGMA user_version</code> change, no new migration file, no
+  security-authority boundary change
 - Git closure: <code>PENDING USER</code>
 
 ## Successor-preflight closure rule

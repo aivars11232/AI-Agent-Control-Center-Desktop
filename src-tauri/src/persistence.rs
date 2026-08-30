@@ -827,6 +827,26 @@ impl StateRepository {
         Self::open_in_memory_internal()
     }
 
+    /// Test-only: force an authoritative approval to be expired on the wall
+    /// clock while still satisfying the `expires_at_unix_ms > created_at_unix_ms`
+    /// table constraint, so the fail-closed expiry path can be exercised without
+    /// waiting out a real retention window.
+    #[cfg(test)]
+    pub(crate) fn force_expire_approval_for_tests(
+        &mut self,
+        approval_id: i64,
+    ) -> PersistenceResult<()> {
+        self.connection
+            .execute(
+                "UPDATE approval_requests
+                 SET created_at_unix_ms = 1, expires_at_unix_ms = 2
+                 WHERE id = ?1",
+                [approval_id],
+            )
+            .map_err(PersistenceError::database)?;
+        Ok(())
+    }
+
     fn open_in_memory_internal() -> PersistenceResult<Self> {
         let connection = Connection::open_in_memory().map_err(PersistenceError::database)?;
         let mut repository = Self { connection };
