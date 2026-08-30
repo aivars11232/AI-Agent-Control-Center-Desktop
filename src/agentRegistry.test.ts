@@ -4,6 +4,7 @@ import {
   findActiveTemplateAgent,
   normalizeLegacyAgentRegistrySet,
   projectAgentGroup,
+  registryIssueMessage,
   validManagerCandidates,
 } from "./agentRegistry";
 import { agentFixture } from "./test/fixtures";
@@ -182,5 +183,54 @@ describe("TASK-0009 agent registry projections", () => {
       reportsTo: null,
     });
     expect(projectAgentGroup(migrated, "Needs assignment").visibleAgents).toHaveLength(3);
+  });
+});
+
+describe("TASK-0021 duplicate identity recovery", () => {
+  it("recognizes the duplicate-id registry issue with its own message", () => {
+    expect(registryIssueMessage("duplicate-id")).toBe(
+      "This agent shared an identifier with another agent during migration and was given a new identity for review.",
+    );
+  });
+
+  it("keeps a re-keyed duplicate quarantined without relabeling the issue", () => {
+    const supervisor = agentFixture({
+      id: 1,
+      role: "Supervisor",
+      category: "Management",
+      authorityLevel: 4,
+      reportsTo: null,
+    });
+    const canonical = agentFixture({
+      id: 5,
+      name: "Finance Agent",
+      category: "Finance",
+      reportsTo: 1,
+    });
+    const requarantined = agentFixture({
+      id: 12,
+      name: "Financial Agent",
+      category: "Finance",
+      registryState: "unassigned",
+      registryIssue: "duplicate-id",
+      status: "Paused",
+      reportsTo: null,
+    });
+
+    const migrated = normalizeLegacyAgentRegistrySet([
+      supervisor,
+      canonical,
+      requarantined,
+    ]);
+
+    expect(migrated.find((agent) => agent.id === 12)).toMatchObject({
+      registryState: "unassigned",
+      registryIssue: "duplicate-id",
+      reportsTo: null,
+    });
+    expect(migrated.find((agent) => agent.id === 5)).toMatchObject({
+      registryState: "active",
+      registryIssue: null,
+    });
   });
 });

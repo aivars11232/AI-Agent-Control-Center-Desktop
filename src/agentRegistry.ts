@@ -79,6 +79,7 @@ const registryIssues = new Set<AgentRegistryIssue>([
   "manager-not-active",
   "manager-authority",
   "cycle",
+  "duplicate-id",
 ]);
 
 export function authorityForRole(role: AgentRole): AuthorityLevel {
@@ -380,5 +381,7 @@ export function registryIssueMessage(issue: AgentRegistryIssue | null): string {
   if (issue === "manager-not-active") return "This agent's manager is not active.";
   if (issue === "manager-authority") return "This agent needs a manager with greater authority.";
   if (issue === "cycle") return "This agent was part of a reporting cycle.";
+  if (issue === "duplicate-id")
+    return "This agent shared an identifier with another agent during migration and was given a new identity for review.";
   return "This agent needs a valid reporting assignment.";
 }

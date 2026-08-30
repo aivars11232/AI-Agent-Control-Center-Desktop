@@ -229,7 +229,8 @@ export type AgentRegistryIssue =
   | "missing-manager"
   | "manager-not-active"
   | "manager-authority"
-  | "cycle";
+  | "cycle"
+  | "duplicate-id";
 
 export type Agent = {
   id: number;

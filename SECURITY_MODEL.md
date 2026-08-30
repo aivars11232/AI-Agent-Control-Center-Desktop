@@ -172,6 +172,10 @@ Static inspection and deterministic tests found these implemented controls:
 - migration quarantine that pauses and visibly detaches invalid legacy agents,
   plus durable tombstones that prevent deleted defaults from silently
   reappearing;
+- legacy duplicate-identity repair that keeps the first occurrence canonical,
+  re-keys and quarantines later duplicates as a duplicate-id registry issue, and
+  moves only references owned by the re-keyed instance so a duplicate cannot
+  inherit another agent's approvals, reviews, routing, or reporting authority;
 - policy, routing, review, voice, approval, reminder, dashboard, and settings
   projections that exclude non-active agent identities;
 - deterministic routing that hard-filters inactive/paused, workspace,

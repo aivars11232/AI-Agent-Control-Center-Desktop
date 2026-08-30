@@ -40,8 +40,28 @@ ready merely because its predecessor's code was edited.
 | TASK-0016 | TASK-0015 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Offline voice runtime, KDE portal control, and XDG integration |
 | TASK-0017 | TASK-0016 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Bounded Coding, Debugging, Browser, and Financial agent capabilities |
 | TASK-0018 | TASK-0017 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Reminder scheduler, structured memory, and management handoff workspaces |
-| TASK-0019 | TASK-0018 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Packaging, privacy-safe removal, release metadata, and CI security gates |
-| TASK-0020 | TASK-0019 | NOT STARTED | NO | NOT STARTED | — | — | Sequential live acceptance and version 1.0 release gate |
+| TASK-0019 | TASK-0018 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Packaging, privacy-safe removal, release metadata, and CI security gates |
+| TASK-0020 | TASK-0019 | COMPLETE | YES | IN PROGRESS | BLOCKED (S3) | — | Sequential live acceptance and version 1.0 release gate |
+
+## Continuation tracker (version 3.0)
+
+Adopted by [Decision 0003](decisions/0003-v3-continuation-roadmap.md) after
+TASK-0020 live acceptance stopped at the S3 first-launch legacy-migration
+blocker. See [IMPLEMENTATION_PLAN.md](../IMPLEMENTATION_PLAN.md) continuation
+roadmap.
+
+| Task | Depends | Phase A | Approved | Phase B | Verification | Git closure | Title |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| TASK-0021 | TASK-0020 S3 blocker | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Legacy state migration repair and duplicate identity recovery |
+| TASK-0022 | TASK-0021 | NOT STARTED | NO | NOT STARTED | — | — | Startup persistence recovery and S3 migration completion |
+| TASK-0023 | TASK-0022 | NOT STARTED | NO | NOT STARTED | — | — | Agent hierarchy, routing, queue, approvals, and policy live stabilization |
+| TASK-0024 | TASK-0023 | NOT STARTED | NO | NOT STARTED | — | — | Codex / Ollama cancellation, workspace evidence, and review stabilization |
+| TASK-0025 | TASK-0024 | NOT STARTED | NO | NOT STARTED | — | — | Voice, KDE portal, PC control, and notification stabilization |
+| TASK-0026 | TASK-0025 | NOT STARTED | NO | NOT STARTED | — | — | Reminders, memory, backup/restore, and data-lifecycle stabilization |
+| TASK-0027 | TASK-0026 | NOT STARTED | NO | NOT STARTED | — | — | Install, upgrade, remove, purge, and Arch package stabilization |
+| TASK-0028 | TASK-0027 | NOT STARTED | NO | NOT STARTED | — | — | Integrated desktop UI/UX and recovery acceptance |
+| TASK-0029 | TASK-0028 | NOT STARTED | NO | NOT STARTED | — | — | Full regression, security, CI, and release-candidate hardening |
+| TASK-0030 | TASK-0029 | NOT STARTED | NO | NOT STARTED | — | — | Final version 1.0 acceptance, release evidence, and handoff |
 
 ## TASK-0001 evidence
 
@@ -1461,8 +1481,128 @@ ready merely because its predecessor's code was edited.
   with TASK-0020
 - No product-data schema, migration, backup-format, or runtime dependency
   change was made. <code>PRAGMA user_version</code> stays 11
-- Git closure: pending TASK-0019 user review, commit, push, and successor
-  evidence
+- Git closure: <code>COMPLETE</code>. Backfilled during the approved TASK-0021
+  Phase B from verified history. TASK-0019 implementation commit
+  <code>588baa0cfd7bc9fd896951a510007935fc195053</code> (<code>task19</code>);
+  in-scope CI/packaging-gate stabilization landed in
+  <code>0935e9a</code>, <code>8cb70ca</code>, <code>58954da</code>,
+  <code>f31440a</code>, <code>7fbd6a9</code>, <code>e9b4b0c</code>,
+  <code>1467f3f</code>, and <code>135e583</code> (all
+  <code>.github/workflows/ci.yml</code>, <code>deny.toml</code>,
+  <code>scripts/check-licenses.sh</code>, and the reqwest-feature
+  <code>Cargo.toml</code>/<code>Cargo.lock</code> update). At TASK-0021 Phase A
+  preflight: <code>588baa0</code> is an ancestor of <code>HEAD</code>
+  <code>135e5835391ea3b215e076784aed1a75a5b04f85</code>, both reachable from
+  <code>origin/main</code> with zero ahead/behind, working tree clean, and the
+  intervening diff is confined to TASK-0019 CI/packaging scope
+
+## TASK-0020 evidence
+
+- Status: <code>IN PROGRESS</code>, blocked at S3. Live acceptance ran on real
+  Arch Linux / KDE Plasma / Wayland prototype data (S0 backup retained at
+  <code>/mnt/F/aacc-prototype-backup-20260829T152608Z</code>, repo commit
+  <code>588baa0</code>).
+- S0 backup / preflight: PASS. S1 deterministic gate: PASS. S2 real build +
+  clean install: PASS. S3 first-launch legacy migration: <strong>FAIL</strong>.
+- S3 blocker: the real legacy <code>localStorage</code> <code>agents</code> key
+  holds 12 agents with two <code>id = 5</code> rows (<code>Finance Agent</code>
+  reporting to the Supervisor, <code>Financial Agent</code> reporting to Finance
+  Senior). Legacy normalization did not repair duplicate agent identities, so
+  authoritative validation rejected <code>agents[5].id: agent id must be
+  unique</code>, the migration transaction rolled back, and the UI did not load.
+  The legacy source and the uninitialized SQLite database were left intact.
+- Bounded correction: returned to the owning subsystem as TASK-0021 per
+  [Decision 0003](decisions/0003-v3-continuation-roadmap.md). Live acceptance
+  resumes through TASK-0022 and completes in TASK-0030.
+
+## TASK-0021 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>
+- Starting HEAD:
+  <code>135e5835391ea3b215e076784aed1a75a5b04f85</code> (<code>Update ci.yml</code>)
+- Starting status: clean; checked-out <code>main</code> and
+  <code>origin/main</code> matched with zero ahead/behind
+- Dependency: the TASK-0020 S3 blocker above. TASK-0019 satisfied every
+  successor-preflight condition and its Git closure was backfilled to
+  <code>COMPLETE</code> in this task
+- Phase A outcome: <code>PHASE_A_READY</code> (governance decision surfaced for
+  the owner in §7 of the plan)
+- Approval received:
+  <code>APPROVED: IMPLEMENT TASK-0021 AS PLANNED.</code>
+- Root cause confirmed against the real legacy store (read-only copy; original
+  untouched): 12 agents, ids 1..11, two <code>id = 5</code>; both rows also map
+  to template key <code>financial</code>. The other eleven identities normalize
+  and validate cleanly.
+- Slice 1 — registry-issue contract and repair function:
+  <code>src-tauri/src/agent_registry.rs</code>. Added
+  <code>repair_duplicate_agent_ids(&amp;mut [Agent]) -&gt; Result&lt;(),
+  StateValidationError&gt;</code> and extended <code>REGISTRY_ISSUES</code> with
+  <code>duplicate-id</code>. First occurrence stays canonical; each later
+  duplicate is re-keyed to <code>max(id)+1</code> (checked, fail closed at
+  <code>MAX_SAFE_INTEGER</code>) and quarantined <code>unassigned</code> /
+  <code>duplicate-id</code> / <code>Paused</code> / detached; only the re-keyed
+  instance's own nested <code>tasks[].assignedAgentId</code> equal to the old id
+  follows the new id. 7 new unit tests. Check:
+  <code>cargo test --offline --lib agent_registry</code>
+- Slice 2 — wire both legacy import paths:
+  <code>src-tauri/src/app_state.rs</code>. Call
+  <code>repair_duplicate_agent_ids</code> before
+  <code>normalize_legacy_agents</code> in
+  <code>application_state_from_legacy</code> (renderer import) and
+  <code>application_state_from_legacy_backup</code> (legacy v2 backup import).
+  2 new integration tests over the 12-agent Finance/Financial fixture. Check:
+  <code>cargo test --offline --lib app_state</code>
+- Slice 3 — migration regression and DB check:
+  <code>src-tauri/src/persistence.rs</code> gains
+  <code>task_0021_migrate_legacy_repairs_duplicate_agent_identities</code>
+  (full <code>migrate_legacy</code>, 12 agents preserved, revision 1,
+  idempotent retry). In-scope defect found: the migration-0004
+  <code>registry_issue</code> <code>CHECK</code> constraint enumerated only the
+  original five issues, so writing <code>duplicate-id</code> failed with a
+  SQLite <code>CHECK constraint failed</code>. Fixed by adding
+  <code>'duplicate-id'</code> to the list in
+  <code>src-tauri/migrations/0004_agent_registry.sql</code>. This is a
+  fresh-database constraint-vs-contract sync, not a schema-version bump:
+  <code>PRAGMA user_version</code> stays 11, no new migration, and
+  <code>duplicate-id</code> is only ever written during legacy import into a
+  not-yet-initialized database
+- Slice 3b — renderer registry-issue contract: the frontend recognized-issue
+  set, the <code>AgentRegistryIssue</code> type, and
+  <code>registryIssueMessage</code> did not include <code>duplicate-id</code>,
+  so a migrated <code>duplicate-id</code> agent rendered with a misleading
+  "needs a valid reporting assignment" message. Synced
+  <code>src/applicationState.ts</code> and <code>src/agentRegistry.ts</code> and
+  added 2 frontend tests. No dedup logic added to the renderer; the backend
+  stays authoritative
+- Slice 4 — documentation and governance: added
+  [Decision 0003](decisions/0003-v3-continuation-roadmap.md); added the
+  continuation roadmap to [IMPLEMENTATION_PLAN.md](../IMPLEMENTATION_PLAN.md);
+  updated the Migration 0004 description in
+  [CURRENT_STATE.md](../CURRENT_STATE.md); added this continuation tracker and
+  evidence and backfilled TASK-0019 Git closure
+- Full non-live gate:
+  <code>npm run verify:fast</code> passed (22 frontend files / 71 tests, 7
+  Python voice-runtime tests, rustfmt, 227 locked/offline Rust tests);
+  <code>cargo clippy --locked --offline --all-targets -- -D warnings</code>
+  clean; <code>npm run build</code> passed (70 modules);
+  <code>npm run verify:full</code> passed the build, Clippy, shell/Python/JSON
+  checks, dependency trees, npm audits, third-party license gate, packaging
+  validation, and the staged install/upgrade/remove/keep-data/purge test.
+  <code>shellcheck</code> available and clean. Rust advisory status
+  <strong>indeterminate</strong> locally (<code>cargo-audit</code>/
+  <code>cargo-deny</code> not installed; CI enforces them)
+- Rust test delta: 217 → 227 (+7 agent_registry, +2 app_state, +1 persistence).
+  Frontend test delta: 69 → 71 (+2 agentRegistry)
+- Live/external actions: none. No live Codex/Ollama, provider auth, microphone,
+  KDE portal, installer/uninstaller/purge against the real machine, or GitHub
+  Actions run. No migration executed against the user's real data; the S0
+  backup and legacy store are untouched
+- No new dependency, no Cargo/npm manifest or lock change, no schema/
+  <code>user_version</code> change, no new migration file, no security-authority
+  boundary change
+- Git closure: <code>PENDING USER</code>
 
 ## Successor-preflight closure rule
 

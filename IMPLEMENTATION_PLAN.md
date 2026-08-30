@@ -211,6 +211,34 @@ the following are recorded:
 Until then, every project authority must call the application development or
 pre-production software.
 
+## Continuation roadmap (version 3.0)
+
+[Decision 0003](planning/decisions/0003-v3-continuation-roadmap.md) adopts a
+ten-task stabilization continuation after TASK-0020 live acceptance stopped at
+the S3 first-launch legacy-migration blocker. The twenty-task roadmap above is
+not renumbered; TASK-0021 – TASK-0030 extend it.
+
+| Task | Priority | Depends on | Coherent outcome |
+| --- | --- | --- | --- |
+| TASK-0021 | P0 | TASK-0020 S3 blocker | Legacy state migration repair and duplicate identity recovery |
+| TASK-0022 | P0 | TASK-0021 | Startup persistence recovery and S3 migration completion |
+| TASK-0023 | P0 | TASK-0022 | Agent hierarchy, routing, queue, approvals, and policy live stabilization |
+| TASK-0024 | P0 | TASK-0023 | Codex / Ollama cancellation, workspace evidence, and review stabilization |
+| TASK-0025 | P0 | TASK-0024 | Voice, KDE portal, PC control, and notification stabilization |
+| TASK-0026 | P1 | TASK-0025 | Reminders, memory, backup/restore, and data-lifecycle stabilization |
+| TASK-0027 | P0 | TASK-0026 | Install, upgrade, remove, purge, and Arch package stabilization |
+| TASK-0028 | P1 | TASK-0027 | Integrated desktop UI/UX and recovery acceptance |
+| TASK-0029 | P0 | TASK-0028 | Full regression, security, CI, and release-candidate hardening |
+| TASK-0030 | P0 | TASK-0029 | Final version 1.0 acceptance, release evidence, and handoff |
+
+TASK-0020's sequential live-acceptance intent and the version 1.0 release gate
+are unchanged in substance; they are satisfied through TASK-0030 once
+TASK-0021 – TASK-0029 are green. TASK-0020 is `IN PROGRESS (blocked at S3)`
+until then. Execution follows [AGENTS.md](AGENTS.md); continuation tasks may
+progress autonomously through routine in-scope defects and pause only for
+destructive real-data actions, secrets, sudo, microphone/portal interaction, or
+a material boundary decision.
+
 ## Changing this roadmap
 
 An explicit user decision may change scope, order, or a fixed decision. A

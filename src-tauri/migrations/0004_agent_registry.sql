@@ -13,7 +13,8 @@ ADD COLUMN registry_issue TEXT
             'missing-manager',
             'manager-not-active',
             'manager-authority',
-            'cycle'
+            'cycle',
+            'duplicate-id'
         )
     );
 

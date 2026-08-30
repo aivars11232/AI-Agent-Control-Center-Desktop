@@ -14932,6 +14932,72 @@ mod tests {
     }
 
     #[test]
+    fn task_0021_migrate_legacy_repairs_duplicate_agent_identities() {
+        // Reproduce the real TASK-0020 S3 blocker: 12 legacy agents, ids 1..11,
+        // with two `id = 5` rows (`Finance Agent` -> Supervisor, `Financial
+        // Agent` -> Finance Senior) and no template keys.
+        let mut legacy_state = default_application_state().unwrap();
+        for agent in &mut legacy_state.agents {
+            agent.template_key = None;
+        }
+        let position = legacy_state
+            .agents
+            .iter()
+            .position(|agent| agent.id == 5)
+            .unwrap();
+        legacy_state.agents[position].name = "Finance Agent".to_string();
+        legacy_state.agents[position].reports_to = Some(1);
+        let mut clone = legacy_state.agents[position].clone();
+        clone.name = "Financial Agent".to_string();
+        clone.reports_to = Some(10);
+        legacy_state.agents.insert(position + 1, clone);
+        let legacy = legacy_renderer_state(&legacy_state);
+
+        let mut repository = StateRepository::open_in_memory().unwrap();
+        let migrated = repository.migrate_legacy(&legacy).unwrap();
+
+        assert_eq!(migrated.revision, 1);
+        assert_eq!(
+            migrated.migration.source_kind.as_deref(),
+            Some("legacy_local_storage")
+        );
+        assert_eq!(migrated.state.agents.len(), 12);
+        let mut ids: Vec<i64> = migrated.state.agents.iter().map(|agent| agent.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 12, "every migrated agent id is unique");
+
+        let canonical = migrated
+            .state
+            .agents
+            .iter()
+            .find(|agent| agent.name == "Finance Agent")
+            .unwrap();
+        assert_eq!(canonical.id, 5);
+        assert_eq!(canonical.registry_state, "active");
+        assert!(canonical.registry_issue.is_none());
+
+        let requarantined = migrated
+            .state
+            .agents
+            .iter()
+            .find(|agent| agent.name == "Financial Agent")
+            .unwrap();
+        assert_ne!(requarantined.id, 5);
+        assert_eq!(requarantined.registry_state, "unassigned");
+        assert_eq!(
+            requarantined.registry_issue.as_deref(),
+            Some("duplicate-id")
+        );
+        assert_eq!(requarantined.status, "Paused");
+        assert_eq!(requarantined.reports_to, None);
+
+        // The migration is committed once; a retry returns the same state.
+        let again = repository.migrate_legacy(&legacy).unwrap();
+        assert_eq!(again, migrated);
+    }
+
+    #[test]
     fn stale_revision_is_rejected_without_changing_state() {
         let mut repository = StateRepository::open_in_memory().unwrap();
         let initialized = repository.initialize_fresh().unwrap();

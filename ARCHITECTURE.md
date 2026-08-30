@@ -199,8 +199,9 @@ change registry identity, lifecycle, name, role, category, authority, or
 reporting structure. Roles derive authority; active non-supervisors require an
 active higher-authority manager; self-parenting, cycles, dangling managers, and
 incompatible authority fail validation. Legacy invalid relationships are
-paused and detached for explicit repair, and absent/deleted defaults are not
-silently recreated.
+paused and detached for explicit repair, legacy agents that share an id are
+made unique by keeping the first occurrence and quarantining re-keyed
+duplicates, and absent/deleted defaults are not silently recreated.
 
 Schema v5 adds bounded routing inputs and evidence, queue state and enqueue
 sequence on tasks, per-agent queue thresholds and overflow policy, plus durable

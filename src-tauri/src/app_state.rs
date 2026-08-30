@@ -1,4 +1,6 @@
-use crate::agent_registry::{normalize_legacy_agents, validate_agent_registry};
+use crate::agent_registry::{
+    normalize_legacy_agents, repair_duplicate_agent_ids, validate_agent_registry,
+};
 use crate::specialist_capabilities::SpecialistTaskRequestV1;
 use crate::task_orchestration::{RoutingEvidence, ROUTING_ALGORITHM_VERSION};
 use crate::workspace_evidence::{
@@ -402,6 +404,7 @@ pub fn application_state_from_legacy(
     }
     if let Some(value) = &legacy.agents {
         state.agents = parse_legacy_json("agents", value)?;
+        repair_duplicate_agent_ids(&mut state.agents)?;
         normalize_legacy_agents(&mut state.agents);
     }
     if let Some(value) = &legacy.models {
@@ -465,6 +468,7 @@ pub fn application_state_from_legacy_backup(
             .preferences
             .unwrap_or_else(|| current.preferences.clone()),
     };
+    repair_duplicate_agent_ids(&mut state.agents)?;
     normalize_legacy_agents(&mut state.agents);
     append_missing_ollama_model(&mut state)?;
     downgrade_legacy_approvals(&mut state);
@@ -1668,5 +1672,115 @@ mod tests {
             validate_application_state(&state).unwrap_err().path,
             "agents[1].deletedAtUnixMs"
         );
+    }
+
+    /// Legacy prototype agents that reproduce the real TASK-0020 S3 blocker: 12
+    /// agents, ids 1..11, with two `id = 5` rows (`Finance Agent` reporting to
+    /// the Supervisor and `Financial Agent` reporting to Finance Senior) and no
+    /// `templateKey` on any row.
+    fn duplicate_identity_legacy_agents_json() -> String {
+        let mut agents = default_application_state()
+            .expect("seed application state is valid")
+            .agents;
+        for agent in &mut agents {
+            agent.template_key = None;
+        }
+        let position = agents
+            .iter()
+            .position(|agent| agent.id == 5)
+            .expect("seed has an agent with id 5");
+        agents[position].name = "Finance Agent".to_string();
+        agents[position].reports_to = Some(1);
+        let mut clone = agents[position].clone();
+        clone.name = "Financial Agent".to_string();
+        clone.reports_to = Some(10);
+        agents.insert(position + 1, clone);
+        serde_json::to_string(&agents).expect("legacy agents serialize")
+    }
+
+    #[test]
+    fn task_0021_legacy_import_recovers_duplicate_finance_identity() {
+        let legacy = LegacyRendererState {
+            agents: Some(duplicate_identity_legacy_agents_json()),
+            ..LegacyRendererState::default()
+        };
+
+        let state =
+            application_state_from_legacy(&legacy).expect("duplicate legacy identity is repaired");
+
+        assert_eq!(state.agents.len(), 12);
+        let mut ids = HashSet::new();
+        assert!(state.agents.iter().all(|agent| ids.insert(agent.id)));
+
+        let canonical = state
+            .agents
+            .iter()
+            .find(|agent| agent.name == "Finance Agent")
+            .unwrap();
+        assert_eq!(canonical.id, 5);
+        assert_eq!(canonical.registry_state, "active");
+        assert!(canonical.registry_issue.is_none());
+        assert_eq!(canonical.template_key.as_deref(), Some("financial"));
+
+        let requarantined = state
+            .agents
+            .iter()
+            .find(|agent| agent.name == "Financial Agent")
+            .unwrap();
+        assert_eq!(requarantined.id, 12);
+        assert_eq!(requarantined.registry_state, "unassigned");
+        assert_eq!(
+            requarantined.registry_issue.as_deref(),
+            Some("duplicate-id")
+        );
+        assert_eq!(requarantined.status, "Paused");
+        assert_eq!(requarantined.reports_to, None);
+        assert!(requarantined.template_key.is_none());
+
+        // Authoritative validation still accepts the repaired state and stays
+        // strict about uniqueness for everything else.
+        validate_application_state(&state).expect("repaired legacy state is valid");
+    }
+
+    #[test]
+    fn task_0021_legacy_backup_import_recovers_duplicate_finance_identity() {
+        let current = default_application_state().expect("seed application state is valid");
+        let agents: serde_json::Value =
+            serde_json::from_str(&duplicate_identity_legacy_agents_json()).unwrap();
+        let backup = serde_json::json!({
+            "version": 2,
+            "agents": agents,
+            "models": [],
+            "approvalRequests": [],
+        })
+        .to_string();
+
+        let state = application_state_from_legacy_backup(&backup, &current)
+            .expect("duplicate legacy-backup identity is repaired");
+
+        assert_eq!(state.agents.len(), 12);
+        let mut ids = HashSet::new();
+        assert!(state.agents.iter().all(|agent| ids.insert(agent.id)));
+
+        let canonical = state
+            .agents
+            .iter()
+            .find(|agent| agent.name == "Finance Agent")
+            .unwrap();
+        assert_eq!(canonical.id, 5);
+        assert_eq!(canonical.registry_state, "active");
+
+        let requarantined = state
+            .agents
+            .iter()
+            .find(|agent| agent.name == "Financial Agent")
+            .unwrap();
+        assert_ne!(requarantined.id, 5);
+        assert_eq!(
+            requarantined.registry_issue.as_deref(),
+            Some("duplicate-id")
+        );
+
+        validate_application_state(&state).expect("repaired legacy backup state is valid");
     }
 }

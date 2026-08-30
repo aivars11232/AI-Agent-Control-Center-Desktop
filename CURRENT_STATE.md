@@ -285,9 +285,20 @@ registry lifecycle, bounded repair reasons, deletion timestamps, and a
 single-row monotonic ID allocator. It derives authority from role, maps the
 eleven legacy default identities without depending on display names, and
 quarantines invalid legacy reporting edges rather than hiding or dropping the
-affected agents. Dedicated revision-checked IPC owns create, update, logical
-delete, and explicit template restore. Generic renderer saves reject registry
-structure changes, and policy/routing projections exclude non-active agents.
+affected agents. Legacy renderer import and legacy version-2 backup import also
+repair agents that share an <code>id</code>: the first occurrence stays
+canonical, each later duplicate is re-keyed to a fresh JavaScript-safe id and
+quarantined as <code>unassigned</code> with the <code>duplicate-id</code>
+registry issue rather than deleted, and only references owned by the re-keyed
+instance itself follow the new id so a duplicate never inherits another agent's
+authority. The recognized registry-issue set is <code>self-parent</code>,
+<code>missing-manager</code>, <code>manager-not-active</code>,
+<code>manager-authority</code>, <code>cycle</code>, and <code>duplicate-id</code>
+in the backend contract, the SQLite <code>registry_issue</code> check, and the
+renderer. Authoritative current-state validation still rejects any duplicate
+agent id. Dedicated revision-checked IPC owns create, update, logical delete,
+and explicit template restore. Generic renderer saves reject registry structure
+changes, and policy/routing projections exclude non-active agents.
 
 Migration 0005 adds task routing inputs and evidence, queue state and enqueue
 sequence, queue-threshold/overflow preferences, indexes and validation
