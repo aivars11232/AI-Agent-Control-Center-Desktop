@@ -401,6 +401,17 @@ approved legacy approvals become expired, remain marked non-authoritative,
 and cannot inherit authority from migration. Legacy keys are removed only
 after commit, and cleanup acknowledgement is restart-safe. Malformed legacy
 data remains available for recovery and does not partially initialize state.
+The real prototype <code>localStorage</code> holding twelve agents with two
+<code>id = 5</code> rows (<code>Finance Agent</code>, <code>Financial Agent</code>)
+migrates to twelve agents: the first occurrence stays canonical and the second
+is re-keyed and quarantined as <code>duplicate-id</code>.
+
+Database open detects one recovery case: a database that finished migrating to
+the current <code>user_version</code> but was never initialized and whose
+persisted schema differs from a freshly migrated schema. That is an empty shell
+left by an older build whose migration DDL later changed in place; it holds no
+user state, so open rebuilds it from scratch. An initialized database is never
+inspected this way and never rebuilt.
 
 Desktop startup and saves fail closed on database errors; they do not fall
 back to browser storage. A browser-only preview continues to use

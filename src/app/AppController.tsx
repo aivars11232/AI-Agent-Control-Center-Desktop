@@ -78,6 +78,10 @@ import { SettingsPage } from "../features/settings/SettingsPage";
 import { TasksPage } from "../features/tasks/TasksPage";
 import { VoiceControlPage } from "../features/voice/VoiceControlPage";
 import { AppShell } from "./AppShell";
+import {
+  PersistenceStatusView,
+  type PersistencePhase,
+} from "./PersistenceStatusView";
 import type { Page } from "./navigation";
 import {
   previewMonitoringSnapshot,
@@ -141,9 +145,9 @@ export function AppController() {
     useState<TaskOrchestrationSnapshot>(emptyTaskOrchestrationSnapshot);
   const [reviewOrchestration, setReviewOrchestration] =
     useState<ReviewOrchestrationSnapshot>(emptyReviewOrchestrationSnapshot);
-  const [persistencePhase, setPersistencePhase] = useState<
-    "loading" | "mutating" | "hydrating" | "ready" | "error"
-  >(desktopRuntime ? "loading" : "ready");
+  const [persistencePhase, setPersistencePhase] = useState<PersistencePhase>(
+    desktopRuntime ? "loading" : "ready",
+  );
   const [persistenceMessage, setPersistenceMessage] = useState("");
   const persistenceWriter = useRef<ApplicationStateWriter | null>(null);
   const suppressNextPersistenceWrite = useRef(false);
@@ -1359,28 +1363,11 @@ export function AppController() {
   }
 
   if (desktopRuntime && persistencePhase !== "ready") {
-    const failed = persistencePhase === "error";
     return (
-      <div className="app-shell">
-        <main className="main-content">
-          <section className="panel" role={failed ? "alert" : "status"}>
-            <span className="eyebrow">APPLICATION STATE</span>
-            <h1>{failed ? "Application data unavailable" : "Loading application data"}</h1>
-            <p className="page-message">
-              {failed
-                ? persistenceMessage
-                : persistencePhase === "mutating"
-                  ? "Updating the versioned local application database…"
-                  : "Opening the versioned local application database…"}
-            </p>
-            {failed && (
-              <p className="form-hint">
-                No desktop data was written to browser storage. Resolve the database error and restart the app.
-              </p>
-            )}
-          </section>
-        </main>
-      </div>
+      <PersistenceStatusView
+        phase={persistencePhase}
+        message={persistenceMessage}
+      />
     );
   }
 

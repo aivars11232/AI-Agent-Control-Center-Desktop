@@ -77,7 +77,7 @@ use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -733,14 +733,33 @@ impl PersistenceService {
 
 impl StateRepository {
     pub fn open(path: &Path) -> PersistenceResult<Self> {
-        prepare_private_database_file(path)?;
-        let connection = Connection::open(path).map_err(PersistenceError::database)?;
-        let mut repository = Self { connection };
-        repository.configure_connection_preflight()?;
-        repository.verify_integrity()?;
-        repository.verify_supported_schema_version()?;
-        repository.configure_write_durability(false)?;
-        repository.apply_migrations()?;
+        let mut repository = Self::open_and_migrate(path)?;
+
+        // A database whose migrations completed but that was never initialized
+        // holds no user state: agent rows and the `initialized = 1` flag are
+        // written in the same transaction as the first migrated or fresh state.
+        // If such a shell was produced by an earlier build whose migration DDL
+        // has since been corrected in place (for example the TASK-0021
+        // `registry_issue` CHECK), the current binary neither re-runs the
+        // migration nor can write against the stale schema, so startup is
+        // permanently stuck. Rebuild the empty shell from scratch instead.
+        if repository.is_superseded_uninitialized_shell()? {
+            log::warn!(
+                "rebuilding an uninitialized application database whose schema \
+                 predates the current migrations"
+            );
+            drop(repository);
+            remove_database_artifacts(path)?;
+            repository = Self::open_and_migrate(path)?;
+            if repository.is_superseded_uninitialized_shell()? {
+                return Err(PersistenceError::new(
+                    "SCHEMA_REBUILD_FAILED",
+                    "The application database could not be rebuilt to the current schema.",
+                    false,
+                ));
+            }
+        }
+
         repository.reconcile_interrupted_runs()?;
         repository.reconcile_dispatched_system_actions()?;
         repository.reconcile_reserved_reminder_deliveries()?;
@@ -751,8 +770,64 @@ impl StateRepository {
         Ok(repository)
     }
 
+    fn open_and_migrate(path: &Path) -> PersistenceResult<Self> {
+        prepare_private_database_file(path)?;
+        let connection = Connection::open(path).map_err(PersistenceError::database)?;
+        let mut repository = Self { connection };
+        repository.configure_connection_preflight()?;
+        repository.verify_integrity()?;
+        repository.verify_supported_schema_version()?;
+        repository.configure_write_durability(false)?;
+        repository.apply_migrations()?;
+        Ok(repository)
+    }
+
+    /// Definitions of every named schema object (tables, indexes, triggers,
+    /// views) that carries explicit SQL, ordered by name. Two databases that
+    /// ran the same migration statements produce byte-identical definitions.
+    fn schema_object_definitions(&self) -> PersistenceResult<Vec<(String, String)>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .map_err(PersistenceError::database)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(PersistenceError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::database)?;
+        Ok(rows)
+    }
+
+    /// True only for a database that finished migrating, was never initialized,
+    /// and whose persisted schema differs from a freshly migrated schema. An
+    /// initialized database is never inspected and never rebuilt.
+    fn is_superseded_uninitialized_shell(&self) -> PersistenceResult<bool> {
+        let initialized: bool = self
+            .connection
+            .query_row(
+                "SELECT initialized FROM application_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        if initialized {
+            return Ok(false);
+        }
+        Ok(self.schema_object_definitions()? != expected_migrated_schema_objects()?)
+    }
+
     #[cfg(test)]
     pub(crate) fn open_in_memory() -> PersistenceResult<Self> {
+        Self::open_in_memory_internal()
+    }
+
+    fn open_in_memory_internal() -> PersistenceResult<Self> {
         let connection = Connection::open_in_memory().map_err(PersistenceError::database)?;
         let mut repository = Self { connection };
         repository.configure_connection_preflight()?;
@@ -9623,6 +9698,40 @@ fn prepare_private_database_file(path: &Path) -> PersistenceResult<()> {
     Ok(())
 }
 
+/// The schema-object definitions a freshly migrated database produces with the
+/// current migration set. Used to detect an uninitialized on-disk shell left by
+/// an older build whose migration DDL has since changed in place.
+fn expected_migrated_schema_objects() -> PersistenceResult<Vec<(String, String)>> {
+    StateRepository::open_in_memory_internal()?.schema_object_definitions()
+}
+
+/// Remove a database file and its SQLite sidecar journals. Missing files are
+/// not an error; any other failure is reported so a rebuild never proceeds on a
+/// partially removed database.
+fn remove_database_artifacts(path: &Path) -> PersistenceResult<()> {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let artifact = if suffix.is_empty() {
+            path.to_path_buf()
+        } else {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
+        match fs::remove_file(&artifact) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(PersistenceError::new(
+                    "SCHEMA_REBUILD_FAILED",
+                    "A superseded application database file could not be removed for rebuild.",
+                    false,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn now_unix_ms() -> PersistenceResult<i64> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -14995,6 +15104,290 @@ mod tests {
         // The migration is committed once; a retry returns the same state.
         let again = repository.migrate_legacy(&legacy).unwrap();
         assert_eq!(again, migrated);
+    }
+
+    #[test]
+    fn task_0022_first_then_second_launch_recover_duplicate_identity_on_disk() {
+        // TASK-0022: replay the real TASK-0020 S3 first launch against an
+        // on-disk database, then prove the second launch is stable without
+        // re-importing. The legacy store holds 12 agents (ids 1..11) with two
+        // `id = 5` rows (`Finance Agent` -> Supervisor, `Financial Agent` ->
+        // Finance Senior) and no template keys.
+        let legacy = twelve_agent_finance_financial_legacy();
+
+        let directory = TestDirectory::new();
+        let path = directory.database_path();
+
+        // First launch: fresh database, schema migrates to 11, the legacy
+        // migration commits the repaired 12-agent registry.
+        let first_revision;
+        {
+            let mut repository = StateRepository::open(&path).unwrap();
+            assert_eq!(repository.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+            let user_version: i64 = repository
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(user_version, 11);
+            assert!(repository.load().unwrap().is_none());
+
+            let migrated = repository.migrate_legacy(&legacy).unwrap();
+            first_revision = migrated.revision;
+            assert_eq!(migrated.revision, 1);
+            assert_eq!(migrated.schema_version, CURRENT_SCHEMA_VERSION);
+            assert_eq!(
+                migrated.migration.source_kind.as_deref(),
+                Some("legacy_local_storage")
+            );
+            assert!(!migrated.migration.legacy_cleanup_acknowledged);
+            assert_eq!(migrated.state.agents.len(), 12);
+
+            let requarantined = migrated
+                .state
+                .agents
+                .iter()
+                .find(|agent| agent.name == "Financial Agent")
+                .unwrap();
+            assert_ne!(requarantined.id, 5);
+            assert_eq!(requarantined.registry_state, "unassigned");
+            assert_eq!(
+                requarantined.registry_issue.as_deref(),
+                Some("duplicate-id")
+            );
+            assert_eq!(requarantined.status, "Paused");
+            assert_eq!(requarantined.reports_to, None);
+
+            // The renderer performs its one-time legacy cleanup acknowledgement
+            // after clearing browser storage; the revision does not advance.
+            let acknowledged = repository
+                .acknowledge_legacy_cleanup(migrated.revision)
+                .unwrap();
+            assert!(acknowledged.migration.legacy_cleanup_acknowledged);
+            assert_eq!(acknowledged.revision, first_revision);
+        }
+
+        // Second launch: the existing database loads directly. The
+        // `duplicate-id` quarantine survived the round trip through the on-disk
+        // CHECK constraint, and no re-import occurs even if the renderer still
+        // offers the legacy keys.
+        {
+            let mut repository = StateRepository::open(&path).unwrap();
+            let reopened = repository.load().unwrap().unwrap();
+            assert_eq!(reopened.revision, first_revision);
+            assert_eq!(reopened.schema_version, CURRENT_SCHEMA_VERSION);
+            assert!(reopened.migration.legacy_cleanup_acknowledged);
+            assert_eq!(reopened.state.agents.len(), 12);
+
+            let mut ids: Vec<i64> = reopened.state.agents.iter().map(|agent| agent.id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), 12, "every persisted agent id stays unique");
+
+            let canonical = reopened
+                .state
+                .agents
+                .iter()
+                .find(|agent| agent.name == "Finance Agent")
+                .unwrap();
+            assert_eq!(canonical.id, 5);
+            assert_eq!(canonical.registry_state, "active");
+            assert!(canonical.registry_issue.is_none());
+
+            let requarantined = reopened
+                .state
+                .agents
+                .iter()
+                .find(|agent| agent.name == "Financial Agent")
+                .unwrap();
+            assert_eq!(requarantined.registry_state, "unassigned");
+            assert_eq!(
+                requarantined.registry_issue.as_deref(),
+                Some("duplicate-id")
+            );
+
+            // A renderer that still holds the legacy keys cannot trigger a
+            // second migration or a second quarantined row.
+            let replay = repository.migrate_legacy(&legacy).unwrap();
+            assert_eq!(replay.revision, first_revision);
+            assert_eq!(replay.state.agents.len(), 12);
+            let quarantined_rows: i64 = repository
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM agents WHERE registry_issue = 'duplicate-id'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(quarantined_rows, 1);
+        }
+
+        // Third launch: still stable, still revision 1.
+        {
+            let mut repository = StateRepository::open(&path).unwrap();
+            let reopened = repository.load().unwrap().unwrap();
+            assert_eq!(reopened.revision, first_revision);
+            assert_eq!(reopened.state.agents.len(), 12);
+        }
+    }
+
+    #[test]
+    fn task_0022_migrated_agents_check_constraint_permits_duplicate_id() {
+        // TASK-0021 synced the migration-0004 `registry_issue` CHECK with the
+        // recognised registry-issue contract. A database created before that
+        // fix keeps the old five-value constraint and rejects a quarantined
+        // `duplicate-id` row, which is why the disposable TASK-0020 S3
+        // acceptance database must be removed rather than reused for the
+        // migration replay.
+        let repository = StateRepository::open_in_memory().unwrap();
+        let agents_ddl: String = repository
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agents'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            agents_ddl.contains("'duplicate-id'"),
+            "migrated agents.registry_issue CHECK must permit 'duplicate-id': {agents_ddl}"
+        );
+    }
+
+    /// Rewrites the persisted `agents` definition so its `registry_issue` CHECK
+    /// predates the TASK-0021 fix, reproducing the schema of the real stale
+    /// database that a pre-fix binary left on the acceptance machine.
+    fn downgrade_persisted_agents_check(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        let current: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agents'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let pre_fix = current.replace(",\n            'duplicate-id'", "");
+        assert_ne!(
+            pre_fix, current,
+            "fixture must remove the duplicate-id value"
+        );
+        connection
+            .execute_batch("PRAGMA writable_schema = ON;")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sqlite_master SET sql = ?1
+                 WHERE type = 'table' AND name = 'agents'",
+                [pre_fix],
+            )
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA writable_schema = OFF;")
+            .unwrap();
+    }
+
+    fn twelve_agent_finance_financial_legacy() -> LegacyRendererState {
+        let mut legacy_state = default_application_state().unwrap();
+        for agent in &mut legacy_state.agents {
+            agent.template_key = None;
+        }
+        let position = legacy_state
+            .agents
+            .iter()
+            .position(|agent| agent.id == 5)
+            .unwrap();
+        let mut clone = legacy_state.agents[position].clone();
+        clone.name = "Financial Agent".to_string();
+        clone.reports_to = Some(10);
+        legacy_state.agents[position].name = "Finance Agent".to_string();
+        legacy_state.agents[position].reports_to = Some(1);
+        legacy_state.agents.insert(position + 1, clone);
+        legacy_renderer_state(&legacy_state)
+    }
+
+    #[test]
+    fn task_0022_open_rebuilds_an_uninitialized_database_with_a_superseded_schema() {
+        let directory = TestDirectory::new();
+        let path = directory.database_path();
+
+        drop(StateRepository::open(&path).unwrap());
+        downgrade_persisted_agents_check(&path);
+
+        // The fixture is the real stuck state: a fully migrated but never
+        // initialized database whose schema can no longer accept a quarantined
+        // duplicate.
+        {
+            let stale = StateRepository::open_and_migrate(&path).unwrap();
+            assert!(stale.is_superseded_uninitialized_shell().unwrap());
+        }
+
+        // `open` rebuilds the empty shell; the schema is current again and the
+        // database is still uninitialized, ready for the legacy migration.
+        let mut repository = StateRepository::open(&path).unwrap();
+        assert!(!repository.is_superseded_uninitialized_shell().unwrap());
+        assert!(repository.load().unwrap().is_none());
+        let healed: String = repository
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agents'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            healed.contains("'duplicate-id'"),
+            "open must rebuild the superseded schema"
+        );
+
+        // The real duplicate-identity legacy migration now completes end to end.
+        let migrated = repository
+            .migrate_legacy(&twelve_agent_finance_financial_legacy())
+            .unwrap();
+        assert_eq!(migrated.state.agents.len(), 12);
+        assert_eq!(
+            migrated
+                .state
+                .agents
+                .iter()
+                .filter(|agent| agent.registry_issue.as_deref() == Some("duplicate-id"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn task_0022_open_preserves_an_initialized_database_with_a_drifted_schema() {
+        let directory = TestDirectory::new();
+        let path = directory.database_path();
+
+        let baseline = {
+            let mut repository = StateRepository::open(&path).unwrap();
+            repository
+                .migrate_legacy(&legacy_renderer_state(
+                    &default_application_state().unwrap(),
+                ))
+                .unwrap()
+        };
+        downgrade_persisted_agents_check(&path);
+
+        // The database carries committed user state, so `open` must not rebuild
+        // it even though its schema no longer matches a fresh migration.
+        let mut repository = StateRepository::open(&path).unwrap();
+        assert!(!repository.is_superseded_uninitialized_shell().unwrap());
+        let reopened = repository.load().unwrap().unwrap();
+        assert_eq!(reopened.revision, baseline.revision);
+        assert_eq!(reopened.state.agents.len(), baseline.state.agents.len());
+        let agents_ddl: String = repository
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agents'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !agents_ddl.contains("'duplicate-id'"),
+            "an initialized database must never be rebuilt"
+        );
     }
 
     #[test]

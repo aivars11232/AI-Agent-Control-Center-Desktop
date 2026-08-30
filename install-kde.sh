@@ -63,6 +63,18 @@ if ! command -v codex >/dev/null 2>&1 && [[ ! -x "$HOME/.local/bin/codex" ]]; th
   warn "until Codex is installed and signed in with ChatGPT."
 fi
 
+# --- stop any running instance before building --------------------------
+# A running pre-upgrade instance opens the database during the multi-minute
+# build. If its migration DDL is older than the current tree it can leave an
+# uninitialised database at the current schema version that the new binary
+# cannot re-migrate, so stop it up front rather than after the build. A stale
+# instance that still races the build is recovered on the next launch: the new
+# binary rebuilds an uninitialised database whose schema is out of date.
+if [[ -x "$installed_bin" ]]; then
+  log "stopping the running instance and voice listener"
+  "$installed_bin" --stop-runtime || true
+fi
+
 # --- build ----------------------------------------------------------------
 cd "$project_dir"
 log "installing JavaScript dependencies (no lifecycle scripts)"
@@ -74,12 +86,6 @@ built_bin="$project_dir/src-tauri/target/release/$app_id"
 if [[ ! -x "$built_bin" ]]; then
   echo "Build did not produce $built_bin" >&2
   exit 1
-fi
-
-# --- stop any running instance ------------------------------------------
-if [[ -x "$installed_bin" ]]; then
-  log "stopping the running instance and voice listener"
-  "$installed_bin" --stop-runtime || true
 fi
 
 # --- install / upgrade the payload ------------------------------------

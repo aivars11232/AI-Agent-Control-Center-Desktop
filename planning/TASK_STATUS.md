@@ -52,8 +52,8 @@ roadmap.
 
 | Task | Depends | Phase A | Approved | Phase B | Verification | Git closure | Title |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| TASK-0021 | TASK-0020 S3 blocker | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Legacy state migration repair and duplicate identity recovery |
-| TASK-0022 | TASK-0021 | NOT STARTED | NO | NOT STARTED | — | — | Startup persistence recovery and S3 migration completion |
+| TASK-0021 | TASK-0020 S3 blocker | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Legacy state migration repair and duplicate identity recovery |
+| TASK-0022 | TASK-0021 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Startup persistence recovery and S3 migration completion |
 | TASK-0023 | TASK-0022 | NOT STARTED | NO | NOT STARTED | — | — | Agent hierarchy, routing, queue, approvals, and policy live stabilization |
 | TASK-0024 | TASK-0023 | NOT STARTED | NO | NOT STARTED | — | — | Codex / Ollama cancellation, workspace evidence, and review stabilization |
 | TASK-0025 | TASK-0024 | NOT STARTED | NO | NOT STARTED | — | — | Voice, KDE portal, PC control, and notification stabilization |
@@ -1514,6 +1514,14 @@ roadmap.
 - Bounded correction: returned to the owning subsystem as TASK-0021 per
   [Decision 0003](decisions/0003-v3-continuation-roadmap.md). Live acceptance
   resumes through TASK-0022 and completes in TASK-0030.
+- S3 replay under TASK-0022 (2026-08-30): after removing the disposable
+  uninitialized acceptance database and reinstalling, first launch migrated the
+  preserved real legacy store to <code>user_version = 11</code>, revision 1,
+  <code>source_kind = legacy_local_storage</code>, 12 agents (<code>Finance
+  Agent</code> canonical, <code>Financial Agent</code> quarantined
+  <code>duplicate-id</code>); legacy keys cleared only after commit; the normal
+  shell loaded; second launch was stable with no re-import. S3 is PASS; TASK-0020
+  overall remains <code>IN PROGRESS</code> until TASK-0030.
 
 ## TASK-0021 evidence
 
@@ -1602,6 +1610,110 @@ roadmap.
 - No new dependency, no Cargo/npm manifest or lock change, no schema/
   <code>user_version</code> change, no new migration file, no security-authority
   boundary change
+- Git closure: user implementation commit
+  <code>0ca0484dc76390f4445ffe0085b785fcb77f3cfb</code> (<code>task21</code>) is
+  the checked-out <code>main</code> HEAD and matches <code>origin/main</code> with
+  zero ahead/behind. Its 13-file scope (agent_registry.rs, app_state.rs,
+  persistence.rs, migrations/0004_agent_registry.sql, applicationState.ts,
+  agentRegistry.ts, agentRegistry.test.ts, and six authority documents) matches
+  the four-slice report above. Verified at the TASK-0022 preflight on
+  2026-08-30; TASK-0019 Git closure was backfilled in that task.
+
+## TASK-0022 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>; starting HEAD
+  <code>0ca0484dc76390f4445ffe0085b785fcb77f3cfb</code> (<code>task21</code>);
+  clean tree; checked-out <code>main</code> and <code>origin/main</code> aligned
+  with zero ahead/behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0021; its
+  implementation commit, origin reachability, alignment, clean tree, and scope
+  were verified rather than inferred from the stale <code>PENDING USER</code>
+  label. TASK-0021 Git closure is backfilled to <code>COMPLETE</code> in this
+  task
+- Phase A outcome: <code>PHASE_A_READY</code>; approval received:
+  <code>APPROVED: IMPLEMENT TASK-0022 AS PLANNED.</code>
+- Slice 1 — startup/recovery regression coverage in
+  <code>src-tauri/src/persistence.rs</code> (tests only):
+  <code>task_0022_first_then_second_launch_recover_duplicate_identity_on_disk</code>
+  (on-disk <code>StateRepository::open</code>, 12-agent Finance/Financial
+  fixture: first open migrates to <code>user_version = 11</code> / revision 1,
+  <code>Financial Agent</code> re-keyed + <code>unassigned</code> /
+  <code>duplicate-id</code> / <code>Paused</code> / detached; reopen returns the
+  persisted quarantine unchanged; cleanup ack does not advance the revision;
+  third open stable; a stale-legacy replay cannot re-migrate or add a second
+  quarantined row) and
+  <code>task_0022_migrated_agents_check_constraint_permits_duplicate_id</code>
+  (guards the TASK-0021 migration-0004 CHECK)
+- Slice 2 — in-scope bootstrap defect found during the live replay and fixed
+  here: a database that finished migrating to <code>user_version = 11</code> but
+  was never initialized, created by an older build whose migration DDL later
+  changed in place, is unrecoverable — the current binary neither re-migrates it
+  nor can write against its stale <code>agents.registry_issue</code> CHECK, so
+  startup is stuck with a raw <code>DATABASE_ERROR</code>. <code>StateRepository::open</code>
+  now detects that exact state (migrations complete, <code>initialized = 0</code>,
+  persisted schema differs from a freshly migrated in-memory schema) and rebuilds
+  the empty shell from scratch; an initialized database is never inspected this
+  way and never rebuilt. No schema or <code>user_version</code> change; no new
+  migration file (owner decision, minimal option). Tests
+  <code>task_0022_open_rebuilds_an_uninitialized_database_with_a_superseded_schema</code>
+  and <code>task_0022_open_preserves_an_initialized_database_with_a_drifted_schema</code>
+- Slice 3 — error-state UI: extracted the pre-existing full-window persistence
+  status panel verbatim into <code>src/app/PersistenceStatusView.tsx</code> and
+  covered it with <code>src/app/PersistenceStatusView.test.tsx</code> — a
+  database failure renders <code>role="alert"</code> with the exact error code
+  and message and renders no navigation, buttons, or provider controls, so it
+  cannot be mistaken for a working screen. No product-UI redesign; recovery
+  affordances remain with TASK-0028
+- Slice 4 — install race fix: <code>install-kde.sh</code> now stops a running
+  pre-upgrade instance before the multi-minute build instead of after it, so a
+  session-restored old binary cannot create a stale schema-11 shell during the
+  build window; the persistence self-heal above is the backstop
+- Slice 5 — documentation: this evidence section, the TASK-0021/TASK-0022
+  tracker rows, the TASK-0020 S3-replay note, the TASK-0021 Git-closure
+  backfill, and the <code>CURRENT_STATE.md</code> startup-recovery paragraph
+- Live S3 replay on real Arch Linux / KDE Plasma / Wayland (2026-08-30): S0
+  backup and legacy <code>localStorage</code> re-verified byte-identical to the
+  20260829T152608Z snapshot; the disposable uninitialized acceptance database
+  was removed (by the user); clean rebuild + <code>install-kde.sh</code>
+  reinstall (post-install <code>--version</code> check passed, no rollback);
+  first launch of the pre-self-heal binary hit the stale-shell defect above
+  (diagnosed, fixed in Slice 2); after removing the stale shell, first launch
+  migrated the preserved legacy store — normal shell loaded, DB
+  <code>user_version = 11</code>, <code>initialized = 1</code>, revision 1,
+  <code>source_kind = legacy_local_storage</code>, 12 agents preserved
+  (<code>Financial Agent</code> = id 12, <code>unassigned</code> /
+  <code>duplicate-id</code>), all seven legacy keys cleared only after the
+  commit; second launch loaded immediately with no re-import (<code>migrated_at</code>
+  unchanged), 12 agents preserved
+- Full non-live gate on 2026-08-30: <code>npm run verify:fast</code> passed (23
+  frontend files / 74 tests, 7 Python voice-runtime tests, rustfmt, 231
+  locked/offline Rust tests); <code>cargo clippy --locked --offline
+  --all-targets -- -D warnings</code> clean; <code>npm run verify:full</code>
+  passed the 71-module build, Clippy, shell (<code>shellcheck</code> available
+  and clean, including <code>install-kde.sh</code>), Python, JSON, dependency
+  trees, both npm audits (0 vulnerabilities), the third-party license gate,
+  packaging validation, and the staged install/upgrade/remove/keep-data/purge
+  test. Rust advisory status <strong>indeterminate</strong> locally
+  (<code>cargo-audit</code> / <code>cargo-deny</code> not installed; CI enforces)
+- Rust test delta: 227 → 231 (+4 persistence). Frontend test delta: 71 → 74
+  (+3 PersistenceStatusView); frontend file count 22 → 23
+- Live/external actions: the user removed two verified-empty disposable
+  databases and ran <code>install-kde.sh</code> and two app launches on the real
+  machine with explicit authorization. No migration was run against real data
+  that was not the preserved legacy store; the S0 backup is untouched. No live
+  Codex/Ollama, provider auth, microphone, KDE portal, uninstaller, or purge
+- No new dependency, no Cargo/npm manifest or lock change, no schema/
+  <code>user_version</code> change, no new migration file, no security-authority
+  boundary change
+- Known out-of-scope observation for TASK-0025: the Voice Control page shows
+  <code>Command status: ERROR</code> and renders an unformatted <code>[object
+  Object]</code> when a startup gateway call
+  (<code>voice_runtime_status</code> / <code>desktop_control_status</code> /
+  <code>query_system_action_audits</code>) fails; <code>errorMessage()</code>
+  does not handle that error shape. Pre-existing, unmasked now that the shell
+  loads; not caused by TASK-0021 or TASK-0022
 - Git closure: <code>PENDING USER</code>
 
 ## Successor-preflight closure rule
