@@ -3,6 +3,8 @@ mod app_state;
 mod authorization;
 mod codex_runtime;
 mod data_lifecycle;
+#[cfg(test)]
+mod data_lifecycle_acceptance;
 mod desktop_control;
 mod lifecycle_removal;
 mod linux_desktop;

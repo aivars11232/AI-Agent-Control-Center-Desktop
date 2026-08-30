@@ -56,8 +56,8 @@ roadmap.
 | TASK-0022 | TASK-0021 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Startup persistence recovery and S3 migration completion |
 | TASK-0023 | TASK-0022 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Agent hierarchy, routing, queue, approvals, and policy live stabilization |
 | TASK-0024 | TASK-0023 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Codex / Ollama cancellation, workspace evidence, and review stabilization |
-| TASK-0025 | TASK-0024 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Voice, KDE portal, PC control, and notification stabilization |
-| TASK-0026 | TASK-0025 | NOT STARTED | NO | NOT STARTED | — | — | Reminders, memory, backup/restore, and data-lifecycle stabilization |
+| TASK-0025 | TASK-0024 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Voice, KDE portal, PC control, and notification stabilization |
+| TASK-0026 | TASK-0025 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Reminders, memory, backup/restore, and data-lifecycle stabilization |
 | TASK-0027 | TASK-0026 | NOT STARTED | NO | NOT STARTED | — | — | Install, upgrade, remove, purge, and Arch package stabilization |
 | TASK-0028 | TASK-0027 | NOT STARTED | NO | NOT STARTED | — | — | Integrated desktop UI/UX and recovery acceptance |
 | TASK-0029 | TASK-0028 | NOT STARTED | NO | NOT STARTED | — | — | Full regression, security, CI, and release-candidate hardening |
@@ -2149,6 +2149,143 @@ roadmap.
   security-authority or IPC-contract change. The only source change outside the
   new test module is the one-line <code>#[cfg(test)] mod voice_kde_acceptance;</code>
   registration in <code>src/lib.rs</code>
+- Git closure: <code>COMPLETE</code>. User implementation commits
+  <code>43a5d941c9ef8e139342d3117bcbf4bd7a674fce</code>
+  (<code>Stabilize voice and KDE control acceptance</code>) and
+  <code>cad16a43f86624e642aa6141a04a880bb76d1e4b</code>
+  (<code>Record TASK-0025 live S6 voice and KDE portal acceptance</code>) were
+  identified from Git history at the TASK-0026 preflight. The second is the
+  checked-out <code>main</code> HEAD and is <code>origin/main</code>; the first
+  is its parent and reachable from <code>origin/main</code>;
+  <code>main</code> vs <code>origin/main</code> is zero ahead / zero behind with
+  a clean tree. Their combined <code>762278a..cad16a4</code> scope (four files:
+  <code>src-tauri/src/voice_kde_acceptance.rs</code> new;
+  <code>src-tauri/src/lib.rs</code> one-line <code>#[cfg(test)]</code>
+  registration; <code>CURRENT_STATE.md</code>;
+  <code>planning/TASK_STATUS.md</code>) matches the TASK-0025 report with no
+  unexplained intervening state, so all seven successor-preflight closure
+  conditions passed. Verified and backfilled during the approved TASK-0026
+  Phase B on 2026-08-30.
+
+## TASK-0026 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>; starting HEAD
+  <code>cad16a43f86624e642aa6141a04a880bb76d1e4b</code>
+  (<code>Record TASK-0025 live S6 voice and KDE portal acceptance</code>); clean
+  tree; <code>main</code> vs <code>origin/main</code> zero ahead / zero behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0025 (see
+  its evidence above); its Git closure is backfilled to <code>COMPLETE</code> in
+  this task
+- Phase A outcome: <code>PHASE_A_READY</code>; approval: the v3.0 continuation
+  <code>RUN_PROMPT.txt</code> for TASK-0026 is the task-level approval to inspect,
+  plan, implement, and verify within its scope (no separate approval phrase).
+  Scope decisions taken as planned: a new <code>#[cfg(test)]</code> acceptance
+  module with all-synthetic data over a real <code>StateRepository</code>; one
+  opt-in <code>#[ignore]</code> live scenario re-confirming only the XDG
+  notification sink (no operator input); the full GUI data-lifecycle load
+  deferred to TASK-0028 per the known-gaps table
+- Slice 1 — composed reminders / memory / backup / data-lifecycle acceptance
+  (test only): <code>src-tauri/src/data_lifecycle_acceptance.rs</code>
+  (<code>#[cfg(test)] mod data_lifecycle_acceptance;</code> in
+  <code>src/lib.rs</code>). Twelve deterministic S7 scenarios over a real
+  <code>StateRepository</code> plus the module-level scheduler / memory / backup
+  helpers the commands use: recurrence + DST gap/fold anchoring and due-window
+  classification are consistent end to end and never count an overdue occurrence
+  as upcoming; due-reminder delivery is a bounded notification job derived from
+  the schedule with zero run attempts before or after scan and delivery, and
+  monitoring counts only active future reminders as upcoming; an unresolvable
+  recurrence is held <code>needs_attention</code> with inspectable issue evidence
+  and never dropped or delivered as a portal job; structured-memory scope
+  isolation holds through the real create path (agent / team / project scopes,
+  no cross-scope leak into the prompt bundle, deterministic SHA-256) and the
+  prompt bundle caps at 128 records with the remainder reported omitted; memory
+  retention prunes only expired records (7-day expired, 90-day and manual kept)
+  and records a <code>retention_deleted</code> maintenance event; portable backup
+  v4 round-trips byte-stable and preserves agents / tasks / reminders / memory /
+  workspaces while listing the omitted runtime-authority domains; a backup whose
+  embedded state carries pending + approved approvals, a running task with
+  model / usage / diff evidence, voice-runtime enabled, a portal-delivery
+  reminder, and user-provenance memory imports with every approval expired and
+  non-authoritative, the task held and stripped, voice disabled, portal delivery
+  downgraded to in-app, memory re-provenanced <code>backup_import</code>, and no
+  active run or pending approval minted; malformed or unsafe envelopes
+  (duplicate keys, trailing content, future version, oversize, depth bomb,
+  reminders smuggled into <code>data</code>, unknown top-level field) are all
+  rejected before any mutation and leave the current state and revision
+  unchanged; reset restores factory defaults, keeps the database file and its
+  bounded maintenance evidence, and its in-app wording is truthful and does not
+  borrow the CLI purge command's irreversible-deletion text; retention
+  maintenance with the clock behind the last observed time reports
+  <code>clock_rollback</code> / <code>CLOCK_ROLLBACK</code>, prunes nothing, and
+  preserves the record it refused to age out; monitoring task pages fail closed
+  with <code>MONITORING_REVISION_CONFLICT</code> on a stale revision tuple; and
+  the management-handoff history requires explicit predecessors, bounds its
+  payload, and scopes visibility to the management chain rather than free-form
+  agent messaging. Check:
+  <code>cargo test --locked --offline --lib data_lifecycle_acceptance</code> —
+  12 passed, plus one <code>#[ignore]</code>d <code>::live</code> test (Slice 4)
+- Slice 2 — backend in-scope defects: none. The composed matrix confirmed the
+  recurrence / DST anchoring, the passive bounded delivery and occurrence
+  evidence, the <code>needs_attention</code> hold, the memory scope-isolation and
+  prompt-bundle bounds, the retention age / task-lifetime / clock-rollback
+  rules, the backup export / candidate-parse / authority-downgrade / strict
+  rejection contract, the reset-versus-purge semantics, the monitoring revision
+  guard, and the sequential bounded handoff history all already hold in
+  <code>reminder_scheduler</code> / <code>structured_memory</code> /
+  <code>data_lifecycle</code> / <code>management_handoffs</code> /
+  <code>persistence</code>. No bound, provenance downgrade, sanitizer, or
+  fail-closed guard was weakened; no behaviour-preserving seam was required
+- Slice 3 — frontend data-lifecycle projection defects: none. The Reminders,
+  Agents (memory), and Settings (backup / reset / retention) surfaces render
+  backend failures through the centralized <code>persistenceErrorMessage</code> /
+  <code>errorMessage</code> helpers (hardened under TASK-0023), which format the
+  typed <code>{code, message}</code> payload and never produce
+  <code>[object Object]</code>. The deterministic renderer suite (25 files /
+  83 tests) is unchanged. The full running-GUI data-lifecycle path is owned by
+  TASK-0028 per the known-gaps table
+- Slice 4 — opt-in live re-confirmation (S7):
+  <code>data_lifecycle_acceptance::live::live_s7_reminder_notification_delivers_and_withdraws</code>
+  (<code>-- --ignored</code>), run once on the real Arch / KDE Plasma 6 / Wayland
+  session on 2026-08-30: a bounded notification derived from a real recurring
+  schedule was accepted via <code>NotificationProxy::add_notification</code> and
+  withdrawn via <code>remove_notification</code> — the exact reminder-delivery
+  sink <code>send_portal_reminder</code> uses — with zero run attempts. The
+  notification portal grant was already established and live-verified under
+  TASK-0025; no operator input, no dialog, no new grant. Excluded from the
+  deterministic gate
+- Slice 5 — documentation: this evidence section, the TASK-0025 Git-closure
+  backfill above, the continuation-tracker rows, and the
+  <code>CURRENT_STATE.md</code> verification-inventory refresh plus the S7
+  data-lifecycle stabilization paragraph and known-gaps row
+- Full non-live gate on 2026-08-30: <code>npm run verify:fast</code> passed (25
+  frontend files / 83 tests, 7 Python voice-runtime tests, rustfmt, 278
+  locked/offline Rust tests, 8 ignored); <code>npm run verify:full</code> passed
+  the 71-module build, <code>cargo clippy --locked --offline --all-targets --
+  -D warnings</code>, shell (<code>shellcheck</code> clean), Python, strict-JSON,
+  dependency trees, both npm audits (0 vulnerabilities), the third-party license
+  gate, packaging validation, and the staged
+  install/upgrade/remove/keep-data/purge test. Rust advisory status
+  <strong>indeterminate</strong> locally (<code>cargo-audit</code> /
+  <code>cargo-deny</code> not installed; CI enforces them under
+  <code>VERIFY_STRICT=1</code>)
+- Rust test delta: 266 → 278 (+12 <code>data_lifecycle_acceptance</code>
+  deterministic scenarios; one further <code>#[ignore]</code>d
+  <code>data_lifecycle_acceptance::live</code> test, run once on the real session
+  as above). Frontend test count unchanged at 83 / 25 files; Python unchanged
+  at 7
+- Live/external actions on 2026-08-30: the S7 notification re-confirmation above
+  (one real XDG notification delivered and withdrawn). No live AI provider, no
+  microphone, no portal grant dialog, no installer. The migrated prototype
+  application database, the KDE portal restore token, and the S0 backup were not
+  touched
+- No new runtime dependency, no Cargo/npm manifest or lock change, no schema /
+  <code>PRAGMA user_version</code> change, no new migration file, no
+  security-authority or IPC-contract change. The only source change outside the
+  new test module is the one-line
+  <code>#[cfg(test)] mod data_lifecycle_acceptance;</code> registration in
+  <code>src/lib.rs</code>
 - Git closure: <code>PENDING USER</code>
 
 ## Successor-preflight closure rule

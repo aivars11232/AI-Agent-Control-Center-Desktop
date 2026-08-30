@@ -911,14 +911,27 @@ cancellation, APG tab keyboard behavior, keyboard agent-card activation, skip
 navigation, page-focus transfer, deterministic axe checks, and responsive
 provider/reduced-motion style contracts.
 
-The Rust library contains 251 passing deterministic tests. They add Codex
+The Rust library contains 278 passing deterministic tests. They add Codex
 compatibility, command-isolation, bounded protocol, fake-process descendant
 cleanup, provider registry, fake-adapter dispatch, exact identity, typed
 failure, run-state, concurrent admission, idempotency, approval-boundary,
 cancellation, timeout, crash/restart, stale completion/event, truncation, and
 retention coverage to the earlier provider, workspace, run-safety, voice,
 state-validation, persistence, authorization, corruption, concurrency, and
-rollback tests. Ten TASK-0024 <code>provider_review_acceptance</code> scenarios
+rollback tests. Fifteen TASK-0025 <code>voice_kde_acceptance</code> scenarios
+compose the voice / KDE portal / PC-control / notification path (S6) over a real
+repository, and twelve TASK-0026 <code>data_lifecycle_acceptance</code> scenarios
+compose the reminders / structured-memory / portable-backup / retention /
+monitoring path (S7) — recurrence and DST anchoring, passive bounded reminder
+delivery with zero run attempts, <code>needs_attention</code> holds, memory
+scope isolation and prompt-bundle bounds through the real write path, retention
+age and clock-rollback rules, byte-stable backup round trips, authority
+downgrade on import, strict pre-mutation rejection of malformed or unsafe
+envelopes, truthful reset-versus-purge wording, and the
+<code>MONITORING_REVISION_CONFLICT</code> fail-closed guard. One further
+<code>data_lifecycle_acceptance::live</code> scenario is <code>#[ignore]</code>
+and re-confirms only the real XDG notification sink; it is excluded from the
+deterministic gate. Ten TASK-0024 <code>provider_review_acceptance</code> scenarios
 compose the real post-dispatch path — fake Codex CLI under Bubblewrap or fake
 Ollama loopback transport, bounded workspace-evidence attach, specialist
 finalize, and the sequential review pipeline over a real repository — and assert
@@ -1152,18 +1165,64 @@ spoken commands, releasing the recorder cleanly on stop. Small-model
 misrecognitions occurred (expected); the deactivate/"off" branch and the full
 GUI listener → gateway → portal-dispatch path stay covered by the deterministic
 matrix and are re-checked in TASK-0028 / TASK-0030.
-<code>npm run verify:fast</code> passed with 25 frontend files /
-83 tests, 7 Python tests, rustfmt, and 266 locked/offline Rust tests;
-<code>npm run verify:full</code> repeated those, built 71 modules, passed Clippy
-with warnings denied, the shell/Python/strict-JSON checks, both npm audits with
-zero vulnerabilities, the license gate, packaging validation, and the staged
-install/removal test.
 
-<code>cargo-audit</code>, <code>cargo-deny</code>, and <code>shellcheck</code>
-are not installed on the development machine, so <code>verify:full</code>
-reports the Rust advisory result as **indeterminate** and does not represent
-the skip as a pass. The CI <code>rust</code>, <code>licenses</code>, and
-<code>scripts</code> jobs install and require them under
+TASK-0026 stabilized the reminders / structured-memory / portable-backup /
+data-lifecycle slice (S7) at the deterministic level. Twelve new
+<code>data_lifecycle_acceptance</code> Rust scenarios compose these surfaces end
+to end over a real repository plus the module-level scheduler / memory / backup
+helpers the Tauri commands use: recurrence and DST gap/fold anchoring plus
+due-window classification that never counts an overdue occurrence as upcoming;
+due-reminder delivery that yields a bounded notification job derived from the
+schedule with zero run attempts before or after scan and delivery, reflected in
+the authoritative monitoring <code>upcoming_reminders</code> count; an
+unresolvable recurrence held <code>needs_attention</code> with inspectable issue
+evidence and never dropped or delivered as a portal job; structured-memory
+scope isolation through the real create path (agent / team / project scopes, no
+cross-scope leak into the prompt bundle, deterministic SHA-256) and the
+128-record / 64 KiB prompt-bundle cap with the remainder reported omitted;
+memory retention that prunes only expired records and records a
+<code>retention_deleted</code> maintenance event; a byte-stable portable
+backup v4 round trip that preserves agents / tasks / reminders / memory /
+workspaces and lists the omitted runtime-authority domains; a backup import that
+expires every carried approval, holds and strips the carried running task,
+disables the voice runtime, downgrades portal reminder delivery to in-app,
+re-provenances imported memory as <code>backup_import</code>, and mints no
+active run or pending approval; strict pre-mutation rejection of duplicate keys,
+trailing content, future versions, oversize, depth bombs, reminders smuggled
+into <code>data</code>, and unknown top-level fields, each leaving the current
+state and revision unchanged; a reset that restores factory defaults, keeps the
+database file and its bounded maintenance evidence, and whose in-app wording is
+truthful and distinct from the CLI purge command's irreversible-deletion text;
+retention maintenance that reports <code>clock_rollback</code> /
+<code>CLOCK_ROLLBACK</code> and prunes nothing when the clock moves behind the
+last observed time; the <code>MONITORING_REVISION_CONFLICT</code> fail-closed
+guard on a stale revision tuple; and a management-handoff history that requires
+explicit predecessors, bounds its payload, and scopes visibility to the
+management chain rather than free-form agent messaging. The composed matrix
+found no backend defect and required no renderer or Python change and no
+behaviour-preserving seam; the only non-test source change is the one-line
+<code>#[cfg(test)]</code> module registration. One opt-in
+<code>data_lifecycle_acceptance::live</code> scenario was run once on the real
+Arch / KDE Plasma 6 / Wayland session on 2026-08-30: a bounded notification
+derived from a real recurring schedule was delivered and withdrawn through the
+same <code>ashpd</code> notification path <code>send_portal_reminder</code> uses
+(the grant was already established under TASK-0025; no operator input, no
+dialog, no new grant). The full running-GUI data-lifecycle path is owned by
+TASK-0028.
+<code>npm run verify:fast</code> passed with 25 frontend files /
+83 tests, 7 Python tests, rustfmt, and 278 locked/offline Rust tests (8 ignored);
+<code>npm run verify:full</code> repeated those, built 71 modules, passed Clippy
+with warnings denied, the shell (<code>shellcheck</code> clean) / Python /
+strict-JSON checks, both npm audits with zero vulnerabilities, the license gate,
+packaging validation, and the staged install/upgrade/remove/keep-data/purge
+test.
+
+<code>cargo-audit</code> and <code>cargo-deny</code> are not installed on the
+development machine, so <code>verify:full</code> reports the Rust advisory
+result as **indeterminate** and does not represent the skip as a pass
+(<code>shellcheck</code> is now installed and the shell-lint step runs clean
+locally). The CI <code>rust</code>, <code>licenses</code>, and
+<code>scripts</code> jobs install and require all three under
 <code>VERIFY_STRICT=1</code>, making the advisory, license, and shell-lint
 gates mandatory for the branch.
 
@@ -1174,7 +1233,8 @@ gates mandatory for the branch.
 | Live Codex compatibility, authentication, model, and packaged-platform acceptance | TASK-0020 |
 | Live Ollama connectivity, installed-model behavior, cancellation, and packaged-platform acceptance | TASK-0020 |
 | Live core-specialist provider, hosted-search, structured-result, and adapter-limit acceptance | TASK-0020 |
-| Live installed reminder timer/tray, XDG notification portal, restart, and DST acceptance | TASK-0020 |
+| Live installed reminder timer/tray, XDG notification portal, restart, and DST acceptance (deterministic S7 green; notification sink live re-confirmed 2026-08-30) | TASK-0020 |
+| Full running-GUI data-lifecycle path (reminders / memory / backup / reset UI) — deterministic S7 green | TASK-0028 |
 | Live installed removal / purge evidence, real PlasmaShell behavior, and real `makepkg` package acceptance | TASK-0020 |
 | Installed WebView, packaged accessibility, and live platform acceptance | TASK-0020 |
 | Live restored-session (app-restart restore-token reuse) and full GUI voice → gateway → portal-dispatch integration (deterministic S6 green; portal grant + input + release and offline listener live-verified 2026-08-30) | TASK-0028 / TASK-0030 |
