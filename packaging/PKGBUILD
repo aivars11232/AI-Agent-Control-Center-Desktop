@@ -13,7 +13,13 @@ pkgdesc="Local desktop control center for governing, routing, and auditing bound
 arch=('x86_64')
 url="https://github.com/aivars11232/AI-Agent-Control-Center-Desktop"
 license=('LicenseRef-proprietary')
-depends=('webkit2gtk-4.1' 'gtk3' 'libappindicator-gtk3' 'librsvg' 'sqlite')
+# `libappindicator-gtk3` is dlopen'd by the Tauri tray at runtime
+# (`libayatana-appindicator3.so.1` / `libappindicator3.so.1` appear in the
+# binary), so namcap's ELF scan cannot see it and reports it as possibly
+# unneeded; it is required and stays declared. `librsvg` is deliberately NOT
+# declared: it is not linked, not dlopen'd, and the package ships only PNG
+# icons, and the declared `gtk3` dependency already guarantees it.
+depends=('webkit2gtk-4.1' 'gtk3' 'libappindicator-gtk3' 'sqlite')
 makedepends=('rust' 'cargo' 'npm' 'nodejs' 'pkgconf')
 optdepends=('python: offline voice runtime (Vosk / optional whisper.cpp)'
             'bubblewrap: Codex runtime sandbox containment')

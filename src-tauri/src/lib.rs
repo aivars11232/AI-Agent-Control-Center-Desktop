@@ -6,6 +6,8 @@ mod data_lifecycle;
 #[cfg(test)]
 mod data_lifecycle_acceptance;
 mod desktop_control;
+#[cfg(test)]
+mod install_package_acceptance;
 mod lifecycle_removal;
 mod linux_desktop;
 mod linux_paths;

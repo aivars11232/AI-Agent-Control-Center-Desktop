@@ -2,9 +2,17 @@
 
 # TASK-0019 staged install / upgrade / removal / purge test.
 #
-# Runs entirely inside a throwaway $HOME and $XDG_RUNTIME_DIR. It never touches
-# the real desktop, never restarts plasmashell, and never runs a provider,
-# microphone, portal, or system-control action.
+# Runs inside a throwaway $HOME and $XDG_RUNTIME_DIR. It never touches the real
+# desktop, never restarts plasmashell, and never runs a provider, microphone,
+# portal, or system-control action.
+#
+# One documented exception to the throwaway isolation: the removal subcommands
+# clear the stored provider key from the OS keyring, and the keyring is reached
+# over the session D-Bus rather than through $HOME, so that clear applies to the
+# real login keyring. The current runtime authenticates Codex through the
+# ChatGPT login and stores no provider key, and install-kde.sh clears the legacy
+# entry on every install, so the effect is a no-op in practice. CI isolates it
+# completely by running under `dbus-run-session` with a scratch keyring.
 #
 # It exercises:
 #   * the binary removal subcommands (--print-data-paths, --stop-runtime,
@@ -21,6 +29,16 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 app_id="ai-agent-control-center"
+
+# The version the binary must report. Derived from the crate manifest so a
+# version bump cannot leave this test asserting a stale string; the packaging
+# gate separately asserts that every other manifest agrees with this one.
+expected_version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' src-tauri/Cargo.toml | head -1)"
+if [[ -z "$expected_version" ]]; then
+  echo "could not read the crate version from src-tauri/Cargo.toml" >&2
+  exit 1
+fi
+
 fail=0
 note() { printf '  - %s\n' "$*"; }
 check() {
@@ -79,8 +97,8 @@ echo
 echo "== binary subcommands =="
 
 h="$work/bin-help"; mkdir -p "$h"
-check "--version prints the pinned version" \
-  "run_bin '$h' --version | grep -qx '$app_id 0.5.1'"
+check "--version prints the crate version ($expected_version)" \
+  "run_bin '$h' --version | grep -qx '$app_id $expected_version'"
 check "--help lists the removal subcommands" \
   "run_bin '$h' --help | grep -q -- '--purge --confirm PURGE'"
 

@@ -38,6 +38,10 @@ done
 warn() { printf 'warning: %s\n' "$*" >&2; }
 
 # --- data removal (delegated to the binary) ---------------------------
+# Whether the binary-delegated removal actually ran. The closing message must
+# never claim a data removal that could not be performed: on a second run the
+# payload is already gone, so nothing owns the data inventory any more.
+data_removal_ran=0
 if [[ -x "$installed_bin" ]]; then
   if (( purge )); then
     if (( ! assume_yes )); then
@@ -53,6 +57,7 @@ if [[ -x "$installed_bin" ]]; then
   else
     "$installed_bin" --uninstall
   fi
+  data_removal_ran=1
 else
   warn "installed binary not found at $installed_bin"
   warn "the tray process, voice listener, and per-user data could not be cleaned"
@@ -76,7 +81,12 @@ elif command -v kbuildsycoca5 >/dev/null 2>&1; then
   kbuildsycoca5 --noincremental >/dev/null 2>&1 || true
 fi
 
-if (( purge )); then
+if (( ! data_removal_ran )); then
+  echo "AI Agent Control Center application files have been removed."
+  echo "Per-user data was NOT touched: the installed binary that owns the data"
+  echo "inventory is missing, so no data location could be resolved or deleted."
+  echo "If data may remain, reinstall and re-run this script."
+elif (( purge )); then
   echo "AI Agent Control Center and all local data have been removed."
 else
   echo "AI Agent Control Center has been removed. User data was preserved;"

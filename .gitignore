@@ -14,3 +14,8 @@ temp.wav
 # Python cache
 __pycache__/
 *.pyc
+
+# Arch package build output (`cd packaging && makepkg -f`)
+packaging/pkg/
+packaging/src/
+packaging/*.pkg.tar.*

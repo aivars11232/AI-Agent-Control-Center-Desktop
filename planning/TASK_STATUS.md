@@ -57,8 +57,8 @@ roadmap.
 | TASK-0023 | TASK-0022 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Agent hierarchy, routing, queue, approvals, and policy live stabilization |
 | TASK-0024 | TASK-0023 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Codex / Ollama cancellation, workspace evidence, and review stabilization |
 | TASK-0025 | TASK-0024 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Voice, KDE portal, PC control, and notification stabilization |
-| TASK-0026 | TASK-0025 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Reminders, memory, backup/restore, and data-lifecycle stabilization |
-| TASK-0027 | TASK-0026 | NOT STARTED | NO | NOT STARTED | — | — | Install, upgrade, remove, purge, and Arch package stabilization |
+| TASK-0026 | TASK-0025 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Reminders, memory, backup/restore, and data-lifecycle stabilization |
+| TASK-0027 | TASK-0026 | COMPLETE | YES | COMPLETE | PASSED (one gate item NOT EXECUTED) | PENDING USER | Install, upgrade, remove, purge, and Arch package stabilization |
 | TASK-0028 | TASK-0027 | NOT STARTED | NO | NOT STARTED | — | — | Integrated desktop UI/UX and recovery acceptance |
 | TASK-0029 | TASK-0028 | NOT STARTED | NO | NOT STARTED | — | — | Full regression, security, CI, and release-candidate hardening |
 | TASK-0030 | TASK-0029 | NOT STARTED | NO | NOT STARTED | — | — | Final version 1.0 acceptance, release evidence, and handoff |
@@ -2286,6 +2286,197 @@ roadmap.
   new test module is the one-line
   <code>#[cfg(test)] mod data_lifecycle_acceptance;</code> registration in
   <code>src/lib.rs</code>
+- Git closure: <code>COMPLETE</code>. User implementation commit
+  <code>b66dadc2fd73c4cc58f319c789caf4291fc010a3</code> (<code>task26</code>) was
+  identified from Git history at the TASK-0027 preflight. It is the checked-out
+  <code>main</code> HEAD and is <code>origin/main</code>; <code>main</code> vs
+  <code>origin/main</code> is zero ahead / zero behind with a clean tree. Its
+  scope (four files: <code>src-tauri/src/data_lifecycle_acceptance.rs</code> new,
+  1237 lines; <code>src-tauri/src/lib.rs</code> two-line
+  <code>#[cfg(test)]</code> registration; <code>CURRENT_STATE.md</code>;
+  <code>planning/TASK_STATUS.md</code>) matches the TASK-0026 report with no
+  unexplained intervening state, so all seven successor-preflight closure
+  conditions passed. Verified and backfilled during the approved TASK-0027
+  Phase B on 2026-08-30
+
+## TASK-0027 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>; starting HEAD
+  <code>b66dadc2fd73c4cc58f319c789caf4291fc010a3</code> (<code>task26</code>);
+  clean tree; <code>main</code> vs <code>origin/main</code> zero ahead / zero
+  behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0026 (see
+  its evidence above); its Git closure is backfilled to <code>COMPLETE</code> in
+  this task. The v3.0 continuation package tracker still listed TASK-0026 as
+  <code>NOT STARTED</code>; actual Git history and the repository tracker are the
+  current truth and both record it complete
+- Phase A outcome: <code>PHASE_A_READY</code>; approval: the v3.0 continuation
+  <code>RUN_PROMPT.txt</code> for TASK-0027 is the task-level approval to inspect,
+  plan, implement, and verify within its scope (no separate approval phrase). The
+  destructive real-data install / remove / purge batch and the sudo interaction
+  were batched into a single up-front authorization request, as the task
+  requires; the user authorized the full destructive batch
+- Pre-destructive backup (S0 equivalent for this task):
+  <code>/mnt/F/aacc-task-0027-backup-20260830T183314Z</code> — a
+  <code>tar.zst</code> of all ten present owned / payload / desktop-integration
+  paths (112,698,731 bytes, 2613 members, SHA-256
+  <code>a6fe1dab…4dc150</code>), a consistent <code>sqlite3 .backup</code> copy of
+  the live database, the pre-run <code>--print-data-paths</code> inventory, and
+  the pre-run agent list. The retained TASK-0020 S0 backup
+  (<code>/mnt/F/aacc-prototype-backup-20260829T152608Z</code>) was verified to
+  exist but is <strong>pre-migration and incomplete</strong> — its manifest omits
+  <code>.config/ai-agent-control-center</code> (the KDE portal restore token),
+  <code>.cache/ai-agent-control-center</code>, and the runtime directory — so it
+  could not have restored the current migrated state and was not relied on. The
+  new backup was <strong>restore-rehearsed into a scratch tree before any
+  destructive step</strong>: byte-identical database (SHA-256
+  <code>c38c0410…a39608</code>), 13 identical agents, a runnable binary, and the
+  portal restore token present
+- Slice 1 — packaging hygiene defects found and fixed (three):
+  <code>makepkg</code> output (<code>packaging/pkg/</code>,
+  <code>packaging/src/</code>, <code>packaging/*.pkg.tar.*</code>) was not
+  ignored, so a real package build dirtied the worktree the release gate requires
+  clean; <code>scripts/staged-install-test.sh</code> asserted a hard-coded
+  <code>0.5.1</code>, which a version bump would silently invalidate (now derived
+  from <code>src-tauri/Cargo.toml</code>); and no gate asserted release-version
+  parity across the five manifests that carry one. Check:
+  <code>VERIFY_STRICT=1 bash scripts/check-packaging.sh</code> — passed
+- Slice 2 — composed install / upgrade / remove / purge / package acceptance
+  (test only): <code>src-tauri/src/install_package_acceptance.rs</code>
+  (<code>#[cfg(test)] mod install_package_acceptance;</code> in
+  <code>src/lib.rs</code>). Twelve deterministic S8 scenarios over the real
+  <code>lifecycle_removal</code> API under a scratch <code>$HOME</code>: the whole
+  machine lifecycle as one continuous sequence (install, idempotent upgrade that
+  leaves the owned inventory identical, keep-data removal, reinstall reusing the
+  retained database byte for byte, purge, and an idempotent second purge that
+  reports every location already absent); the keep-data retained set matching
+  every documented promise in the pacman hook and <code>uninstall-kde.sh</code>;
+  the unconfirmed-purge dry run changing nothing; artifact parity between
+  <code>install-kde.sh</code> and <code>packaging/PKGBUILD</code>; the desktop
+  entry differing only in its <code>Exec</code> target between the two install
+  paths; release-version parity across every shipped manifest; removal delegating
+  every owned-data path to the binary; no install or removal path restarting
+  PlasmaShell and the pacman hook not duplicating pacman's own cache hooks; the
+  hook naming only flags the CLI actually accepts; hostile <code>XDG_*</code>
+  values failing closed; the verified upgrade rollback path; and the portal grant
+  being reported as a platform limit rather than claimed removed. Check:
+  <code>cargo test --locked --offline --lib install_package_acceptance</code> —
+  12 passed
+- Slice 3 — live Arch package build and validation:
+  <code>cd packaging &amp;&amp; makepkg -f --noconfirm</code> built
+  <code>ai-agent-control-center-0.5.1-1-x86_64.pkg.tar.zst</code> (7,393,636
+  bytes, installed size 20,250,634) and its <code>check()</code>
+  (<code>--version</code>) passed. <code>namcap</code> reported 17 findings, of
+  which two were real and are fixed here: the <code>.INSTALL</code> hook
+  re-ran the desktop-database and icon-cache refreshers that pacman's own
+  PostTransaction hooks already run for exactly the paths this package installs
+  (<code>usr/share/applications/*.desktop</code>, <code>usr/share/icons/*/</code>,
+  on install, upgrade, and remove), and <code>librsvg</code> was declared as a
+  runtime dependency although it is not linked, not dlopen'd, ships no SVG asset,
+  and is already guaranteed by the declared <code>gtk3</code> dependency. After
+  both fixes namcap reports 14 findings and zero errors, all explicitly justified
+  and pinned in <code>scripts/check-packaging.sh</code>: the per-user Vosk
+  virtual-environment modules (×2, why <code>python</code> is an
+  <code>optdepend</code>), the ELF interpreter reported as an unused shared
+  library, nine transitive dependencies Arch guidelines say not to re-declare
+  (pinned by name, so a new one fails the gate), and
+  <code>libappindicator-gtk3</code> reported as possibly unneeded — the Tauri tray
+  dlopen's <code>libayatana-appindicator3.so.1</code> /
+  <code>libappindicator3.so.1</code>, confirmed by the strings in the built
+  binary, so namcap's ELF scan cannot see it and it stays declared. The PKGBUILD's
+  one <code>$startdir</code> error is justified: this is a local, private, non-AUR
+  PKGBUILD that deliberately builds the checked-out repository shipping it. Both
+  namcap gates were negative-tested — an injected <code>E:</code>, an unjustified
+  unneeded dependency, and an unpinned implicitly-satisfied dependency were each
+  rejected. Package contents verified (22 entries; <code>/usr/bin</code> symlink
+  onto the payload; desktop entry, 512×512 icon, metainfo, LICENSE and
+  third-party notices under <code>/usr/share</code>) and the packaged binary
+  smoke-tested from an extracted staging tree under a throwaway
+  <code>$HOME</code>: <code>--version</code>, <code>--help</code>,
+  <code>--print-data-paths</code> on a clean home, <code>--stop-runtime</code>,
+  and an unconfirmed <code>--purge</code> refusing with exit 2
+- Slice 4 — live user-local install / upgrade on the real Arch / KDE Plasma 6 /
+  Wayland session (2026-08-30): <code>./install-kde.sh</code> upgraded the
+  existing install (binary SHA-256 <code>811b5715…7f4413</code> →
+  <code>10265ea1…98c9ad</code>) and reported <em>upgraded; existing data was
+  preserved</em>. Database SHA-256 unchanged at
+  <code>c38c0410…a39608</code> with 13 agents; the rollback copy was cleaned up on
+  success; launcher symlink, desktop entry, icon, metainfo, LICENSE, and
+  third-party notices all reinstalled. A second immediate run was idempotent:
+  identical binary SHA-256 and identical desktop-entry SHA-256, database
+  untouched. <strong>PlasmaShell PID 822 with an unchanged start time, and KWin
+  PID 673, across every install, upgrade, removal, and purge in this task</strong>
+- Slice 5 — live keep-data removal, reinstall, purge, and restore (authorized
+  destructive batch, 2026-08-30): <code>./uninstall-kde.sh</code> retained exactly
+  <code>LocalDataAndWebview</code> and <code>VoiceData</code> and removed the
+  other six owned locations, the payload, launcher, desktop entry, icon,
+  metainfo, and licenses; the retained database stayed byte-identical with 13
+  agents and 123 MB of voice models. <code>./install-kde.sh</code> then reinstalled
+  over the retained data (reported as a fresh install, since the payload was
+  gone) and reused the database byte for byte. An interactive purge answered with
+  the wrong word aborted with exit 1 and removed nothing (database SHA-256
+  unchanged). The confirmed purge removed every owned location, and a residue
+  scan under <code>$HOME</code> found nothing owned left. Restoring the verified
+  backup and reinstalling returned the machine to a working state: identical
+  database SHA-256, an identical 13-agent list, 116.5 MiB of voice models, the
+  49.3 MiB voice cache, and the KDE portal restore token; only the ephemeral
+  runtime directory is absent, and it is recreated on next launch
+- Slice 5 — in-scope defect found live and fixed: a second
+  <code>uninstall-kde.sh --purge</code> (the payload is already gone, so nothing
+  owns the data inventory) warned that the tray process, voice listener, and
+  per-user data <em>could not be cleaned automatically</em> and then printed
+  <em>AI Agent Control Center and all local data have been removed</em> —
+  contradicting the warning it had just issued and claiming a removal it had not
+  performed. The closing message is now gated on whether the binary-delegated
+  removal actually ran, and a run that could not delegate says so explicitly.
+  Regression coverage asserts the claim sits behind that guard
+  (<code>s8_removal_scripts_delegate_owned_data_removal_to_the_binary</code>)
+- Slice 6 — <code>pacman -U</code> / packaged-binary smoke / <code>pacman -R</code>
+  on the real system: <strong>NOT EXECUTED</strong>. Both require root, and
+  <code>sudo</code> on this machine requires a password that cannot be supplied
+  through a non-interactive tool session; <code>pacman -U</code> into an alternate
+  <code>--root</code> / <code>--dbpath</code> was also tried and refuses without
+  root. The package itself is built, namcap-clean against the justified set,
+  content-verified, and its binary smoke-tested from an extracted tree, so the
+  only unproven part is real pacman transaction integration and the
+  <code>post_install</code> hook output. This is the one open item in the
+  TASK-0027 completion gate
+- Slice 7 — documentation: this evidence section, the TASK-0026 Git-closure
+  backfill above, the continuation-tracker rows, and the
+  <code>CURRENT_STATE.md</code> verification-inventory refresh plus the S8
+  install / package stabilization paragraph and known-gaps rows
+- Full non-live gate on 2026-08-30: <code>npm run verify:full</code> passed (exit
+  0) — <code>verify:fast</code> with 25 frontend files / 83 tests, 7 Python
+  voice-runtime tests, rustfmt, and 290 locked/offline Rust tests (8 ignored);
+  the 71-module build; <code>cargo clippy --locked --offline --all-targets --
+  -D warnings</code>; the shell (<code>shellcheck</code> clean), Python, and
+  strict-JSON checks; dependency trees; both npm audits with 0 vulnerabilities;
+  the third-party license gate; packaging validation (now including the namcap
+  and version-parity gates, with the built package present); and the staged
+  install / upgrade / remove / keep-data / purge test. Rust advisory status
+  <strong>indeterminate</strong> locally (<code>cargo-audit</code> /
+  <code>cargo-deny</code> not installed; CI enforces them under
+  <code>VERIFY_STRICT=1</code>)
+- Rust test delta: 278 → 290 (+12 <code>install_package_acceptance</code>
+  deterministic scenarios; no new <code>#[ignore]</code>d test). Frontend test
+  count unchanged at 83 / 25 files; Python unchanged at 7
+- Live/external actions on 2026-08-30: one real Arch package build, three real
+  user-local installs / upgrades, one real keep-data removal, one real
+  irreversible purge of the live user data, and one real restore — all on the
+  operator's own machine under the batch authorization, with a verified,
+  restore-rehearsed backup taken first and the machine returned to a working
+  installed state afterwards. No live AI provider, no microphone, no portal grant
+  dialog, no <code>pacman</code> transaction, no PlasmaShell restart. The KDE
+  portal grant itself was untouched and its restore token was restored
+- No new runtime dependency, no Cargo/npm manifest or lock change, no schema /
+  <code>PRAGMA user_version</code> change, no new migration file, no
+  security-authority or IPC-contract change. One declared <em>package</em>
+  dependency was removed (<code>librsvg</code>, already guaranteed by
+  <code>gtk3</code>). The only source change outside the new test module is the
+  two-line <code>#[cfg(test)] mod install_package_acceptance;</code> registration
+  in <code>src/lib.rs</code>
 - Git closure: <code>PENDING USER</code>
 
 ## Successor-preflight closure rule

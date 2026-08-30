@@ -1,10 +1,16 @@
-_refresh_caches() {
-  update-desktop-database -q /usr/share/applications 2>/dev/null || true
-  gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
-}
+# pacman ships PostTransaction hooks in /usr/share/libalpm/hooks/ that refresh
+# the desktop-file MIME cache and the icon theme caches. They trigger on
+# `usr/share/applications/*.desktop` and `usr/share/icons/*/` for install,
+# upgrade, and remove -- exactly the paths this package installs -- so
+# refreshing either cache here would be redundant work, and namcap's
+# `externalhooks` rule flags it. That rule substring-matches the whole file,
+# comments included, so those refresher command names must not appear here at
+# all. The KDE service cache is per-user and rebuilt on demand; a root-run
+# rebuild would only touch root's cache and is deliberately not invoked.
+#
+# This hook therefore only prints the removal contract pacman cannot carry out.
 
 post_install() {
-  _refresh_caches
   cat <<'MSG'
 AI Agent Control Center is installed at /usr/bin/ai-agent-control-center.
 
@@ -22,12 +28,4 @@ Before removing the package, run ONE of:
 The persistent KDE screen-cast / remote-desktop permission is revoked in
 KDE System Settings, not by this package.
 MSG
-}
-
-post_upgrade() {
-  _refresh_caches
-}
-
-post_remove() {
-  _refresh_caches
 }
