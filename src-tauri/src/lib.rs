@@ -23,6 +23,8 @@ mod specialist_capabilities;
 mod structured_memory;
 mod system_actions;
 mod task_orchestration;
+#[cfg(test)]
+mod voice_kde_acceptance;
 mod voice_runtime;
 mod workspace_evidence;
 mod workspace_tools;

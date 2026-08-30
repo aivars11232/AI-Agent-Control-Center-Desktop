@@ -766,9 +766,15 @@ agent, observes native <code>Closed</code>, exposes explicit disable, closes
 partial grants, and is invalidated after relevant state/import/agent changes.
 Pressed keys/buttons are released after an error or the session is closed when
 release cannot be confirmed. These behaviors have deterministic non-live
-coverage. Model download/install, microphone behavior, portal authorization,
-compositor actions, restored-session behavior, and packaged KDE/Wayland/XDG
-compatibility were not exercised; TASK-0020 owns those live acceptance gates.
+coverage, and TASK-0025 adds the composed <code>voice_kde_acceptance</code>
+matrix that drives voice-intent normalization, the forced-one-use policy, the
+restart-safe redacted audit lifecycle, the listener state machine, the portal
+lifecycle guards, pressed-input release, the restore-token contract, and the
+passive reminder → notification path together over a real repository. Model
+download/install, microphone behavior, portal authorization, compositor actions,
+restored-session behavior, and packaged KDE/Wayland/XDG compatibility were not
+exercised; TASK-0025 owns the human-observed live S6 batch and TASK-0030 owns
+the final packaged-platform acceptance.
 
 ## Packaging and privacy-safe removal
 
@@ -1104,6 +1110,48 @@ bounded Ollama coding run terminates with a typed
 strict result; and an in-flight Ollama run cancels within milliseconds. The
 migrated prototype database and the S0 backup were not touched.
 
+TASK-0025 stabilized the voice / KDE portal / PC-control / notification slice
+(S6) at the deterministic level. Fifteen new <code>voice_kde_acceptance</code>
+Rust scenarios compose the voice and system-action path end to end over a real
+repository plus the gateway's own helpers: canonical voice-intent normalization,
+validation, the redacted fingerprint, and unresolved-target classification; the
+authoritative capability / approval / forced-one-use policy (a destructive close
+still requires a one-use approval under the most permissive
+<code>full</code> / <code>allow</code> policy, a reversible launch under
+<code>allow</code> needs none, a <code>none</code>-capability agent is denied and
+audited as <code>rejected</code>); the redacted restart-safe audit lifecycle
+(<code>approvalRequired → dispatched → applied</code>, with terminal replay,
+changed-target, and rebound-request-id all failing closed across a real database
+reopen); the offline listener state machine and bounded transcript framing;
+voice-runtime install/listener overlap refusal and cancellation; the KDE
+RemoteDesktop lifecycle guards, explicit-disable precedence, and the exact
+active Full PC Control agent binding dropped on a capability downgrade;
+pressed-input reverse-order release; the private restore-token contract; and the
+passive reminder → XDG notification path (bounded notification jobs derived from
+the schedule, zero run attempts across scan and delivery, and a static check
+that the scheduler cycle delivers only through
+<code>send_portal_reminder</code> / <code>NotificationProxy</code>). The composed
+matrix found no backend defect and required no renderer or Python change and no
+behaviour-preserving seam; the only non-test source change is the one-line
+<code>#[cfg(test)]</code> module registration. Two <code>#[ignore]</code>d
+<code>voice_kde_acceptance::live</code> tests drive the real <code>ashpd</code>
+portal paths on the KDE Plasma 6 / Wayland session: the dialog-free one ran once
+on 2026-08-30 — the XDG notification portal delivered and withdrew a real
+reminder notification, and the KDE RemoteDesktop portal created a session and
+negotiated the exact keyboard + pointer devices up to the <code>Start()</code>
+consent boundary. The remaining human-observed S6 items — the RemoteDesktop
+consent grant, real compositor pointer/keyboard injection and release,
+restore-token reuse across a restart through the real app, and a spoken command
+through the offline Vosk listener — were <strong>not executed</strong> and
+remain owned by TASK-0025 pending an operator session; nothing about real
+consent, compositor input, or microphone transcription behavior is claimed here.
+<code>npm run verify:fast</code> passed with 25 frontend files /
+83 tests, 7 Python tests, rustfmt, and 266 locked/offline Rust tests;
+<code>npm run verify:full</code> repeated those, built 71 modules, passed Clippy
+with warnings denied, the shell/Python/strict-JSON checks, both npm audits with
+zero vulnerabilities, the license gate, packaging validation, and the staged
+install/removal test.
+
 <code>cargo-audit</code>, <code>cargo-deny</code>, and <code>shellcheck</code>
 are not installed on the development machine, so <code>verify:full</code>
 reports the Rust advisory result as **indeterminate** and does not represent
@@ -1122,7 +1170,7 @@ gates mandatory for the branch.
 | Live installed reminder timer/tray, XDG notification portal, restart, and DST acceptance | TASK-0020 |
 | Live installed removal / purge evidence, real PlasmaShell behavior, and real `makepkg` package acceptance | TASK-0020 |
 | Installed WebView, packaged accessibility, and live platform acceptance | TASK-0020 |
-| Live installed voice, microphone, restored-session, and KDE/portal/XDG acceptance | TASK-0020 |
+| Live installed voice, microphone, restored-session, and KDE/portal/XDG acceptance (deterministic S6 composed and green; human-observed live batch pending) | TASK-0025 |
 | Full sequential live acceptance and production gate | TASK-0020 |
 
 See [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for exact sequencing.

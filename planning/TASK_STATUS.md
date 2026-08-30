@@ -55,8 +55,8 @@ roadmap.
 | TASK-0021 | TASK-0020 S3 blocker | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Legacy state migration repair and duplicate identity recovery |
 | TASK-0022 | TASK-0021 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Startup persistence recovery and S3 migration completion |
 | TASK-0023 | TASK-0022 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Agent hierarchy, routing, queue, approvals, and policy live stabilization |
-| TASK-0024 | TASK-0023 | COMPLETE | YES | COMPLETE | PASSED | PENDING USER | Codex / Ollama cancellation, workspace evidence, and review stabilization |
-| TASK-0025 | TASK-0024 | NOT STARTED | NO | NOT STARTED | — | — | Voice, KDE portal, PC control, and notification stabilization |
+| TASK-0024 | TASK-0023 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Codex / Ollama cancellation, workspace evidence, and review stabilization |
+| TASK-0025 | TASK-0024 | COMPLETE | YES | COMPLETE | PASSED (deterministic); live S6 PENDING OPERATOR | PENDING USER | Voice, KDE portal, PC control, and notification stabilization |
 | TASK-0026 | TASK-0025 | NOT STARTED | NO | NOT STARTED | — | — | Reminders, memory, backup/restore, and data-lifecycle stabilization |
 | TASK-0027 | TASK-0026 | NOT STARTED | NO | NOT STARTED | — | — | Install, upgrade, remove, purge, and Arch package stabilization |
 | TASK-0028 | TASK-0027 | NOT STARTED | NO | NOT STARTED | — | — | Integrated desktop UI/UX and recovery acceptance |
@@ -1982,6 +1982,149 @@ roadmap.
 - No new runtime dependency, no Cargo/npm manifest or lock change, no schema /
   <code>PRAGMA user_version</code> change, no new migration file, no
   security-authority or IPC-contract change
+- Git closure: <code>COMPLETE</code>. User implementation commit
+  <code>762278a78fcb8ec3a0baaa8f265050d91fabbf23</code> (<code>task24</code>) was
+  identified from Git history; it is the checked-out <code>main</code> HEAD, is
+  reachable from <code>origin/main</code> (it is <code>origin/main</code>), and
+  <code>main</code> vs <code>origin/main</code> is zero ahead / zero behind with
+  a clean tree. Its <code>1200fba..762278a</code> scope (seven files:
+  <code>provider_review_acceptance.rs</code> new;
+  <code>lib.rs</code> test-module wiring;
+  <code>codex_runtime.rs</code> one-line <code>#[cfg(test)]</code> visibility
+  widening; <code>orchestration_acceptance.rs</code> one-line;
+  <code>tests/fixtures/fake_codex.sh</code> <code>success_coding</code> scenario;
+  <code>CURRENT_STATE.md</code>; <code>planning/TASK_STATUS.md</code>) matches the
+  TASK-0024 report with no unexplained intervening state, so all seven
+  successor-preflight closure conditions passed. Verified and backfilled during
+  the approved TASK-0025 Phase B on 2026-08-30.
+
+## TASK-0025 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>; starting HEAD
+  <code>762278a78fcb8ec3a0baaa8f265050d91fabbf23</code> (<code>task24</code>);
+  clean tree; <code>main</code> vs <code>origin/main</code> zero ahead / zero
+  behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0024 (see
+  its evidence above); its Git closure is backfilled to <code>COMPLETE</code> in
+  this task
+- Phase A outcome: <code>PHASE_A_READY</code>; approval received:
+  <code>APPROVED: IMPLEMENT TASK-0025 AS PLANNED.</code> (decisions D1–D5 accepted
+  as recommended: an isolated <code>XDG_DATA_HOME</code>/<code>XDG_CONFIG_HOME</code>
+  for the live S6 session with the real prototype database, real voice runtime,
+  portal restore token, and S0 backup untouched; the deterministic S6 harness as
+  a new <code>#[cfg(test)]</code> module with the live batch driven through the
+  real app; portal restore-token reuse across a restart observed once; whisper
+  high-accuracy exercised only if already installed; and a stop-and-report rule
+  for any materially new seam or boundary)
+- Slice 1 — composed voice / KDE / notification acceptance harness (test only):
+  <code>src-tauri/src/voice_kde_acceptance.rs</code>
+  (<code>#[cfg(test)] mod voice_kde_acceptance;</code> in <code>src/lib.rs</code>).
+  Fifteen deterministic S6 scenarios wire the voice and system-action path end to
+  end over a real <code>StateRepository</code> plus the module-level helpers the
+  gateway uses: canonical voice-intent normalization / validation / redacted
+  fingerprint + unresolved-target classification; the authoritative
+  capability / approval / forced-one-use policy (a destructive close still
+  requires a one-use approval with <code>system</code> capability
+  <code>full</code> and approval mode <code>allow</code>; a reversible launch under
+  <code>allow</code> needs none; a <code>none</code>-capability agent is
+  <code>CAPABILITY_DENIED</code> and audited as <code>rejected</code>); the
+  redacted restart-safe audit lifecycle
+  (<code>approvalRequired → dispatched → applied</code>, terminal replay refused
+  with <code>SYSTEM_ACTION_TERMINAL</code> after a real database reopen, a changed
+  exact target refused with <code>SYSTEM_ACTION_TARGET_CHANGED</code>, a rebound
+  request id refused with <code>SYSTEM_ACTION_IDEMPOTENCY_CONFLICT</code>); the
+  offline listener state machine
+  (<code>ready/activated/listening/transcribing/heard/command/deactivated/off_requested/warning/error</code>
+  → bounded projected states, transcript frames rejected on unknown kind,
+  unexpected field, oversize, or control bytes); voice-runtime install/listener
+  overlap refusal (<code>VOICE_INSTALL_BUSY</code> / <code>VOICE_LISTENER_BUSY</code>)
+  and cancellation state; the KDE RemoteDesktop lifecycle guards
+  (<code>DESKTOP_CONTROL_BUSY</code>, explicit-disable-wins, the exact active Full
+  PC Control agent binding dropped on a capability downgrade); pressed-input
+  reverse-order release without duplicates; the private restore-token contract
+  rejecting empty / control-character / over-length tokens before touching disk;
+  and the passive reminder → XDG notification path (a due daily reminder yields
+  bounded notification jobs derived from the schedule under its privacy mode,
+  zero run attempts before and after scan + accepted/failed delivery + occurrence
+  evidence, and a static check that the production
+  <code>run_reminder_scheduler_cycle</code> delivers only through
+  <code>send_portal_reminder</code> / <code>NotificationProxy</code> with no
+  provider, registry, or model reference). Check:
+  <code>cargo test --locked --offline --lib voice_kde_acceptance</code> — 15
+  passed, plus two <code>#[ignore]</code>d <code>::live</code> tests (Slice 5)
+- Slice 2 — backend in-scope defects: none. The composed matrix confirmed every
+  fail-closed sequence, the forced-one-use rule, the audit transition table, the
+  idempotency binding, the listener projection, the desktop-control lifecycle
+  guards, the exact-agent reconciliation, and the no-background-model reminder
+  path already hold in <code>system_actions</code> / <code>policy</code> /
+  <code>authorization</code> / <code>persistence</code> /
+  <code>voice_runtime</code> / <code>desktop_control</code> /
+  <code>reminder_scheduler</code> and the <code>lib.rs</code> gateway helpers. No
+  capability filter, forced-approval rule, one-use consumption, input-release
+  order, restore-token guard, or audit-transition guard was weakened. No
+  behaviour-preserving seam was required
+- Slice 3 — Python listener defects: none observed; the seven
+  <code>tests/voice_runtime/</code> tests remain green
+- Slice 4 — frontend voice/portal projection defects: none observed in the
+  deterministic suite (25 files / 83 tests unchanged). The live-pass surface
+  review is part of the pending operator batch
+- Slice 5a — live portal checks that need no operator input, run on the real
+  Arch / KDE Plasma 6 / Wayland session on 2026-08-30 through the
+  <code>ashpd</code> paths the production code uses
+  (<code>voice_kde_acceptance::live::live_s6_portals_deliver_and_negotiate</code>,
+  <code>-- --ignored</code>): the XDG <strong>notification portal</strong>
+  accepted a real reminder notification via
+  <code>NotificationProxy::add_notification</code> and withdrew it via
+  <code>remove_notification</code> (the exact reminder-delivery sink — PASS,
+  ~2 s); the KDE <strong>RemoteDesktop portal</strong> was reachable and
+  <code>RemoteDesktop::create_session</code> + <code>select_devices</code>
+  (Keyboard | Pointer, <code>ExplicitlyRevoked</code>) + <code>Session::close</code>
+  all completed without a dialog (PASS). A pre-existing
+  <code>desktop-control-restore-token</code> from an earlier real grant is
+  present on the machine
+- Slice 5b — residual human-observed S6 items: <strong>NOT EXECUTED — PENDING
+  OPERATOR</strong>. The KDE RemoteDesktop <code>Start()</code> consent dialog
+  plus real compositor pointer/keyboard injection and release
+  (<code>voice_kde_acceptance::live::live_s6_remote_desktop_grant_and_input</code>,
+  gated on <code>AACC_LIVE_PORTAL_START=1</code>), the enable → input → disable →
+  restart-token-reuse lifecycle through the real Tauri app, and a spoken command
+  through the offline Vosk listener (the voice runtime is not installed on this
+  machine; the gateway itself is covered by the deterministic matrix and a typed
+  command) all require the operator present. Auto-approving the portal consent
+  dialog is deliberately not done — it would invalidate the "explicit permission
+  required" acceptance. The prepared batch is in the TASK-0025 final report
+- Slice 6 — documentation: this evidence section, the TASK-0024 Git-closure
+  backfill above, the continuation-tracker rows, and the <code>CURRENT_STATE.md</code>
+  voice/KDE verification-inventory refresh plus the S6 stabilization paragraph
+- Full non-live gate on 2026-08-30: <code>npm run verify:fast</code> passed (25
+  frontend files / 83 tests, 7 Python voice-runtime tests, rustfmt, 266
+  locked/offline Rust tests, 7 ignored); <code>npm run verify:full</code> passed
+  the 71-module build, <code>cargo clippy --locked --offline --all-targets -- -D
+  warnings</code>, shell (<code>shellcheck</code> clean), Python, strict-JSON,
+  dependency trees, both npm audits (0 vulnerabilities), the third-party license
+  gate, packaging validation, and the staged
+  install/upgrade/remove/keep-data/purge test. Rust advisory status
+  <strong>indeterminate</strong> locally (<code>cargo-audit</code> /
+  <code>cargo-deny</code> not installed; CI enforces them under
+  <code>VERIFY_STRICT=1</code>)
+- Rust test delta: 251 → 266 (+15 <code>voice_kde_acceptance</code> deterministic
+  scenarios; two further <code>#[ignore]</code>d
+  <code>voice_kde_acceptance::live</code> tests — one dialog-free portal check run
+  once as above, one operator-gated). Frontend test count unchanged at 83 / 25
+  files; Python unchanged at 7
+- Live/external actions on 2026-08-30: one dialog-free live portal check (Slice
+  5a) — a real XDG notification delivered and withdrawn, and a KDE RemoteDesktop
+  session created / device-negotiated / closed. No <code>Start()</code> consent,
+  no compositor input, no microphone capture, no live provider. The migrated
+  prototype database, the real voice runtime, the portal restore token, and the
+  S0 backup were not touched
+- No new runtime dependency, no Cargo/npm manifest or lock change, no schema /
+  <code>PRAGMA user_version</code> change, no new migration file, no
+  security-authority or IPC-contract change. The only source change outside the
+  new test module is the one-line <code>#[cfg(test)] mod voice_kde_acceptance;</code>
+  registration in <code>src/lib.rs</code>
 - Git closure: <code>PENDING USER</code>
 
 ## Successor-preflight closure rule
