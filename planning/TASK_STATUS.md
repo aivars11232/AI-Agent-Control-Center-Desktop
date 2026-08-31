@@ -58,7 +58,7 @@ roadmap.
 | TASK-0024 | TASK-0023 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Codex / Ollama cancellation, workspace evidence, and review stabilization |
 | TASK-0025 | TASK-0024 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Voice, KDE portal, PC control, and notification stabilization |
 | TASK-0026 | TASK-0025 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Reminders, memory, backup/restore, and data-lifecycle stabilization |
-| TASK-0027 | TASK-0026 | COMPLETE | YES | COMPLETE | PASSED (one gate item NOT EXECUTED) | PENDING USER | Install, upgrade, remove, purge, and Arch package stabilization |
+| TASK-0027 | TASK-0026 | COMPLETE | YES | COMPLETE | PASSED (`pacman -U`/`-R` exercised as namespaced root; live system-database transaction NOT EXECUTED) | COMPLETE | Install, upgrade, remove, purge, and Arch package stabilization |
 | TASK-0028 | TASK-0027 | NOT STARTED | NO | NOT STARTED | — | — | Integrated desktop UI/UX and recovery acceptance |
 | TASK-0029 | TASK-0028 | NOT STARTED | NO | NOT STARTED | — | — | Full regression, security, CI, and release-candidate hardening |
 | TASK-0030 | TASK-0029 | NOT STARTED | NO | NOT STARTED | — | — | Final version 1.0 acceptance, release evidence, and handoff |
@@ -2433,16 +2433,13 @@ roadmap.
   removal actually ran, and a run that could not delegate says so explicitly.
   Regression coverage asserts the claim sits behind that guard
   (<code>s8_removal_scripts_delegate_owned_data_removal_to_the_binary</code>)
-- Slice 6 — <code>pacman -U</code> / packaged-binary smoke / <code>pacman -R</code>
-  on the real system: <strong>NOT EXECUTED</strong>. Both require root, and
-  <code>sudo</code> on this machine requires a password that cannot be supplied
-  through a non-interactive tool session; <code>pacman -U</code> into an alternate
-  <code>--root</code> / <code>--dbpath</code> was also tried and refuses without
-  root. The package itself is built, namcap-clean against the justified set,
-  content-verified, and its binary smoke-tested from an extracted tree, so the
-  only unproven part is real pacman transaction integration and the
-  <code>post_install</code> hook output. This is the one open item in the
-  TASK-0027 completion gate
+- Slice 6 — <code>pacman -U</code> / packaged-binary smoke / <code>pacman -R</code>:
+  <strong>NOT EXECUTED as of commit <code>3be4711</code></strong>, then closed in
+  the continuation slice recorded below. At the time of <code>3be4711</code> both
+  required root, <code>sudo</code> on this machine requires a password that
+  cannot be supplied through a non-interactive tool session, and <code>pacman
+  -U</code> into an alternate <code>--root</code> / <code>--dbpath</code> was
+  tried and refuses without root
 - Slice 7 — documentation: this evidence section, the TASK-0026 Git-closure
   backfill above, the continuation-tracker rows, and the
   <code>CURRENT_STATE.md</code> verification-inventory refresh plus the S8
@@ -2477,7 +2474,92 @@ roadmap.
   <code>gtk3</code>). The only source change outside the new test module is the
   two-line <code>#[cfg(test)] mod install_package_acceptance;</code> registration
   in <code>src/lib.rs</code>
-- Git closure: <code>PENDING USER</code>
+- Git closure: <code>COMPLETE</code>. User commit
+  <code>3be4711a7a99d2ec15c92305cbfef501c574f0e8</code> (<code>task27</code>)
+  carries the Slice 1–7 scope above, identified from actual Git history rather
+  than from its message. It is the checked-out <code>HEAD</code>, reachable from
+  <code>origin/main</code>, with <code>main</code> and <code>origin/main</code> at
+  zero ahead / zero behind and a clean tree at the continuation preflight. Its ten
+  changed paths (<code>.gitignore</code>, <code>CURRENT_STATE.md</code>,
+  <code>packaging/PKGBUILD</code>,
+  <code>packaging/ai-agent-control-center.install</code>,
+  <code>planning/TASK_STATUS.md</code>, <code>scripts/check-packaging.sh</code>,
+  <code>scripts/staged-install-test.sh</code>,
+  <code>src-tauri/src/install_package_acceptance.rs</code>,
+  <code>src-tauri/src/lib.rs</code>, <code>uninstall-kde.sh</code>) match the
+  reported scope with no unexplained intervening state, so all seven
+  successor-preflight conditions pass
+
+### TASK-0027 continuation — Slice 6 closure (uncommitted at the time of writing)
+
+- Preflight: branch <code>main</code>, HEAD
+  <code>3be4711</code>, clean tree, zero ahead / zero behind
+  <code>origin/main</code>
+- Slice 8 — real <code>pacman</code> transaction acceptance without root. New
+  <code>scripts/pacman-transaction-test.sh</code> runs pacman as <em>namespaced</em>
+  root (<code>unshare --user --map-root-user --map-auto</code>) against a minimal
+  Arch root built offline from <code>/var/cache/pacman/pkg</code>. This is a
+  genuine libalpm transaction — conflict, integrity, file-conflict and disk-space
+  checks, extraction, local-database registration, and <strong>chroot execution of
+  the packaged <code>.INSTALL</code> scriptlet</strong> — so the
+  <code>post_install</code> output is observed rather than inferred from the hook
+  source. 36 checks, all passing, in ~1.6 s: <code>pacman -U</code> commits with
+  no error; every line of the shipped hook's heredoc is emitted verbatim; the
+  database registers <code>ai-agent-control-center 0.5.1-1</code> with exactly the
+  PKGBUILD's declared dependencies and the proprietary license; <code>pacman
+  -Ql</code> lists exactly the ten expected payload files and
+  <code>/usr/bin/…</code> is a symlink onto the payload; the pacman-installed
+  binary smoke-tests under a throwaway <code>$HOME</code>
+  (<code>--version</code>, <code>--help</code>, <code>--print-data-paths</code>,
+  <code>--stop-runtime</code>, unconfirmed <code>--purge</code> refusing with exit
+  2); <code>pacman -R</code> commits, deregisters the package, removes all ten
+  files, and leaves per-user data untouched exactly as the hook promises; and
+  PlasmaShell's PID is unchanged across the whole transaction. The host's pacman
+  database, the real <code>$HOME</code>, and the running session are never touched,
+  and the script never escalates privilege
+- Earlier approaches ruled out by evidence, recorded so they are not retried:
+  plain <code>pacman -U --root/--dbpath</code> needs real root;
+  <code>bwrap --unshare-user --uid 0 --gid 0</code> maps a single uid, so pacman's
+  chown of its download directory fails with <code>Invalid argument</code>;
+  <code>fakeroot pacman -U</code> installs but cannot <code>chroot</code>, so the
+  <code>.INSTALL</code> scriptlet never runs. The working route needs both a
+  subordinate uid/gid range (<code>/etc/subuid</code>, <code>/etc/subgid</code>)
+  and <code>coreutils</code> in the minimal root, because the hook is a
+  <code>cat</code> heredoc and bash has no <code>cat</code> builtin
+- The gate was negative-tested three times rather than assumed live: a hook line
+  the built package does not emit, a repacked package shipping one extra file
+  (with <code>.MTREE</code> regenerated the way <code>makepkg</code> does, since
+  pacman extracts from the MTREE and ignores a bare tar addition), and a PKGBUILD
+  <code>depends</code> drift each made it fail; the untampered package passes
+- Slice 9 — regression coverage: three further
+  <code>install_package_acceptance</code> scenarios
+  (<code>s8_pacman_transaction_test_asserts_the_payload_the_pkgbuild_installs</code>,
+  <code>…_is_wired_in_and_never_escalates_privilege</code>,
+  <code>…_expectations_match_the_shipped_install_hook</code>). The first derives
+  the shipped file set from the PKGBUILD's own <code>package()</code> body and
+  asserts the harness expects exactly it, so adding or removing a packaged file
+  fails the deterministic gate even where no built package exists; it was
+  negative-tested by adding a file to the PKGBUILD. The second pins the wiring,
+  the no-privilege-escalation rule, and the clean off-Arch skip. The third keeps
+  the harness's hook assertions and the shipped hook from drifting apart
+- Slice 10 — wiring: <code>scripts/verify-full.sh</code> runs, syntax-checks and
+  shellchecks the new script, and <code>scripts/check-packaging.sh</code> includes
+  it in both its shell gates. The script skips with exit 0 (not a failure, and not
+  strict-gated) when pacman, a built package, user namespaces, or a subordinate
+  uid range are unavailable, so the non-Arch CI image is unaffected
+- Continuation gate: <code>cargo test --locked --offline --lib
+  install_package_acceptance</code> — 15 passed; <code>cargo clippy --locked
+  --offline --all-targets -- -D warnings</code> — clean; <code>shellcheck -x -e
+  SC2016,SC2317 scripts/pacman-transaction-test.sh</code> — clean;
+  <code>VERIFY_STRICT=1 bash scripts/check-packaging.sh</code> — passed;
+  <code>bash scripts/pacman-transaction-test.sh</code> — 36 checks passed
+- Remaining limitation, unchanged and not claimed closed: a transaction against
+  the <strong>live system pacman database</strong> (<code>sudo pacman -U</code> /
+  <code>-R</code> on the running machine) is still <strong>NOT EXECUTED</strong>.
+  It needs a real root password. The host's installed package set, its own pacman
+  hooks, and its file-conflict surface are therefore not represented. Everything
+  the package itself controls — payload, metadata, dependencies, scriptlet
+  behaviour, and removal — is now proven by a real transaction
 
 ## Successor-preflight closure rule
 

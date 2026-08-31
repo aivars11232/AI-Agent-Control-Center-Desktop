@@ -40,6 +40,7 @@ scripts=(
   scripts/check-packaging.sh
   scripts/check-licenses.sh
   scripts/staged-install-test.sh
+  scripts/pacman-transaction-test.sh
   voice-runtime/setup.sh
   voice-runtime/setup-high-accuracy.sh
   packaging/ai-agent-control-center.install
@@ -54,7 +55,7 @@ if need shellcheck; then
   # SC2016: intentional single-quoted node -e / awk program text.
   # SC2317: functions referenced only indirectly (report/check helpers).
   report "shellcheck packaging scripts" \
-    "shellcheck -x -e SC2016,SC2317 install-kde.sh uninstall-kde.sh scripts/verify-fast.sh scripts/verify-full.sh scripts/check-packaging.sh scripts/check-licenses.sh scripts/staged-install-test.sh voice-runtime/setup.sh voice-runtime/setup-high-accuracy.sh"
+    "shellcheck -x -e SC2016,SC2317 install-kde.sh uninstall-kde.sh scripts/verify-fast.sh scripts/verify-full.sh scripts/check-packaging.sh scripts/check-licenses.sh scripts/staged-install-test.sh scripts/pacman-transaction-test.sh voice-runtime/setup.sh voice-runtime/setup-high-accuracy.sh"
   # packaging/*.install is sourced by pacman with helper functions predefined.
   report "shellcheck pacman install hook" \
     "shellcheck -s bash -e SC2148,SC2317 packaging/ai-agent-control-center.install"

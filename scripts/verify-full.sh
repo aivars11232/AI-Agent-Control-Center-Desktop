@@ -25,6 +25,7 @@ run bash -n \
   scripts/check-packaging.sh \
   scripts/check-licenses.sh \
   scripts/staged-install-test.sh \
+  scripts/pacman-transaction-test.sh \
   install-kde.sh \
   uninstall-kde.sh \
   voice-runtime/setup.sh \
@@ -44,11 +45,16 @@ run npm audit --audit-level=moderate
 run env VERIFY_STRICT="$strict" bash scripts/check-licenses.sh
 run env VERIFY_STRICT="$strict" bash scripts/check-packaging.sh
 run bash scripts/staged-install-test.sh
+# A real libalpm transaction for the built Arch package, as namespaced root in
+# an unprivileged user namespace. Skips on a non-Arch image (CI) or without a
+# built package; the skip is deliberate and not strict-gated.
+run bash scripts/pacman-transaction-test.sh
 
 if command -v shellcheck >/dev/null 2>&1; then
   run shellcheck -x -e SC2016,SC2317 \
     scripts/verify-fast.sh scripts/verify-full.sh scripts/check-packaging.sh \
     scripts/check-licenses.sh scripts/staged-install-test.sh \
+    scripts/pacman-transaction-test.sh \
     install-kde.sh uninstall-kde.sh \
     voice-runtime/setup.sh voice-runtime/setup-high-accuracy.sh
 elif [[ "$strict" == "1" ]]; then

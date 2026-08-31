@@ -911,7 +911,7 @@ cancellation, APG tab keyboard behavior, keyboard agent-card activation, skip
 navigation, page-focus transfer, deterministic axe checks, and responsive
 provider/reduced-motion style contracts.
 
-The Rust library contains 290 passing deterministic tests. They add Codex
+The Rust library contains 293 passing deterministic tests. They add Codex
 compatibility, command-isolation, bounded protocol, fake-process descendant
 cleanup, provider registry, fake-adapter dispatch, exact identity, typed
 failure, run-state, concurrent admission, idempotency, approval-boundary,
@@ -937,7 +937,11 @@ install / upgrade / remove / purge lifecycle and the shipped packaging artifacts
 (S8) — the whole sequence run as one continuous story over a scratch
 <code>$HOME</code>, and cross-artifact parity between
 <code>install-kde.sh</code>, <code>packaging/PKGBUILD</code>, the pacman install
-hook, the desktop entry, and the five manifests that carry a release version. Ten TASK-0024 <code>provider_review_acceptance</code> scenarios
+hook, the desktop entry, and the five manifests that carry a release version.
+Three further S8 scenarios cover the pacman transaction harness: that it expects
+exactly the payload the PKGBUILD's <code>package()</code> installs, that it is
+wired into the verification routes, skips cleanly off-Arch, and never escalates
+privilege, and that its install-hook assertions match the shipped hook. Ten TASK-0024 <code>provider_review_acceptance</code> scenarios
 compose the real post-dispatch path — fake Codex CLI under Bubblewrap or fake
 Ollama loopback transport, bounded workspace-evidence attach, specialist
 finalize, and the sequential review pipeline over a real repository — and assert
@@ -1264,21 +1268,35 @@ with the payload already gone, warned that per-user data could not be cleaned an
 then still claimed all local data had been removed; the closing message is now
 gated on whether the binary-delegated removal actually ran.
 
-Real <code>pacman -U</code>, packaged-binary smoke on an installed system, and
-<code>pacman -R</code> are <strong>not executed</strong>: they require root, and
-<code>sudo</code> on the development machine requires an interactive password.
-The package is built, validated, content-verified, and smoke-tested from an
-extracted tree, so only real pacman transaction integration and the
-<code>post_install</code> hook output remain unproven.
+Real <code>pacman -U</code>, packaged-binary smoke, and <code>pacman -R</code>
+are exercised by <code>scripts/pacman-transaction-test.sh</code>, which runs
+pacman as <em>namespaced</em> root
+(<code>unshare --user --map-root-user --map-auto</code>) against a minimal Arch
+root built offline from the local package cache. That is a genuine libalpm
+transaction, including <strong>chroot execution of the packaged
+<code>.INSTALL</code> scriptlet</strong>, so the <code>post_install</code> output
+is observed rather than inferred: 36 checks covering the commit, the hook message
+verbatim, database registration, the exact ten-file payload, the declared
+dependencies, a binary smoke test under a throwaway <code>$HOME</code>, removal,
+and per-user data surviving <code>pacman -R</code> as the hook promises. It never
+touches the host package database or the running session, and never escalates
+privilege; it skips with exit 0 off-Arch, so CI is unaffected.
+
+A transaction against the <strong>live system pacman database</strong>
+(<code>sudo pacman -U</code> / <code>-R</code> on the running machine) remains
+<strong>not executed</strong> — it requires a real root password. The host's
+installed package set, its own pacman hooks, and its file-conflict surface are
+therefore not represented.
 
 <code>npm run verify:fast</code> passed with 25 frontend files /
-83 tests, 7 Python tests, rustfmt, and 290 locked/offline Rust tests (8 ignored);
+83 tests, 7 Python tests, rustfmt, and 293 locked/offline Rust tests (8 ignored);
 <code>npm run verify:full</code> repeated those, built 71 modules, passed Clippy
 with warnings denied, the shell (<code>shellcheck</code> clean) / Python /
 strict-JSON checks, both npm audits with zero vulnerabilities, the license gate,
 packaging validation (now including a <code>namcap</code> gate over the PKGBUILD
 and the built package, and a release-version parity gate across every shipped
-manifest), and the staged install/upgrade/remove/keep-data/purge test.
+manifest), the staged install/upgrade/remove/keep-data/purge test, and the
+namespaced <code>pacman -U</code> / <code>-R</code> transaction test.
 
 <code>cargo-audit</code> and <code>cargo-deny</code> are not installed on the
 development machine, so <code>verify:full</code> reports the Rust advisory
@@ -1298,7 +1316,7 @@ gates mandatory for the branch.
 | Live core-specialist provider, hosted-search, structured-result, and adapter-limit acceptance | TASK-0020 |
 | Live installed reminder timer/tray, XDG notification portal, restart, and DST acceptance (deterministic S7 green; notification sink live re-confirmed 2026-08-30) | TASK-0020 |
 | Full running-GUI data-lifecycle path (reminders / memory / backup / reset UI) — deterministic S7 green | TASK-0028 |
-| Real `pacman -U` / packaged-binary smoke / `pacman -R` transaction acceptance (needs root; deterministic S8 green, package built and namcap-clean, live user-local install/upgrade/keep-data/purge/restore and no-PlasmaShell-restart verified 2026-08-30) | TASK-0027 (blocked on sudo) / TASK-0030 |
+| `pacman -U` / packaged-binary smoke / `pacman -R` against the **live system package database** (needs a root password; the same transactions are proven as namespaced root by `scripts/pacman-transaction-test.sh`, and deterministic S8, the namcap-clean built package, and the live user-local install/upgrade/keep-data/purge/restore with no PlasmaShell restart are all green) | TASK-0030 |
 | Installed WebView, packaged accessibility, and live platform acceptance | TASK-0020 |
 | Live restored-session (app-restart restore-token reuse) and full GUI voice → gateway → portal-dispatch integration (deterministic S6 green; portal grant + input + release and offline listener live-verified 2026-08-30) | TASK-0028 / TASK-0030 |
 | Full sequential live acceptance and production gate | TASK-0020 |

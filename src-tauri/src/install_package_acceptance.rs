@@ -920,3 +920,209 @@ fn s8_portal_grant_is_reported_as_a_platform_limit_not_claimed_removed() {
         "keep-data removal must delete the KDE portal restore token"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 13 — the pacman transaction harness asserts the payload the
+// PKGBUILD actually installs
+// ---------------------------------------------------------------------------
+
+/// The `$pkgdir` targets `packaging/PKGBUILD`'s `package()` lays down, as
+/// absolute package paths with `$pkgname` resolved. Directory-only targets
+/// (`install -d`) are dropped, so this is the shipped *file* set.
+fn pkgbuild_payload_paths() -> BTreeSet<String> {
+    let pkgbuild = read_shipped("packaging/PKGBUILD");
+    let mut targets = BTreeSet::new();
+    for (index, _) in pkgbuild.match_indices("$pkgdir/") {
+        let rest = &pkgbuild[index + "$pkgdir".len()..];
+        let end = rest
+            .find('"')
+            .expect("every $pkgdir target in the PKGBUILD is a quoted string");
+        targets.insert(rest[..end].replace("$pkgname", APPLICATION_NAMESPACE));
+    }
+    assert!(
+        !targets.is_empty(),
+        "packaging/PKGBUILD must install something under $pkgdir"
+    );
+    // `install -d "$pkgdir/usr/bin"` creates a directory the `ln -s` below then
+    // fills; a target another target lives inside is not itself a payload file.
+    targets
+        .iter()
+        .filter(|candidate| {
+            let prefix = format!("{candidate}/");
+            !targets.iter().any(|other| other.starts_with(&prefix))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The payload list `scripts/pacman-transaction-test.sh` asserts `pacman -Ql`
+/// reports, read out of the shipped script so the two cannot drift.
+fn harness_expected_paths() -> BTreeSet<String> {
+    let harness = read_shipped("scripts/pacman-transaction-test.sh");
+    let mut paths = BTreeSet::new();
+    for line in harness.lines() {
+        let trimmed = line.trim();
+        let Some(inner) = trimmed.strip_prefix("\"/usr/") else {
+            continue;
+        };
+        let end = inner
+            .find('"')
+            .expect("every expected payload entry is a quoted string");
+        paths.insert(format!("/usr/{}", &inner[..end]).replace("$app_id", APPLICATION_NAMESPACE));
+    }
+    paths
+}
+
+#[test]
+fn s8_pacman_transaction_test_asserts_the_payload_the_pkgbuild_installs() {
+    let from_pkgbuild = pkgbuild_payload_paths();
+    let from_harness = harness_expected_paths();
+
+    assert_eq!(
+        from_harness, from_pkgbuild,
+        "scripts/pacman-transaction-test.sh must expect exactly the files \
+         packaging/PKGBUILD installs; adding or removing a shipped file has to \
+         update both"
+    );
+
+    // The live harness needs a built package to run at all, so pin the shape
+    // here too: a PKGBUILD that stopped shipping the launcher, the payload
+    // binary, or the licence would otherwise still satisfy the equality above.
+    for required in [
+        format!("/usr/bin/{APPLICATION_NAMESPACE}"),
+        format!("/usr/lib/{APPLICATION_NAMESPACE}/{APPLICATION_NAMESPACE}"),
+        format!("/usr/share/applications/{APPLICATION_NAMESPACE}.desktop"),
+        format!("/usr/share/licenses/{APPLICATION_NAMESPACE}/LICENSE"),
+        format!("/usr/share/metainfo/{BUNDLE_IDENTIFIER}.metainfo.xml"),
+    ] {
+        assert!(
+            from_pkgbuild.contains(&required),
+            "packaging/PKGBUILD must install {required}, got {from_pkgbuild:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 14 — the pacman transaction harness is wired into the verification
+// routes, never escalates privilege, and skips instead of failing off-Arch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s8_pacman_transaction_test_is_wired_in_and_never_escalates_privilege() {
+    let harness_path = "scripts/pacman-transaction-test.sh";
+    let harness = read_shipped(harness_path);
+    let verify_full = read_shipped("scripts/verify-full.sh");
+    let check_packaging = read_shipped("scripts/check-packaging.sh");
+
+    // Wired into the full gate: executed, syntax-checked, and shellchecked.
+    assert!(
+        verify_full.contains(&format!("run bash {harness_path}")),
+        "scripts/verify-full.sh must run the pacman transaction test"
+    );
+    for (route, contents) in [
+        ("scripts/verify-full.sh", &verify_full),
+        ("scripts/check-packaging.sh", &check_packaging),
+    ] {
+        assert!(
+            contents.matches(harness_path).count() >= 2,
+            "{route} must both list and check {harness_path}"
+        );
+    }
+
+    // `pacman -U` normally needs root. This harness must reach that through an
+    // unprivileged user namespace, never by escalating: the repository's
+    // verification routes are not allowed to ask for a password or run as root.
+    for forbidden in ["sudo", "pkexec", "doas ", "su -", "systemd-run"] {
+        assert!(
+            !executable_lines(&harness).contains(forbidden),
+            "{harness_path} must not escalate privilege via {forbidden}"
+        );
+    }
+    assert!(
+        harness.contains("unshare --user --map-root-user --map-auto"),
+        "{harness_path} must run pacman as namespaced root"
+    );
+    // A single-uid mapping cannot represent the uid pacman chowns its download
+    // directory to, so the subordinate range is a hard precondition.
+    for precondition in ["/etc/subuid", "/etc/subgid"] {
+        assert!(
+            harness.contains(precondition),
+            "{harness_path} must require a {precondition} range before running"
+        );
+    }
+
+    // Off-Arch (CI) it must skip cleanly rather than fail, and the skip must
+    // not be upgraded to a failure under VERIFY_STRICT.
+    assert!(
+        harness.contains("exit 0; }") || harness.contains("exit 0\n}"),
+        "{harness_path}'s skip must exit 0"
+    );
+    assert!(
+        harness.contains("command -v pacman")
+            && harness.contains("|| skip \"pacman is unavailable"),
+        "{harness_path} must skip when pacman is unavailable"
+    );
+    // Read the executable text, not the prose: the header documents the skip
+    // by naming VERIFY_STRICT, but no code may branch on it.
+    assert!(
+        !executable_lines(&harness).contains("VERIFY_STRICT"),
+        "{harness_path} must not strict-gate its environment skip"
+    );
+
+    // It must never touch the host's package database or the real $HOME.
+    assert!(
+        harness.contains("--root \"$root\"") && harness.contains("--dbpath"),
+        "{harness_path} must confine pacman to a scratch root and database"
+    );
+    assert!(
+        harness.contains("HOME=\"$smoke_home\""),
+        "{harness_path} must smoke-test the packaged binary under a throwaway HOME"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 15 — the harness's hook expectations match the shipped hook
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s8_pacman_transaction_test_expectations_match_the_shipped_install_hook() {
+    let harness = read_shipped("scripts/pacman-transaction-test.sh");
+    let hook = read_shipped("packaging/ai-agent-control-center.install");
+
+    // The harness compares the executed post_install output against the hook's
+    // own heredoc, so it cannot silently stop covering a line the hook prints.
+    assert!(
+        harness.contains("<<'MSG'") && harness.contains("packaging/$app_id.install"),
+        "the harness must read the shipped hook's message to compare it verbatim"
+    );
+
+    // Every literal the harness greps for must actually be in the hook, or the
+    // live check would assert text the package never emits.
+    for expected in [
+        "installed at /usr/bin/",
+        "cannot remove per-user data",
+        "--purge --confirm PURGE",
+        "KDE System Settings",
+    ] {
+        assert!(
+            harness.contains(expected),
+            "the harness must assert the hook line {expected:?}"
+        );
+        assert!(
+            hook.contains(expected),
+            "packaging/ai-agent-control-center.install must contain {expected:?}, \
+             which the pacman transaction test asserts"
+        );
+    }
+
+    // The harness also proves what `pacman -R` cannot do. That promise is the
+    // hook's, so both must describe the same boundary.
+    assert!(
+        harness.contains("leaves per-user data untouched, as the hook promises"),
+        "the harness must verify that pacman -R leaves per-user data in place"
+    );
+    assert!(
+        hook.contains("`pacman -R` cannot remove per-user data"),
+        "the hook must state the boundary the harness verifies"
+    );
+}
