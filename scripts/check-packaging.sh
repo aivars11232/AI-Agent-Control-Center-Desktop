@@ -8,6 +8,9 @@
 #   * makepkg --printsrcinfo parse of the PKGBUILD;
 #   * namcap on the PKGBUILD (and on a built package when one is present),
 #     allowing only the explicitly justified findings listed below;
+#     makepkg and namcap are Arch-only, so both are gated behind
+#     `arch_environment` and skip (never fail) on a non-Arch runner, including
+#     under VERIFY_STRICT=1;
 #   * release-version parity across every manifest that carries a version;
 #   * a check that install-kde.sh no longer restarts plasmashell.
 
@@ -30,6 +33,13 @@ need() {
     printf 'skip %s unavailable\n' "$1"
   fi
   return 1
+}
+# `makepkg` and `namcap` are Arch-only tools. Every gate that depends on one
+# must be wrapped in this predicate, otherwise `need` turns "not an Arch
+# machine" into a strict-mode failure on a non-Arch CI runner. The Arch
+# packaging job still gets the strict check, because there the tools exist.
+arch_environment() {
+  command -v pacman >/dev/null 2>&1 || command -v makepkg >/dev/null 2>&1
 }
 
 scripts=(
@@ -113,7 +123,7 @@ report "metainfo newest release matches src-tauri/Cargo.toml" \
 
 echo
 echo "== PKGBUILD =="
-if command -v pacman >/dev/null 2>&1 || command -v makepkg >/dev/null 2>&1; then
+if arch_environment; then
   if need makepkg; then
     report "makepkg --printsrcinfo parses the PKGBUILD" \
       "( cd packaging && makepkg --printsrcinfo >/dev/null )"
@@ -186,7 +196,9 @@ namcap_gate() {
   fi
   return 0
 }
-if need namcap; then
+if ! arch_environment; then
+  printf 'skip namcap checks (not an Arch environment)\n'
+elif need namcap; then
   report "namcap on the PKGBUILD reports only justified findings" \
     "namcap_gate packaging/PKGBUILD pkgbuild"
   built_package=""

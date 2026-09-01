@@ -133,8 +133,10 @@ Other platforms are not current release targets.
 
 ## Development
 
-The locked frontend toolchain requires Node.js <code>^20.19.0</code> or
-<code>>=22.12.0</code>. The verification routes also require npm, Bash,
+The locked frontend toolchain requires Node.js <code>^22.22.2</code>,
+<code>^24.15.0</code>, or <code>>=26.0.0</code> — the floor its own locked
+development dependencies declare. <code>.nvmrc</code> pins the exact version CI
+uses. The verification routes also require npm, Bash,
 Python 3, Cargo, rustfmt, Clippy, <code>pkg-config</code>, and the platform
 SQLite development files. Linux Codex execution additionally requires
 <code>bwrap</code> (Bubblewrap); absence or incompatibility fails closed rather

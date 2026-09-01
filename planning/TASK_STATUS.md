@@ -59,8 +59,8 @@ roadmap.
 | TASK-0025 | TASK-0024 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Voice, KDE portal, PC control, and notification stabilization |
 | TASK-0026 | TASK-0025 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Reminders, memory, backup/restore, and data-lifecycle stabilization |
 | TASK-0027 | TASK-0026 | COMPLETE | YES | COMPLETE | PASSED (`pacman -U`/`-R` exercised as namespaced root; live system-database transaction NOT EXECUTED) | COMPLETE | Install, upgrade, remove, purge, and Arch package stabilization |
-| TASK-0028 | TASK-0027 | COMPLETE | YES | COMPLETE | PASSED (live 1280x820 desktop pass on the real KDE Plasma 6 / Wayland session, keyboard-driven, against an isolated scratch data home) | PENDING USER | Integrated desktop UI/UX and recovery acceptance |
-| TASK-0029 | TASK-0028 | NOT STARTED | NO | NOT STARTED | — | — | Full regression, security, CI, and release-candidate hardening |
+| TASK-0028 | TASK-0027 | COMPLETE | YES | COMPLETE | PASSED (live 1280x820 desktop pass on the real KDE Plasma 6 / Wayland session, keyboard-driven, against an isolated scratch data home) | COMPLETE (<code>0a43046</code> "task28"; backfilled by TASK-0029 Phase B) | Integrated desktop UI/UX and recovery acceptance |
+| TASK-0029 | TASK-0028 | COMPLETE | YES | COMPLETE | PASSED (<code>VERIFY_STRICT=1 npm run verify:full</code> green with zero skips and zero warnings; Rust advisory status <strong>PASSED</strong> rather than indeterminate for the first time; live-system-database <code>pacman</code> still NOT EXECUTED, unchanged from TASK-0027) | PENDING USER | Full regression, security, CI, and release-candidate hardening |
 | TASK-0030 | TASK-0029 | NOT STARTED | NO | NOT STARTED | — | — | Final version 1.0 acceptance, release evidence, and handoff |
 
 ## TASK-0001 evidence
@@ -2692,6 +2692,167 @@ roadmap.
   advisory status remains <strong>indeterminate</strong> locally because
   <code>cargo-audit</code> / <code>cargo-deny</code> are not installed; CI
   requires them under <code>VERIFY_STRICT=1</code>
+- Git closure: <code>PENDING USER</code>
+
+## TASK-0029 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>; starting HEAD
+  <code>0a43046b26214d3baef29ab220fa0ea62c9b1399</code> (<code>task28</code>);
+  clean tree; <code>main</code> vs <code>origin/main</code> zero ahead / zero
+  behind. Candidate tree object
+  <code>5282bb7bd2a6464b1e341453f499b3ef8b23ab56</code>, frozen 2026-09-01
+- Dependency: all seven successor-preflight conditions passed for TASK-0028 —
+  tracker Phase A COMPLETE / approval YES / Phase B COMPLETE / verification
+  PASSED; implementation commit <code>0a43046</code> identified from actual Git
+  history and confirmed by its file scope (the recovery view, AppController,
+  Activity / Reminders / Settings / Voice pages, the shell stylesheets, and
+  <code>desktopUiAcceptance.test.tsx</code>); that commit is the checked-out
+  HEAD and is reachable from <code>origin/main</code>; branch and
+  <code>origin/main</code> aligned zero/zero; clean tree; no unexplained
+  intervening state. Its Git closure is backfilled to COMPLETE in this task's
+  tracker update, per the successor-preflight closure rule
+- Phase A outcome: <code>PHASE_A_READY</code>; approval: the v3.0 continuation
+  <code>RUN_PROMPT.txt</code> for TASK-0029 is the task-level approval to
+  inspect, plan, implement, and verify within its scope
+- Package-tracker note: the v3.0 continuation package's own
+  <code>05_STATUS_TRACKER.md</code> still lists TASK-0026, TASK-0027, and
+  TASK-0028 as <code>NOT STARTED</code>. Actual Git history and this repository
+  tracker are the current truth; all three are complete and pushed
+- Defect 1 — CI red since TASK-0027: <code>scripts/check-packaging.sh</code>
+  called <code>need namcap</code> outside the
+  <code>pacman</code>/<code>makepkg</code> guard, and <code>need()</code> turns a
+  missing tool into <code>FAIL … is required in strict mode</code> under
+  <code>VERIFY_STRICT=1</code>. <code>namcap</code> is Arch-only and absent from
+  the Ubuntu runner, so the <code>scripts</code> job failed on every push. Live
+  evidence: GitHub Actions runs <code>33330544485</code>,
+  <code>33422628238</code>, and <code>33549730695</code>, the last one on the
+  TASK-0028 commit, whose job log ends
+  <code>FAIL namcap is required in strict mode</code> /
+  <code>packaging validation: FAILED</code>. Because the six jobs form one
+  ordered <code>needs:</code> chain, <code>licenses</code>,
+  <code>secrets</code>, and <code>packaging</code> never started, so
+  <code>cargo-deny</code>, the license gate, <code>gitleaks</code>, and the Arch
+  <code>makepkg</code> / <code>namcap</code> / staged-install job produced no
+  result for three consecutive pushes. Fixed by routing both Arch-only sections
+  through one shared <code>arch_environment</code> predicate. Verified by
+  executing the gate with <code>VERIFY_STRICT=1</code> under a
+  <code>PATH</code> containing neither <code>pacman</code>,
+  <code>makepkg</code>, nor <code>namcap</code>: exit <strong>0</strong>,
+  <code>packaging validation: passed</code>, with
+  <code>skip namcap checks (not an Arch environment)</code> and the non-Arch
+  checks still executing
+- Defect 2 — a published advisory in the candidate: <code>npm audit
+  --audit-level=moderate</code> reported <code>browserslist &lt;=4.28.6</code>
+  high severity (GHSA-c83g-rgw3-j3cx, GHSA-73wf-gq98-2v4g), a build-time
+  transitive dependency through
+  <code>@vitejs/plugin-react → @babel/core →
+  @babel/helper-compilation-targets</code>. Production-only audit was already
+  clean. No CI job ran <code>npm audit</code> at all, so the branch gate could
+  not see it. Fixed with <code>npm audit fix --package-lock-only</code> followed
+  by <code>npm ci --ignore-scripts</code>; the lockfile diff was verified
+  package-by-package to be exactly 6 development-only transitive entries
+  (<code>browserslist</code> 4.28.6→4.28.8 plus its data packages), with the
+  root <code>dependencies</code> and <code>devDependencies</code> objects
+  unchanged, no <code>package.json</code> edit, and the total package count
+  unchanged at 212. Both audit surfaces were added to the CI
+  <code>frontend</code> job
+- Defect 3 — pinned toolchain below its dependencies' floor: the CI
+  <code>frontend</code> job log showed five <code>npm warn EBADENGINE</code>
+  blocks against <code>node: 'v22.12.0'</code> —
+  <code>@asamuzakjp/css-color</code>, <code>@asamuzakjp/dom-selector</code>,
+  <code>jsdom@30.0.1</code>, <code>undici@8.10.0</code>,
+  <code>whatwg-url@17.1.0</code>. The strictest floor is
+  <code>jsdom</code>'s <code>^22.22.2</code>. <code>.nvmrc</code> is now
+  <code>22.23.2</code> (the current v22 LTS, from the official Node dist index,
+  which satisfies all five), <code>package.json</code>
+  <code>engines.node</code> is <code>^22.22.2 || ^24.15.0 || &gt;=26.0.0</code>
+  instead of <code>^20.19.0 || &gt;=22.12.0</code> (Node 20 cannot satisfy
+  <code>jsdom</code>), both CI <code>npm ci</code> steps run with
+  <code>--engine-strict</code> so npm fails rather than warns, and the README
+  toolchain paragraph was corrected to match
+- Defect 4 — deprecated CI action runtimes: every job carried a Node-20
+  deprecation annotation. <code>actions/checkout</code> and
+  <code>actions/setup-node</code> are pinned to <code>v5</code>, confirmed
+  against each action's own <code>runs.using</code> as the first major declaring
+  <code>node24</code>. <code>v6</code>/<code>v7</code> were deliberately not
+  taken, to avoid absorbing unrelated behavioural changes into a release freeze
+- Regression coverage: new <code>src-tauri/src/release_gate_acceptance.rs</code>
+  (S10), nine deterministic scenarios over the release gate itself — the layer
+  that had none. Each of the three gate defects was confirmed to fail the new
+  scenarios before the fix: restoring the pre-fix
+  <code>scripts/check-packaging.sh</code> and <code>.github/workflows/ci.yml</code>
+  produced <code>the packaging gate strict-failed on the Arch-only tool
+  `namcap` … which is the TASK-0027 CI regression</code> and
+  <code>`actions/checkout` majors below v5 declare the deprecated node20
+  runtime</code>; restoring the old pin and engines range produced
+  <code>the pinned Node toolchain 22.12.0 is below the engine floor declared by
+  5 dependenc(ies)</code>, listing all five by name and range
+- Rust advisory status is <strong>PASSED</strong> locally for the first time.
+  <code>cargo-deny 0.20.2</code> was already installed at
+  <code>~/.cargo/bin</code>, a directory absent from the interactive
+  <code>PATH</code> — which is precisely why TASK-0019 through TASK-0028 all
+  recorded the status as indeterminate. Nothing was installed to fix it;
+  <code>PATH</code> was corrected for the run. <code>cargo deny check</code>
+  reports <code>advisories ok, bans ok, licenses ok, sources ok</code>. Three
+  <code>license-not-encountered</code> warnings were silenced deliberately with
+  <code>unused-allowed-license = "allow"</code> and a comment, because
+  <code>deny.toml</code>'s allowlist intentionally mirrors
+  <code>scripts/check-licenses.sh</code>
+- Secret scan: <code>gitleaks 8.30.1</code> installed to
+  <code>~/.local/bin</code> from the official release (no <code>sudo</code>),
+  <code>gitleaks detect --source . --redact --no-banner --verbose</code> →
+  44 commits scanned, <strong>no leaks found</strong>, exit 0. The CI pin was
+  raised from 8.21.2 to the same 8.30.1
+- Final gate on the frozen candidate: <code>makepkg -f --noconfirm</code> exit
+  <strong>0</strong> and <code>VERIFY_STRICT=1 npm run verify:full</code> exit
+  <strong>0</strong>, run back to back on the final tree, with <strong>zero
+  skips and zero warnings</strong>. 26 frontend files / 96 tests; 7 Python
+  tests; rustfmt; 302 locked/offline Rust tests, 0 failed, 8 <code>#[ignore]</code>d
+  live scenarios excluded by design; 71-module build; Clippy with
+  <code>-D warnings</code>; <code>npm ls --all</code>; <code>cargo tree
+  --locked --offline</code>; <code>npm audit --omit=dev</code> and
+  <code>npm audit</code> both 0 vulnerabilities; license gate passed with 541
+  crates and every npm package permissive; packaging validation passed including
+  <code>namcap</code> over the PKGBUILD and the built package; staged
+  install/upgrade/remove/keep-data/purge; namespaced <code>pacman -U</code> /
+  <code>-R</code> transaction test — 89 individual <code>ok</code> checks across
+  the script gates
+- Candidate artifacts (from the final <code>makepkg</code> run):
+  <code>packaging/ai-agent-control-center-0.5.1-1-x86_64.pkg.tar.zst</code>
+  sha256
+  <code>6e6e17e4e0e37909c1c5d9379fa47eb504f87bc706115017087d6522bb385609</code>,
+  7393884 bytes;
+  <code>src-tauri/target/release/ai-agent-control-center</code> sha256
+  <code>86baa17c2424075375582217c6257403db4c36f0b8982f46b1063820fc5affe3</code>,
+  29917928 bytes, reporting <code>ai-agent-control-center 0.5.1</code>. The
+  binary sha256 was identical across three independent <code>makepkg</code>
+  runs spanning the lockfile correction, so the dependency change provably did
+  not alter the shipped artifact; the package archive hash differs per run only
+  through its embedded build date
+- Ownership decision recorded, not hidden: the known-gaps entry for backend
+  recovery from a startup database failure without a process restart was
+  assigned to TASK-0029 by TASK-0028. It was examined
+  (<code>src-tauri/src/persistence.rs</code> lines 216-231 and 716-731, and the
+  startup site in <code>src-tauri/src/lib.rs</code>) and deliberately
+  <strong>not</strong> implemented here: it is a persistence-subsystem feature,
+  not an integration regression, its owning scope TASK-0022 is closed, and
+  TASK-0029's scope forbids reopening finished design work — it would also
+  require undoing the TASK-0028 recovery-screen design that was live-verified.
+  Restarting the application recovers, with no data loss and no security
+  consequence, so the gap is re-assigned to TASK-0030 as a recorded 1.0
+  limitation
+- Not executed, unchanged from TASK-0027: a <code>pacman -U</code> /
+  <code>-R</code> transaction against the <strong>live system package
+  database</strong>, which needs a real root password. No <code>sudo</code>,
+  microphone, portal, provider, or destructive real-data action was taken by
+  this task
+- Environment note: the local run used Node <code>v26.8.1</code> while CI uses
+  the pinned <code>22.23.2</code>. Node 26 emits
+  <code>ExperimentalWarning: localStorage is not available</code> during Vitest;
+  the CI <code>frontend</code> job log on Node 22 was checked and does not
+  contain it, so it is a local-runtime artifact and not a product warning
 - Git closure: <code>PENDING USER</code>
 
 ## Successor-preflight closure rule

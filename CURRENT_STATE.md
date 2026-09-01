@@ -827,7 +827,12 @@ with TASK-0020.
 <code>.github/workflows/ci.yml</code> runs six jobs strictly in sequence
 (<code>frontend → rust → scripts → licenses → secrets → packaging</code>) under
 one concurrency group, with no release or publish step and no live
-AI/microphone/portal/system action. The Rust job makes <code>cargo-deny</code>
+AI/microphone/portal/system action. The frontend job installs with
+<code>npm ci --ignore-scripts --engine-strict</code>, so a dependency whose
+declared Node range the pinned <code>.nvmrc</code> toolchain does not satisfy
+fails the build instead of emitting an <code>EBADENGINE</code> warning, and runs
+both <code>npm audit</code> surfaces — production-only and full — which no CI
+job did before TASK-0029. The Rust job makes <code>cargo-deny</code>
 (advisories, licenses, bans, sources) mandatory; the license job runs
 <code>scripts/check-licenses.sh</code>, which fails the build on any
 non-permissive dependency license; the secrets job runs <code>gitleaks</code>;
@@ -839,8 +844,19 @@ adds the same packaging, license, staged-install, and (in
 advisory tooling is absent it reports the skip and marks the Rust advisory
 status **indeterminate** rather than passing.
 
+Both Arch-only checks in <code>scripts/check-packaging.sh</code>
+(<code>makepkg</code> and <code>namcap</code>) are reached through one shared
+<code>arch_environment</code> predicate and skip — never fail — off Arch, even
+under <code>VERIFY_STRICT=1</code>. Requiring <code>namcap</code> outside that
+guard is what held CI red on <code>main</code> from TASK-0027 until TASK-0029:
+the <code>scripts</code> job failed on the Ubuntu runner, so the
+<code>licenses</code>, <code>secrets</code>, and <code>packaging</code> jobs
+after it never executed at all and their security gates were dark.
+<code>release_gate_acceptance</code> now regresses that guard, the ordered job
+chain, and the tooling parity between the two routes.
+
 The application and every dependency are cleared for proprietary distribution:
-545 third-party crates and all npm packages resolve to permissive licenses with
+541 third-party crates and all npm packages resolve to permissive licenses with
 no GPL/AGPL/standalone-LGPL. <code>THIRD-PARTY-NOTICES.md</code> records the
 inventory and notes that the LGPL relink/source obligation would apply only to a
 bundled artifact, which the supported Arch and user-local paths avoid by using
@@ -902,7 +918,7 @@ and WebSocket endpoints.
 
 ## Verification inventory
 
-Twenty-five Vitest files contain 83 deterministic frontend tests for renderer
+Twenty-six Vitest files contain 96 deterministic frontend tests for renderer
 domain characterization, voice, persistence, revision/fail-closed writer
 behavior, authoritative run/provider/registry/queue/review projections, readable
 rendering of serialized backend error payloads, editing a created agent from its
@@ -911,7 +927,7 @@ cancellation, APG tab keyboard behavior, keyboard agent-card activation, skip
 navigation, page-focus transfer, deterministic axe checks, and responsive
 provider/reduced-motion style contracts.
 
-The Rust library contains 293 passing deterministic tests. They add Codex
+The Rust library contains 302 passing deterministic tests. They add Codex
 compatibility, command-isolation, bounded protocol, fake-process descendant
 cleanup, provider registry, fake-adapter dispatch, exact identity, typed
 failure, run-state, concurrent admission, idempotency, approval-boundary,
@@ -941,7 +957,20 @@ hook, the desktop entry, and the five manifests that carry a release version.
 Three further S8 scenarios cover the pacman transaction harness: that it expects
 exactly the payload the PKGBUILD's <code>package()</code> installs, that it is
 wired into the verification routes, skips cleanly off-Arch, and never escalates
-privilege, and that its install-hook assertions match the shipped hook. Ten TASK-0024 <code>provider_review_acceptance</code> scenarios
+privilege, and that its install-hook assertions match the shipped hook. Nine TASK-0029 <code>release_gate_acceptance</code> scenarios cover the
+release gate itself (S10) — the layer that decides whether a candidate may
+ship, and which previously had no regression coverage of its own. They assert
+that an Arch-only packaging tool skips rather than strict-fails off Arch (the
+exact defect that held CI red from TASK-0027 to TASK-0029, reproduced by
+executing the shipped gate under a scratch <code>PATH</code>), that every
+mandatory CI job is still wired into one ordered chain with read-only
+permissions and no publish step, that CI starts no provider, microphone,
+portal, installer, or system action, that the local strict route and CI require
+the same security tooling including both npm audit surfaces, that the pinned
+Node toolchain satisfies every engine range its own locked dependencies declare,
+that the release version is one value across manifests <em>and</em> lockfiles,
+and that the Rust and npm license gates encode one consistent
+proprietary-distribution policy. Ten TASK-0024 <code>provider_review_acceptance</code> scenarios
 compose the real post-dispatch path — fake Codex CLI under Bubblewrap or fake
 Ollama loopback transport, bounded workspace-evidence attach, specialist
 finalize, and the sequential review pipeline over a real repository — and assert
@@ -1367,14 +1396,108 @@ same process through the single-instance plugin and restores the 1280x820
 window. The narrow layout was checked at 860x700, where the sidebar collapses to
 a top bar and the provider control stays fully readable.
 
-<code>cargo-audit</code> and <code>cargo-deny</code> are not installed on the
-development machine, so <code>verify:full</code> reports the Rust advisory
-result as **indeterminate** and does not represent the skip as a pass
-(<code>shellcheck</code> is now installed and the shell-lint step runs clean
-locally). The CI <code>rust</code>, <code>licenses</code>, and
-<code>scripts</code> jobs install and require all three under
-<code>VERIFY_STRICT=1</code>, making the advisory, license, and shell-lint
-gates mandatory for the branch.
+That statement about the local advisory tooling is superseded by TASK-0029; see
+the release-candidate record below.
+
+TASK-0029 froze a release candidate and hardened the deterministic, security,
+and CI gates around it. The candidate is the TASK-0028 commit
+<code>0a43046</code> plus the TASK-0029 changes.
+
+Four defects were found and fixed. Three of them were in the gate itself, which
+is why they had survived:
+
+- <strong>The CI chain was red on <code>main</code> and had been since
+  TASK-0027.</strong> <code>scripts/check-packaging.sh</code> required the
+  Arch-only <code>namcap</code> outside the guard that wraps the
+  <code>makepkg</code> checks, and <code>VERIFY_STRICT=1</code> turns a missing
+  required tool into a failure, so the Ubuntu <code>scripts</code> job failed on
+  every run. Because the six jobs form one ordered chain, the
+  <code>licenses</code>, <code>secrets</code>, and <code>packaging</code> jobs
+  after it never ran at all: <code>cargo-deny</code>, the third-party license
+  gate, <code>gitleaks</code>, and the whole Arch packaging job were dark for
+  three consecutive pushes while the only visible symptom was a red mark. Both
+  Arch-only sections now go through one shared <code>arch_environment</code>
+  predicate and skip off Arch.
+- <strong>A published high-severity advisory reached the candidate.</strong>
+  <code>browserslist &lt;=4.28.6</code> (GHSA-c83g-rgw3-j3cx,
+  GHSA-73wf-gq98-2v4g), a build-time transitive dependency of
+  <code>@vitejs/plugin-react</code>. No CI job ran <code>npm audit</code> at
+  all — only the local <code>verify:full</code> did — so the advisory was
+  invisible to the branch gate. The lockfile now resolves the fixed versions (6
+  development-only transitive packages; no declared dependency and no
+  <code>package.json</code> dependency entry changed), and both audit surfaces
+  run in CI.
+- <strong>The pinned toolchain was below its own dependencies' floor.</strong>
+  <code>.nvmrc</code> pinned Node 22.12.0 while five installed development
+  dependencies declared a higher v22 floor (<code>jsdom@30.0.1</code> requires
+  <code>^22.22.2</code>). npm reports that as an <code>EBADENGINE</code>
+  warning, so five of them scrolled past a green check on every CI run. The pin
+  is now 22.23.2 (current v22 LTS), <code>package.json</code>
+  <code>engines.node</code> states the real floor
+  (<code>^22.22.2 || ^24.15.0 || &gt;=26.0.0</code>) instead of a range that
+  Node 20 could not honour, and CI installs with <code>--engine-strict</code> so
+  npm — the semver authority — fails the build rather than warning.
+- <strong>Deprecated CI action runtimes.</strong>
+  <code>actions/checkout@v4</code> and <code>actions/setup-node@v4</code>
+  declare <code>node20</code> and annotated every job with a deprecation
+  warning; both are pinned to <code>v5</code>, the first major declaring
+  <code>node24</code>.
+
+A ninth acceptance module, <code>src-tauri/src/release_gate_acceptance.rs</code>
+(S10), now regresses the gate itself. Each of the three gate defects was
+re-verified by restoring the pre-fix file and observing the corresponding
+scenario fail with the real message — the packaging scenario reproduces the CI
+failure by executing the shipped gate under a scratch <code>PATH</code> with
+<code>pacman</code>, <code>makepkg</code>, and <code>namcap</code> absent, and
+the toolchain scenario reproduces all five <code>EBADENGINE</code> dependencies
+by name.
+
+The Rust advisory status is <strong>PASSED</strong> locally for the first time.
+<code>cargo-deny 0.20.2</code> was in fact already installed at
+<code>~/.cargo/bin</code>; that directory is not on the interactive
+<code>PATH</code>, which is the whole reason every earlier task recorded the
+status as indeterminate. With it resolvable,
+<code>cargo deny check</code> reports <code>advisories ok, bans ok, licenses
+ok, sources ok</code>. Three <code>license-not-encountered</code> warnings for
+allowances no current crate exercises (<code>BlueOak-1.0.0</code>,
+<code>NCSA</code>, <code>Unicode-DFS-2016</code>) are silenced deliberately in
+<code>deny.toml</code>: that list is the Rust half of one policy whose npm half
+lives in <code>scripts/check-licenses.sh</code>, and keeping the two in sync is
+worth more than pruning entries the tree happens not to carry today.
+
+The full gate on the frozen candidate: <code>VERIFY_STRICT=1 npm run
+verify:full</code> exit <strong>0</strong>, with <strong>zero skips and zero
+warnings</strong> — 26 frontend files / 96 tests, 7 Python voice-runtime tests,
+rustfmt, 302 locked/offline Rust tests (8 <code>#[ignore]</code>d live
+scenarios, excluded by design), a 71-module production build, Clippy with
+warnings denied, shell/Python/strict-JSON syntax checks, <code>npm ls
+--all</code>, <code>cargo tree --locked --offline</code>, both npm audits at 0
+vulnerabilities, the license gate (541 crates and every npm package permissive),
+packaging validation including <code>namcap</code> over the PKGBUILD and the
+built package, the staged install/upgrade/remove/keep-data/purge test, and the
+namespaced <code>pacman -U</code> / <code>-R</code> transaction test — 89
+individual <code>ok</code> checks across the script gates. A
+<code>gitleaks 8.30.1</code> scan of all 44 commits found no leaks; the CI pin
+was raised to the same version.
+
+Candidate artifacts, built by <code>makepkg -f</code> from the final tree:
+
+<pre><code>packaging/ai-agent-control-center-0.5.1-1-x86_64.pkg.tar.zst
+  sha256 6e6e17e4e0e37909c1c5d9379fa47eb504f87bc706115017087d6522bb385609
+  7393884 bytes
+src-tauri/target/release/ai-agent-control-center
+  sha256 86baa17c2424075375582217c6257403db4c36f0b8982f46b1063820fc5affe3
+  29917928 bytes, reports "ai-agent-control-center 0.5.1"
+</code></pre>
+
+The binary hash was identical across three independent <code>makepkg</code>
+runs, including one before and one after the lockfile correction, so the
+browserslist bump provably did not change the shipped artifact. The package
+archive hash differs between runs only because it embeds its own build date.
+
+The release version stays <strong>0.5.1</strong> and the AppStream release stays
+<code>type="development"</code>. Promoting to 1.0 is TASK-0030's decision, not a
+hardening side effect.
 
 ## Known gaps and roadmap ownership
 
@@ -1388,7 +1511,7 @@ gates mandatory for the branch.
 | `pacman -U` / packaged-binary smoke / `pacman -R` against the **live system package database** (needs a root password; the same transactions are proven as namespaced root by `scripts/pacman-transaction-test.sh`, and deterministic S8, the namcap-clean built package, and the live user-local install/upgrade/keep-data/purge/restore with no PlasmaShell restart are all green) | TASK-0030 |
 | Installed WebView, packaged accessibility, and live platform acceptance | TASK-0020 |
 | Live restored-session (app-restart restore-token reuse) and full GUI voice → gateway → portal-dispatch integration (deterministic S6 green; portal grant + input + release and offline listener live-verified 2026-08-30; TASK-0028 live-verified the tray/window restart lifecycle and the voice page's own states, not a spoken command through the portal) | TASK-0030 |
-| Backend recovery from a startup database open/validation failure without restarting the process (`PersistenceService` holds the single `StateRepository` result for the process lifetime; the recovery screen reports this truthfully instead of offering a retry that cannot work) | TASK-0029 |
+| Backend recovery from a startup database open/validation failure without restarting the process (`PersistenceService` holds the single `StateRepository` result for the process lifetime; the recovery screen reports this truthfully instead of offering a retry that cannot work). TASK-0029 examined the change and did not make it: it is a persistence-subsystem feature whose owning scope, TASK-0022, is closed, and TASK-0029 may not reopen finished design work. Restarting the application recovers, with no data loss and no security consequence, so it is carried as a recorded 1.0 limitation | TASK-0030 |
 | Full sequential live acceptance and production gate | TASK-0020 |
 
 See [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for exact sequencing.

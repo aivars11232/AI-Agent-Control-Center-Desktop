@@ -14,7 +14,7 @@
     "url": "https://github.com/aivars11232/AI-Agent-Control-Center-Desktop/issues"
   },
   "engines": {
-    "node": "^20.19.0 || >=22.12.0"
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
   },
   "type": "module",
   "scripts": {

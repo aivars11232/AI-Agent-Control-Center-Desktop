@@ -20,6 +20,8 @@ mod policy;
 #[cfg(test)]
 mod provider_review_acceptance;
 mod provider_runtime;
+#[cfg(test)]
+mod release_gate_acceptance;
 mod reminder_scheduler;
 mod review_orchestration;
 mod run_coordinator;

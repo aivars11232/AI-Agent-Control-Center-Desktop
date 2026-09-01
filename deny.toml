@@ -30,6 +30,13 @@ allow = [
     "NCSA",
 ]
 confidence-threshold = 0.9
+# This list is the Rust half of one policy; `scripts/check-licenses.sh` carries
+# the same identifiers plus the extra permissive ones only npm packages use.
+# Keeping both in sync matters more than pruning entries that no crate happens
+# to carry today, so an allowance the current tree does not exercise
+# (BlueOak-1.0.0, NCSA, Unicode-DFS-2016 as of this release candidate) is not a
+# finding. Without this, cargo-deny warns on each one on every run.
+unused-allowed-license = "allow"
 # The workspace crate itself carries the non-SPDX proprietary license via
 # `license-file`; it is not a third-party dependency.
 private = { ignore = true }
