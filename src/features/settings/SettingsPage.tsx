@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import type { Agent, AgentPerformance, AgentStatus, AppPreferences, ApprovalRequest, ExecutionFocus, HistoryRetentionDays, InterfaceDensity, ModelDefinition, OverflowAction, Reminder, ReviewMode, RoutingMode, SafetyMode, TaskCategory, TaskPriority, ThemeMode, WorkspaceDefinition, AccentColor } from "../../applicationState";
 import { LEGACY_STORAGE_KEYS, persistenceErrorMessage } from "../../persistence";
 import { executableModels, providerRuntimeStatus } from "../../providerRegistry";
@@ -35,25 +35,32 @@ function RangeSetting({
   hint: string;
   onChange: (value: number) => void;
 }) {
+  // The slider carries its own name and description: the visible heading is a
+  // real label and the hint is referenced, so the control is not an unnamed
+  // range for assistive technology or a keyboard-only operator.
+  const inputId = useId();
+  const hintId = `${inputId}-hint`;
   return (
     <article className="range-setting">
       <div className="range-setting-heading">
-        <span>{label}</span>
-        <output>
+        <label htmlFor={inputId}>{label}</label>
+        <output htmlFor={inputId}>
           {value}
           {suffix}
         </output>
       </div>
 
       <input
+        id={inputId}
         type="range"
         min={minimum}
         max={maximum}
         step={step}
         value={value}
+        aria-describedby={hintId}
         onChange={(event) => onChange(Number(event.target.value))}
       />
-      <small>{hint}</small>
+      <small id={hintId}>{hint}</small>
     </article>
   );
 }
@@ -1576,8 +1583,9 @@ export function SettingsPage({
             <p className="page-message">
               Reset restores defaults and clears current run/review history. It
               does not physically erase the SQLite database, bounded
-              maintenance evidence, or desktop files; physical purge belongs
-              to TASK-0019.
+              maintenance evidence, or desktop files. Physically removing those
+              files is done by uninstalling with the purge option, not from
+              this screen.
             </p>
           </div>
         </div>

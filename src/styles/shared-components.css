@@ -173,6 +173,17 @@ button:disabled {
   letter-spacing: -0.03em;
 }
 
+/* Summary cards whose value is a long identifier rather than a metric. The
+   numeric size breaks such values mid-word ("Europe/Amste rdam") and pushes the
+   card past its row peers. */
+.summary-card strong.summary-value-text {
+  margin-top: 18px;
+  overflow-wrap: break-word;
+  font-size: clamp(17px, 1.5vw, 21px);
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+
 .summary-card select {
   margin-bottom: 8px;
 }
@@ -271,6 +282,10 @@ button:disabled {
 .agent-card p,
 .agent-card small {
   overflow-wrap: anywhere;
+}
+
+.agent-card small {
+  display: block;
 }
 
 .agent-card p {

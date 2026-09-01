@@ -59,7 +59,7 @@ roadmap.
 | TASK-0025 | TASK-0024 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Voice, KDE portal, PC control, and notification stabilization |
 | TASK-0026 | TASK-0025 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Reminders, memory, backup/restore, and data-lifecycle stabilization |
 | TASK-0027 | TASK-0026 | COMPLETE | YES | COMPLETE | PASSED (`pacman -U`/`-R` exercised as namespaced root; live system-database transaction NOT EXECUTED) | COMPLETE | Install, upgrade, remove, purge, and Arch package stabilization |
-| TASK-0028 | TASK-0027 | NOT STARTED | NO | NOT STARTED | — | — | Integrated desktop UI/UX and recovery acceptance |
+| TASK-0028 | TASK-0027 | COMPLETE | YES | COMPLETE | PASSED (live 1280x820 desktop pass on the real KDE Plasma 6 / Wayland session, keyboard-driven, against an isolated scratch data home) | PENDING USER | Integrated desktop UI/UX and recovery acceptance |
 | TASK-0029 | TASK-0028 | NOT STARTED | NO | NOT STARTED | — | — | Full regression, security, CI, and release-candidate hardening |
 | TASK-0030 | TASK-0029 | NOT STARTED | NO | NOT STARTED | — | — | Final version 1.0 acceptance, release evidence, and handoff |
 
@@ -2474,10 +2474,22 @@ roadmap.
   <code>gtk3</code>). The only source change outside the new test module is the
   two-line <code>#[cfg(test)] mod install_package_acceptance;</code> registration
   in <code>src/lib.rs</code>
-- Git closure: <code>COMPLETE</code>. User commit
+- Git closure: <code>COMPLETE</code>. Two user commits carry the task, both
+  identified from actual Git history rather than from their messages.
   <code>3be4711a7a99d2ec15c92305cbfef501c574f0e8</code> (<code>task27</code>)
-  carries the Slice 1–7 scope above, identified from actual Git history rather
-  than from its message. It is the checked-out <code>HEAD</code>, reachable from
+  carries the Slice 1–7 scope above and
+  <code>b08a2732f825f449ac97bd2f07e202785cd04bf0</code> (<code>task27</code>)
+  carries the Slice 8–10 <code>pacman</code>-transaction scope
+  (<code>CURRENT_STATE.md</code>, <code>planning/TASK_STATUS.md</code>,
+  <code>scripts/check-packaging.sh</code>,
+  <code>scripts/pacman-transaction-test.sh</code>,
+  <code>scripts/verify-full.sh</code>,
+  <code>src-tauri/src/install_package_acceptance.rs</code>). Verified at the
+  TASK-0028 preflight: <code>b08a273</code> is the checked-out <code>HEAD</code>,
+  <code>3be4711</code> is its ancestor, both are reachable from
+  <code>origin/main</code>, <code>main</code> and <code>origin/main</code> are at
+  zero ahead / zero behind, and the tree was clean. Backfilled during the
+  approved TASK-0028 Phase B. It is the checked-out <code>HEAD</code>, reachable from
   <code>origin/main</code>, with <code>main</code> and <code>origin/main</code> at
   zero ahead / zero behind and a clean tree at the continuation preflight. Its ten
   changed paths (<code>.gitignore</code>, <code>CURRENT_STATE.md</code>,
@@ -2560,6 +2572,127 @@ roadmap.
   hooks, and its file-conflict surface are therefore not represented. Everything
   the package itself controls — payload, metadata, dependencies, scriptlet
   behaviour, and removal — is now proven by a real transaction
+
+## TASK-0028 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch: <code>main</code>; starting HEAD
+  <code>b08a2732f825f449ac97bd2f07e202785cd04bf0</code> (<code>task27</code>);
+  clean tree; <code>main</code> vs <code>origin/main</code> zero ahead / zero
+  behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0027. Its
+  implementation landed in two commits, <code>3be4711</code> (Slices 1–7) and
+  <code>b08a273</code> (Slices 8–10, the namespaced <code>pacman</code>
+  transaction test); <code>b08a273</code> is the checked-out HEAD and
+  <code>3be4711</code> is its ancestor, both reachable from
+  <code>origin/main</code>. Its Git closure evidence named only the first commit
+  and is backfilled to name both in this task. The v3.0 continuation package
+  tracker still lists TASK-0026 and TASK-0027 as <code>NOT STARTED</code>; actual
+  Git history and this repository tracker are the current truth and both record
+  them complete
+- Phase A outcome: <code>PHASE_A_READY</code>; approval: the v3.0 continuation
+  <code>RUN_PROMPT.txt</code> for TASK-0028 is the task-level approval to
+  inspect, plan, implement, and verify within its scope (no separate approval
+  phrase)
+- Live method and data safety: the shipped 1280x820 window was driven on the
+  real Arch / KDE Plasma 6 / Wayland session. Every instance ran against an
+  isolated scratch <code>XDG_DATA_HOME</code> / <code>XDG_CONFIG_HOME</code> /
+  <code>XDG_CACHE_HOME</code>, using a first-run database and a
+  <code>sqlite3 .backup</code> copy of the operator's real database, so no
+  operator data was written and the real database was only read once, through
+  SQLite's own backup API. Navigation was driven <strong>by keyboard only</strong>
+  through the application's own focus order (a <code>/dev/uinput</code> keyboard,
+  with the KWin scripting API used first to assert that the application window
+  was the active window before every key batch), and each state was captured
+  with <code>spectacle</code>. An earlier absolute-pointer approach was abandoned
+  after it proved unreliable on this compositor; no pointer input was injected
+  for any recorded observation
+- Slice 1 — recovery state: <code>src/app/PersistenceStatusView.tsx</code> no
+  longer reuses <code>.app-shell</code>. That grid reserves its first column for
+  the sidebar, so its single <code>main</code> child was squeezed into a ~150px
+  column and the error code broke mid-word
+  (<code>DATABASE_CO&#8203;RRUPT</code>): a truthful report that read as a broken
+  screen. It now owns a centred <code>.status-shell</code> /
+  <code>.status-main</code> / <code>.status-panel</code> layout (new CSS in
+  <code>src/styles/shell.css</code>) with the cause in a wrapped monospace
+  <code>.status-detail</code> block
+- Slice 2 — bounded recovery action: <code>AppController</code> gained a
+  <code>bootstrapAttempt</code> counter in the bootstrap effect's dependencies
+  and a <code>retryPersistenceBootstrap</code> that clears the writer and
+  replays the same authoritative bootstrap. The live run showed the retry could
+  not recover a <em>startup</em> failure, because the backend opens the database
+  once in the Tauri <code>setup</code> hook and <code>PersistenceService</code>
+  holds that <code>Result</code> for the process lifetime. Fixing that is a
+  persistence-subsystem change this task does not own, so the renderer was made
+  honest instead: <code>onRetry</code> is passed only once the state has loaded
+  at least once, and a startup failure states that the database is opened once at
+  startup and the app must be restarted. Both branches were observed live
+- Slice 3 — clipped sidebar control: <code>.system-provider-select</code> was a
+  flex row whose label consumed most of a ~230px sidebar, truncating the select's
+  own value to <code>Co</code> so the active provider was unreadable. It is now a
+  grid with the label above the full-width control, and
+  <code>.system-status small</code> wraps instead of being ellipsised, so the
+  provider hint is legible. Verified live at 1280x820 and at 860x700, where the
+  sidebar collapses to a top bar
+- Slice 4 — contradictory projection: the Activity page showed
+  <em>Active agents 6 &middot; Working or reviewing</em> above <em>No agents are
+  currently working or reviewing</em>. The count is the backend's
+  <code>agents WHERE registry_state = 'active' AND status = 'Working'</code>
+  definition; the list required a Running/Under Review task. The list now
+  projects the same definition and both captions state it
+- Slice 5 — remaining page defects: two adjacent <code>&lt;small&gt;</code>
+  captions in a card body ran together on one line
+  (<em>…token contextModel capabilities…</em>), fixed by blocking
+  <code>.agent-card small</code>; the Reminders time-zone summary card broke the
+  IANA zone mid-word (<em>Europe/Amste rdam</em>) at the numeric value size,
+  fixed with a <code>summary-value-text</code> modifier; a first launch with no
+  offline voice engine reported a bare <code>ERROR</code> under
+  <em>Authoritative gateway lifecycle</em>, which now reads
+  <code>NOT INSTALLED</code> with the reason and next step beside it; the reset
+  panel leaked <em>physical purge belongs to TASK-0019</em> into shipped copy;
+  and four Settings range sliders had no accessible name, each now carrying a
+  real <code>&lt;label&gt;</code> and an <code>aria-describedby</code> hint
+- Slice 6 — regression coverage: new
+  <code>src/app/desktopUiAcceptance.test.tsx</code> (six composed scenarios)
+  drives the real <code>AppController</code> over a scripted desktop-client
+  double that throws on any command a scenario should not reach. It walks all
+  nine pages from a first-run window (own content rendered, no placeholder,
+  <code>aria-current</code> moved, keyboard focus moved to the new heading),
+  asserts the Activity page against the authoritative active-agent count,
+  asserts a startup failure renders as a bounded report with no application
+  chrome, no <code>.app-shell</code> and no unusable retry, drives a post-load
+  write failure through the recovery screen and back into the working window on
+  the page the operator was on, asserts a restart re-reads authoritative state,
+  and runs <code>axe</code> on every page (which is what found the unnamed
+  sliders). Four stylesheet-contract assertions were added to
+  <code>src/styles/responsive.test.ts</code> and four cases to
+  <code>src/app/PersistenceStatusView.test.tsx</code>
+- Slice 7 — documentation: this evidence section, the TASK-0027 Git-closure
+  backfill, the tracker row, the TASK-0028 <code>CURRENT_STATE.md</code>
+  paragraph, and the known-gaps reassignment
+- Live observations (rebuilt binary, <code>npm run tauri -- build --no-bundle</code>):
+  all nine pages at 1280x820 in a first-run window and against the copied
+  populated database; the recovery screen in both its retryable and
+  startup-failure forms; the Voice page's <code>NOT INSTALLED</code> state on a
+  clean first run; the Reminders, Models, Activity and Settings fixes; the
+  narrow 860x700 layout; and the tray/window lifecycle — closing the window
+  leaves the process running with no mapped window and relaunching reuses the
+  same process through the single-instance plugin and restores the window
+- Not executed, and not claimed: backup export / import / reset were not run
+  through the GUI, because they mutate data; no spoken command was driven
+  through the voice → gateway → portal path; and no pointer input was injected
+- Verification gate: <code>npm run verify:full</code> — frontend 26 files /
+  96 tests passed (from 25 / 83), 7 Python tests, rustfmt clean, 293 locked
+  offline Rust tests passed with 8 ignored (unchanged: no backend source
+  changed), Clippy clean with warnings denied, <code>npm run build</code> 71
+  modules, both npm audits clean, license gate, packaging validation, the staged
+  install/upgrade/remove/keep-data/purge test, and the namespaced
+  <code>pacman -U</code> / <code>-R</code> transaction test (36 checks). Rust
+  advisory status remains <strong>indeterminate</strong> locally because
+  <code>cargo-audit</code> / <code>cargo-deny</code> are not installed; CI
+  requires them under <code>VERIFY_STRICT=1</code>
+- Git closure: <code>PENDING USER</code>
 
 ## Successor-preflight closure rule
 

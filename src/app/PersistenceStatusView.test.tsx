@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
 import { PersistenceStatusView } from "./PersistenceStatusView";
 
 describe("PersistenceStatusView", () => {
@@ -30,6 +31,51 @@ describe("PersistenceStatusView", () => {
     expect(screen.queryByRole("navigation")).toBeNull();
     expect(screen.queryByRole("button")).toBeNull();
     expect(screen.queryByRole("combobox")).toBeNull();
+  });
+
+  it("lays itself out on its own shell instead of the sidebar grid column", () => {
+    render(<PersistenceStatusView phase="error" message="DATABASE_CORRUPT" />);
+
+    // `.app-shell` reserves its first grid column for the sidebar; a single
+    // child would be squeezed into it and the report would read as a broken
+    // screen rather than as a failure report.
+    expect(document.querySelector(".app-shell")).toBeNull();
+    expect(document.querySelector(".status-shell")).not.toBeNull();
+    expect(document.querySelector(".status-detail")?.textContent).toBe(
+      "DATABASE_CORRUPT",
+    );
+  });
+
+  it("offers exactly one bounded recovery action when a retry is available", async () => {
+    const user = userEvent.setup();
+    const onRetry = vi.fn();
+    render(
+      <PersistenceStatusView
+        phase="error"
+        message="DATABASE_LOCKED"
+        onRetry={onRetry}
+      />,
+    );
+
+    const buttons = screen.getAllByRole("button");
+    expect(buttons.map((button) => button.textContent)).toEqual(["Try again"]);
+    expect(screen.queryByRole("navigation")).toBeNull();
+    expect(screen.queryByRole("combobox")).toBeNull();
+
+    await user.click(buttons[0]);
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers no recovery action while the database is still opening", () => {
+    render(
+      <PersistenceStatusView
+        phase="loading"
+        message=""
+        onRetry={() => undefined}
+      />,
+    );
+
+    expect(screen.queryByRole("button")).toBeNull();
   });
 
   it("shows a non-alert loading status while the database opens", () => {

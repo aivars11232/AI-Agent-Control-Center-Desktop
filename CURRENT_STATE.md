@@ -1288,8 +1288,8 @@ A transaction against the <strong>live system pacman database</strong>
 installed package set, its own pacman hooks, and its file-conflict surface are
 therefore not represented.
 
-<code>npm run verify:fast</code> passed with 25 frontend files /
-83 tests, 7 Python tests, rustfmt, and 293 locked/offline Rust tests (8 ignored);
+<code>npm run verify:fast</code> passed with 26 frontend files /
+96 tests, 7 Python tests, rustfmt, and 293 locked/offline Rust tests (8 ignored);
 <code>npm run verify:full</code> repeated those, built 71 modules, passed Clippy
 with warnings denied, the shell (<code>shellcheck</code> clean) / Python /
 strict-JSON checks, both npm audits with zero vulnerabilities, the license gate,
@@ -1297,6 +1297,75 @@ packaging validation (now including a <code>namcap</code> gate over the PKGBUILD
 and the built package, and a release-version parity gate across every shipped
 manifest), the staged install/upgrade/remove/keep-data/purge test, and the
 namespaced <code>pacman -U</code> / <code>-R</code> transaction test.
+
+TASK-0028 stabilized the integrated desktop UI/UX and recovery states. The
+window was driven on the real Arch / KDE Plasma 6 / Wayland session at the
+shipped 1280x820 size, against an isolated scratch <code>XDG_DATA_HOME</code>
+(a first-run database and a <code>sqlite3 .backup</code> copy of the real one),
+so no operator data was read or written by the pass. Navigation was driven by
+the keyboard only, through the application's own focus order, and every page was
+captured with <code>spectacle</code>. Eight defects were found live and fixed;
+seven were re-observed fixed in a rebuilt binary, and the eighth (unnamed range
+sliders) is proven by <code>axe</code> in the deterministic matrix:
+
+- the persistence failure/recovery screen reused <code>.app-shell</code>, whose
+  first grid column is reserved for the sidebar, so a single <code>main</code>
+  child was squeezed into a ~150px column and the error code broke mid-word
+  (<code>DATABASE_CO&#8203;RRUPT</code>) — a truthful report that read as a broken
+  screen, with no recovery affordance. It now owns a centred
+  <code>.status-shell</code> layout, states the cause in a wrapped monospace
+  block, and offers a bounded retry;
+- the sidebar AI-provider <code>select</code> shared one flex row with its label
+  inside a ~230px sidebar and truncated its own value to <code>Co</code>, so the
+  active provider was unreadable; the label now sits above the control and the
+  provider hint wraps instead of being ellipsised;
+- the Activity page contradicted its own headline number, showing
+  <em>Active agents 6 &middot; Working or reviewing</em> above <em>No agents are
+  currently working or reviewing</em>: the count is the backend's
+  <code>status = 'Working'</code> definition while the list required a
+  Running/Under Review task. The list now projects the same definition;
+- two adjacent <code>&lt;small&gt;</code> captions in a card body rendered on one
+  line (<em>…token contextModel capabilities…</em>);
+- the Reminders time-zone summary card broke the IANA zone mid-word
+  (<em>Europe/Amste rdam</em>) at the numeric value size and grew past its row;
+- a first launch with no offline voice engine installed reported a bare
+  <code>ERROR</code> under <em>Authoritative gateway lifecycle</em>; that
+  expected, recoverable condition now reads <code>NOT INSTALLED</code> with the
+  reason and the next step beside it;
+- the reset panel leaked an internal roadmap identifier
+  (<em>physical purge belongs to TASK-0019</em>) into shipped copy;
+- four Settings range sliders had no accessible name, which
+  <code>axe</code> reports as a <code>label</code> violation; each now carries a
+  real <code>&lt;label&gt;</code> and an <code>aria-describedby</code> hint.
+
+Live retry exposed a real limitation that this task does not own: the backend
+opens the application database once, in the Tauri <code>setup</code> hook, and
+<code>PersistenceService</code> keeps that <code>Result</code> for the process
+lifetime, so a renderer retry after a <em>startup</em> open/validation failure
+replays the same stored error. Rather than offer an action that cannot work, the
+recovery screen offers the retry only for a failure raised after the state had
+already loaded once, and a startup failure states plainly that the database is
+opened once at startup and the app must be restarted. Both branches were
+observed live.
+
+Regression coverage is <code>src/app/desktopUiAcceptance.test.tsx</code>: six
+composed scenarios that drive the real <code>AppController</code> over a
+scripted desktop-client double which throws on any command the scenario should
+not reach. They walk all nine pages from a first-run window asserting each
+renders its own content, moves <code>aria-current</code>, and moves keyboard
+focus to the new heading; assert the Activity page against the authoritative
+active-agent count; assert a startup failure renders as a bounded report with no
+application chrome, no <code>.app-shell</code>, and no unusable retry; drive a
+post-load write failure through the recovery screen and back into the working
+window on the page the operator was on; assert a restart re-reads authoritative
+state instead of reusing the previous render; and run <code>axe</code> on every
+page. Four stylesheet-contract assertions pin the shell layout fixes.
+
+The tray/window lifecycle was observed live: closing the window leaves the
+process running with no mapped window, and relaunching the binary reuses the
+same process through the single-instance plugin and restores the 1280x820
+window. The narrow layout was checked at 860x700, where the sidebar collapses to
+a top bar and the provider control stays fully readable.
 
 <code>cargo-audit</code> and <code>cargo-deny</code> are not installed on the
 development machine, so <code>verify:full</code> reports the Rust advisory
@@ -1315,10 +1384,11 @@ gates mandatory for the branch.
 | Live Ollama connectivity, installed-model behavior, cancellation, and packaged-platform acceptance | TASK-0020 |
 | Live core-specialist provider, hosted-search, structured-result, and adapter-limit acceptance | TASK-0020 |
 | Live installed reminder timer/tray, XDG notification portal, restart, and DST acceptance (deterministic S7 green; notification sink live re-confirmed 2026-08-30) | TASK-0020 |
-| Full running-GUI data-lifecycle path (reminders / memory / backup / reset UI) — deterministic S7 green | TASK-0028 |
+| Executing backup export / import / reset through the running GUI (the reminders, backup and reset screens were live-rendered and inspected at 1280x820 under TASK-0028; the operations themselves were not run, because they mutate real data) | TASK-0030 |
 | `pacman -U` / packaged-binary smoke / `pacman -R` against the **live system package database** (needs a root password; the same transactions are proven as namespaced root by `scripts/pacman-transaction-test.sh`, and deterministic S8, the namcap-clean built package, and the live user-local install/upgrade/keep-data/purge/restore with no PlasmaShell restart are all green) | TASK-0030 |
 | Installed WebView, packaged accessibility, and live platform acceptance | TASK-0020 |
-| Live restored-session (app-restart restore-token reuse) and full GUI voice → gateway → portal-dispatch integration (deterministic S6 green; portal grant + input + release and offline listener live-verified 2026-08-30) | TASK-0028 / TASK-0030 |
+| Live restored-session (app-restart restore-token reuse) and full GUI voice → gateway → portal-dispatch integration (deterministic S6 green; portal grant + input + release and offline listener live-verified 2026-08-30; TASK-0028 live-verified the tray/window restart lifecycle and the voice page's own states, not a spoken command through the portal) | TASK-0030 |
+| Backend recovery from a startup database open/validation failure without restarting the process (`PersistenceService` holds the single `StateRepository` result for the process lifetime; the recovery screen reports this truthfully instead of offering a retry that cannot work) | TASK-0029 |
 | Full sequential live acceptance and production gate | TASK-0020 |
 
 See [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for exact sequencing.

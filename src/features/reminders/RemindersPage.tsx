@@ -243,7 +243,7 @@ export function RemindersPage({
         <article className="summary-card"><span>Scheduled</span><strong>{snapshot.items.filter((item) => item.status === "scheduled").length}</strong><small>Waiting on local time</small></article>
         <article className="summary-card"><span>Due in 24 hours</span><strong>{dueSoon}</strong><small>Excludes overdue items</small></article>
         <article className="summary-card"><span>Overdue</span><strong>{overdue}</strong><small>Missed occurrences stay explicit</small></article>
-        <article className="summary-card"><span>Time zone</span><strong>{snapshot.systemTimeZone ?? "Unavailable"}</strong><small>Each item retains its IANA zone</small></article>
+        <article className="summary-card"><span>Time zone</span><strong className="summary-value-text">{snapshot.systemTimeZone ?? "Unavailable"}</strong><small>Each item retains its IANA zone</small></article>
       </section>
 
       <section className="panel">

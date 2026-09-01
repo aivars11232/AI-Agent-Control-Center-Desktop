@@ -149,7 +149,16 @@ export function AppController() {
     desktopRuntime ? "loading" : "ready",
   );
   const [persistenceMessage, setPersistenceMessage] = useState("");
+  // Bumped by the recovery screen's retry action. It is the only dependency
+  // that re-runs the authoritative bootstrap, so a retry replays exactly the
+  // same backend load rather than reconstructing state in the renderer.
+  const [bootstrapAttempt, setBootstrapAttempt] = useState(0);
   const persistenceWriter = useRef<ApplicationStateWriter | null>(null);
+  // Whether the authoritative state has loaded at least once in this process.
+  // A failure before that is a startup failure: the backend opens the database
+  // once at startup, so a renderer retry would replay the same stored error and
+  // must not be offered.
+  const hasLoadedOnce = useRef(false);
   const suppressNextPersistenceWrite = useRef(false);
   const [agentRegistrySnapshot, setAgentRegistrySnapshot] =
     useState<AgentRegistrySnapshot | null>(null);
@@ -796,11 +805,24 @@ export function AppController() {
     return () => {
       active = false;
     };
-  }, [desktopRuntime]);
+  }, [desktopRuntime, bootstrapAttempt]);
+
+  function retryPersistenceBootstrap() {
+    if (persistencePhase !== "error") {
+      return;
+    }
+    persistenceWriter.current = null;
+    setPersistenceMessage("");
+    setPersistencePhase("loading");
+    setBootstrapAttempt((attempt) => attempt + 1);
+  }
 
   useEffect(() => {
     if (persistencePhase === "hydrating") {
       setPersistencePhase("ready");
+    }
+    if (persistencePhase === "ready") {
+      hasLoadedOnce.current = true;
     }
   }, [persistencePhase]);
 
@@ -1367,6 +1389,9 @@ export function AppController() {
       <PersistenceStatusView
         phase={persistencePhase}
         message={persistenceMessage}
+        onRetry={
+          hasLoadedOnce.current ? retryPersistenceBootstrap : undefined
+        }
       />
     );
   }

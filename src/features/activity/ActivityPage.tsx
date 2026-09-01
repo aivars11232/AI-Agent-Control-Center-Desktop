@@ -95,12 +95,14 @@ export function ActivityPage({
       }))
     : localActivity;
 
-  const activeAgents = agents.filter((agent) =>
-    agent.tasks.some(
-      (task) =>
-        task.status === "Running" ||
-        task.status === "Under Review",
-    ),
+  const activeAgents = agents.filter(
+    (agent) =>
+      agent.status === "Working" ||
+      agent.tasks.some(
+        (task) =>
+          task.status === "Running" ||
+          task.status === "Under Review",
+      ),
   );
 
   const blockedAgents = agents.filter((agent) =>
@@ -244,7 +246,7 @@ export function ActivityPage({
           <strong>
             {monitoringSnapshot?.counts.activeAgents ?? activeAgents.length}
           </strong>
-          <small>Working or reviewing</small>
+          <small>Marked working or running a task</small>
         </article>
 
         <article className="summary-card">
@@ -318,7 +320,7 @@ export function ActivityPage({
 
         {activeAgents.length === 0 ? (
           <p className="page-message">
-            No agents are currently working or reviewing.
+            No agent is marked working and no task is running or under review.
           </p>
         ) : (
           <div className="agent-list">

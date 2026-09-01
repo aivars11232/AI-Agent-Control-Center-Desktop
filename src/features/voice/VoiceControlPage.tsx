@@ -217,6 +217,30 @@ export function VoiceControlPage({
 
   submitCommandRef.current = submitCommand;
 
+  const commandStatus = (() => {
+    if (voiceUiState !== "ERROR") {
+      return {
+        label: voiceUiState,
+        detail: "Authoritative gateway lifecycle",
+        long: false,
+      };
+    }
+    if (voiceRuntime && !voiceRuntime.installed) {
+      return {
+        label: "NOT INSTALLED",
+        detail:
+          "The offline voice engine is not installed yet. Install it below to"
+          + " use spoken commands; typed commands already work.",
+        long: true,
+      };
+    }
+    return {
+      label: "ERROR",
+      detail: message || "The last command did not complete.",
+      long: false,
+    };
+  })();
+
   useEffect(() => {
     if (!isDesktopRuntime()) return;
     let active = true;
@@ -655,8 +679,10 @@ export function VoiceControlPage({
         </article>
         <article className="summary-card">
           <span>Command status</span>
-          <strong>{voiceUiState}</strong>
-          <small>Authoritative gateway lifecycle</small>
+          <strong className={commandStatus.long ? "summary-value-text" : undefined}>
+            {commandStatus.label}
+          </strong>
+          <small>{commandStatus.detail}</small>
         </article>
       </section>
 
