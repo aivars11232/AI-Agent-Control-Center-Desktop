@@ -74,10 +74,22 @@ version, so the metadata cannot silently regress to a development build.
 The candidate's only CI run before this task, `33553945326` on `f87effb`, was
 **red**: the axe scenario exceeded Vitest's implicit 5000 ms default on the
 runner. TASK-0029's final gate had been run locally only, so the release
-candidate had never had a green branch gate. That is fixed and covered by a new
-S10 scenario. The green run for this release is the one triggered by pushing the
-TASK-0030 commit; its result is recorded in `planning/TASK_STATUS.md` rather than
-predicted here.
+candidate had never had a green branch gate.
+
+Run **`33631329331`** on the release commit `cc552ab` is **green**, all six jobs:
+
+```
+frontend 42s · rust 1m45s · scripts 17s · licenses 25s · secrets 11s · packaging 8m6s
+```
+
+This is the first fully executed branch gate on a release candidate. The six jobs
+form one ordered `needs:` chain, so while `frontend` was failing — from TASK-0027
+through TASK-0029, three consecutive pushes — `licenses`, `secrets` and
+`packaging` never started at all: `cargo-deny`, the third-party license gate,
+`gitleaks`, and the Arch `makepkg` / `namcap` / staged-install job produced no
+result. Those gates were dark, not passing. This run is the first on which every
+one of them actually ran, including the full `archlinux:latest` container build
+of the 1.0.0 package.
 
 ## Not done
 

@@ -61,7 +61,7 @@ roadmap.
 | TASK-0027 | TASK-0026 | COMPLETE | YES | COMPLETE | PASSED (`pacman -U`/`-R` exercised as namespaced root; live system-database transaction NOT EXECUTED) | COMPLETE | Install, upgrade, remove, purge, and Arch package stabilization |
 | TASK-0028 | TASK-0027 | COMPLETE | YES | COMPLETE | PASSED (live 1280x820 desktop pass on the real KDE Plasma 6 / Wayland session, keyboard-driven, against an isolated scratch data home) | COMPLETE (<code>0a43046</code> "task28"; backfilled by TASK-0029 Phase B) | Integrated desktop UI/UX and recovery acceptance |
 | TASK-0029 | TASK-0028 | COMPLETE | YES | COMPLETE | PASSED (<code>VERIFY_STRICT=1 npm run verify:full</code> green with zero skips and zero warnings; Rust advisory status <strong>PASSED</strong> rather than indeterminate for the first time; live-system-database <code>pacman</code> still NOT EXECUTED, unchanged from TASK-0027) | COMPLETE (<code>f87effb</code> "task29"; backfilled by TASK-0030 Phase B from verified history) | Full regression, security, CI, and release-candidate hardening |
-| TASK-0030 | TASK-0029 | COMPLETE | YES | COMPLETE | PASSED (condensed live acceptance on real Arch / KDE Plasma 6 / Wayland; <code>PATH=$HOME/.cargo/bin:$PATH VERIFY_STRICT=1 npm run verify:full</code> exit 0 with zero skips and Rust advisory status PASSED; live-system-database <code>pacman -U</code>/<code>-R</code> EXECUTED at last; two cases recorded as exceptions rather than waived — Codex bounded-run BLOCKED by an external usage limit, spoken-voice pipeline NOT EXECUTED) | PENDING USER | Final version 1.0 acceptance, release evidence, and handoff |
+| TASK-0030 | TASK-0029 | COMPLETE | YES | COMPLETE | PASSED (branch CI 33631329331 green, all six jobs; condensed live acceptance on real Arch / KDE Plasma 6 / Wayland; <code>PATH=$HOME/.cargo/bin:$PATH VERIFY_STRICT=1 npm run verify:full</code> exit 0 with zero skips and Rust advisory status PASSED; live-system-database <code>pacman -U</code>/<code>-R</code> EXECUTED at last; two cases recorded as exceptions rather than waived — Codex bounded-run BLOCKED by an external usage limit, spoken-voice pipeline NOT EXECUTED) | COMPLETE (cc552ab) | Final version 1.0 acceptance, release evidence, and handoff |
 
 ## TASK-0001 evidence
 
@@ -2980,7 +2980,20 @@ roadmap.
 - Evidence directory: <code>planning/acceptance/</code> — final matrix, release
   evidence, known limitations, and owner handoff
 - No tag, GitHub release, publish, or external distribution step was performed
-- Git closure: <code>PENDING USER</code>
+- Branch CI: run <code>33631329331</code> on the release commit
+  <code>cc552ab</code> is <strong>green</strong>, all six jobs — frontend 42s,
+  rust 1m45s, scripts 17s, licenses 25s, secrets 11s, packaging 8m6s. This is the
+  first fully executed branch gate on a release candidate: because the jobs form
+  one ordered <code>needs:</code> chain, the red <code>frontend</code> job from
+  TASK-0027 through TASK-0029 meant <code>licenses</code>, <code>secrets</code>
+  and <code>packaging</code> never started, so <code>cargo-deny</code>, the
+  license gate, <code>gitleaks</code> and the Arch container build produced no
+  result at all across three pushes
+- Git closure: <code>COMPLETE</code>. Implementation commit <code>cc552ab</code>
+  (<code>Record final 1.0 acceptance and release evidence</code>), pushed to
+  <code>origin/main</code>, branch and remote aligned zero ahead / zero behind,
+  working tree clean, branch CI green. TASK-0020 and TASK-0030 both close here;
+  neither has a successor to backfill them
 
 ## Successor-preflight closure rule
 
