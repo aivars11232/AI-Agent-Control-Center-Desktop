@@ -2312,6 +2312,70 @@ async fn choose_workspace_folder() -> Result<Option<String>, String> {
         .map_err(|_| "The folder picker stopped unexpectedly.".to_string())?
 }
 
+/// Write an exported backup to a location the operator picks in a native save
+/// dialog.
+///
+/// The renderer previously saved through a `Blob` + `<a download>` click. The
+/// Linux webview is WebKitGTK, which does perform that download — into the
+/// process's current working directory. The desktop entry sets no `Path=`, so
+/// the destination was whatever CWD the launcher happened to supply, the
+/// operator was never told where the file went, and they could not choose. The
+/// bytes therefore leave the renderer through this command instead, which
+/// reports the real path back.
+///
+/// The destination is chosen in `kdialog`, not supplied by the renderer, so a
+/// forged IPC payload cannot direct a write at an arbitrary path. The suggested
+/// name is reduced to its final component for the same reason.
+fn save_backup_file_sync(file_name: String, backup_json: String) -> Result<Option<String>, String> {
+    let suggested = Path::new(&file_name)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "ai-agent-control-center-backup.json".to_string());
+    let start_directory = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+
+    let Some(kdialog) = find_in_path("kdialog").or_else(|| {
+        let path = PathBuf::from("/usr/bin/kdialog");
+        is_executable_file(&path).then_some(path)
+    }) else {
+        return Err(
+            "KDE's `kdialog` save dialog is not installed, so the backup could not be written."
+                .to_string(),
+        );
+    };
+
+    let output = Command::new(kdialog)
+        .arg("--getsavefilename")
+        .arg(start_directory.join(&suggested))
+        .arg("application/json")
+        .args(["--title", "Save the AI Agent Control Center backup"])
+        .output()
+        .map_err(|error| format!("Could not open the KDE save dialog: {error}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let destination = command_text(&output.stdout);
+    if destination.is_empty() {
+        return Ok(None);
+    }
+
+    fs::write(&destination, backup_json.as_bytes())
+        .map_err(|error| format!("Could not write the backup to {destination}: {error}"))?;
+    Ok(Some(destination))
+}
+
+#[tauri::command]
+async fn save_backup_file(
+    file_name: String,
+    backup_json: String,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || save_backup_file_sync(file_name, backup_json))
+        .await
+        .map_err(|_| "The save dialog stopped unexpectedly.".to_string())?
+}
+
 #[tauri::command]
 async fn run_coordinator_snapshot(
     persistence: State<'_, PersistenceService>,
@@ -5563,6 +5627,7 @@ pub fn run() {
             provider_registry_status,
             run_coordinator_snapshot,
             choose_workspace_folder,
+            save_backup_file,
             cancel_agent_run,
             open_workspace_item,
             submit_voice_intent,

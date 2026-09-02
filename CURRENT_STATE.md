@@ -108,8 +108,9 @@ rollback and no longer restarts PlasmaShell; a <code>packaging/PKGBUILD</code>
 builds the Arch system package. A sequential <code>.github/workflows/ci.yml</code>
 gate runs frontend, Rust, script, dependency-advisory, license, secret, and
 Arch-packaging checks with no live AI/microphone/portal/system action and no
-release step. The application version stays <code>0.5.1</code> and remains
-development / pre-production until TASK-0020.
+release step. At the time of TASK-0019 the version was <code>0.5.1</code> and
+the application was pre-production; TASK-0030 later ran the final acceptance and
+promoted it to <code>1.0.0</code>.
 
 TASK-0019 did **not** run a live Codex task, Ollama, hosted web search, or
 another model/provider; capture microphone input; start the Python listener;
@@ -128,17 +129,17 @@ fresh result.
 | Fact | Current evidence |
 | --- | --- |
 | Product | AI Agent Control Center |
-| Version | <code>0.5.1</code> in <code>package.json</code> and <code>src-tauri/tauri.conf.json</code> |
+| Version | <code>1.0.0</code> in <code>package.json</code>, <code>package-lock.json</code>, <code>src-tauri/Cargo.toml</code>, <code>src-tauri/Cargo.lock</code>, <code>src-tauri/tauri.conf.json</code>, <code>packaging/PKGBUILD</code>, and the AppStream metainfo |
 | License | Proprietary — <code>LicenseRef-proprietary</code>, root <code>LICENSE</code>; third-party components in <code>THIRD-PARTY-NOTICES.md</code> |
 | Repository | <code>https://github.com/aivars11232/AI-Agent-Control-Center-Desktop</code> in <code>package.json</code> and <code>src-tauri/Cargo.toml</code> |
-| Release state | Development/pre-production prototype |
+| Release state | Released 1.0.0; live acceptance and release gate passed under TASK-0030 |
 | Primary platform direction | Arch Linux, KDE Plasma, and Wayland |
 | Frontend | React 19, TypeScript, and Vite |
 | Desktop backend | Tauri 2 and Rust |
 | Persistence dependency | <code>rusqlite 0.32.1</code> using the platform SQLite library |
 | AI execution paths | Installed Codex CLI and local Ollama |
 | Mandatory paid API key | None in the current Codex/Ollama execution design |
-| Production gate | TASK-0020, not yet reached |
+| Production gate | Passed. TASK-0020's intent was completed through the TASK-0021 - TASK-0030 continuation; evidence in <code>planning/acceptance/</code> |
 
 ## Repository shape
 
@@ -1495,24 +1496,28 @@ runs, including one before and one after the lockfile correction, so the
 browserslist bump provably did not change the shipped artifact. The package
 archive hash differs between runs only because it embeds its own build date.
 
-The release version stays <strong>0.5.1</strong> and the AppStream release stays
-<code>type="development"</code>. Promoting to 1.0 is TASK-0030's decision, not a
-hardening side effect.
+Those were the TASK-0029 candidate artifacts at version <strong>0.5.1</strong>.
+TASK-0030 ran the final acceptance, recorded the release decision, and promoted
+the version to <strong>1.0.0</strong> with the AppStream release marked
+<code>type="stable"</code>.
 
 ## Known gaps and roadmap ownership
 
-| Gap | Owning task |
+The TASK-0020 release gate closed under TASK-0030 on 2026-09-02. The gaps that
+gate owned were either executed or are recorded below as exceptions with their
+exact reason. Full evidence is in [planning/acceptance/](planning/acceptance/).
+
+| Gap | State |
 | --- | --- |
-| Live Codex compatibility, authentication, model, and packaged-platform acceptance | TASK-0020 |
-| Live Ollama connectivity, installed-model behavior, cancellation, and packaged-platform acceptance | TASK-0020 |
-| Live core-specialist provider, hosted-search, structured-result, and adapter-limit acceptance | TASK-0020 |
-| Live installed reminder timer/tray, XDG notification portal, restart, and DST acceptance (deterministic S7 green; notification sink live re-confirmed 2026-08-30) | TASK-0020 |
-| Executing backup export / import / reset through the running GUI (the reminders, backup and reset screens were live-rendered and inspected at 1280x820 under TASK-0028; the operations themselves were not run, because they mutate real data) | TASK-0030 |
-| `pacman -U` / packaged-binary smoke / `pacman -R` against the **live system package database** (needs a root password; the same transactions are proven as namespaced root by `scripts/pacman-transaction-test.sh`, and deterministic S8, the namcap-clean built package, and the live user-local install/upgrade/keep-data/purge/restore with no PlasmaShell restart are all green) | TASK-0030 |
-| Installed WebView, packaged accessibility, and live platform acceptance | TASK-0020 |
-| Live restored-session (app-restart restore-token reuse) and full GUI voice → gateway → portal-dispatch integration (deterministic S6 green; portal grant + input + release and offline listener live-verified 2026-08-30; TASK-0028 live-verified the tray/window restart lifecycle and the voice page's own states, not a spoken command through the portal) | TASK-0030 |
-| Backend recovery from a startup database open/validation failure without restarting the process (`PersistenceService` holds the single `StateRepository` result for the process lifetime; the recovery screen reports this truthfully instead of offering a retry that cannot work). TASK-0029 examined the change and did not make it: it is a persistence-subsystem feature whose owning scope, TASK-0022, is closed, and TASK-0029 may not reopen finished design work. Restarting the application recovers, with no data loss and no security consequence, so it is carried as a recorded 1.0 limitation | TASK-0030 |
-| Full sequential live acceptance and production gate | TASK-0020 |
+| Live Codex bounded-run completion with truthful zero-change evidence | **BLOCKED (external).** The account's ChatGPT Codex usage limit was exhausted, resetting 2026-09-07; verified outside the application. Codex identity, containment, cancellation, and typed failure were all observed live |
+| Spoken microphone command through the full GUI voice → gateway → portal pipeline | **NOT EXECUTED.** Needs a human voice. The offline listener, the intent gateway, and portal grant/input/release are each covered deterministically and, for the portal, live |
+| Backend recovery from a startup database open/validation failure without restarting the process | **Recorded 1.0 limitation.** `PersistenceService` holds one `StateRepository` result for the process lifetime; the recovery screen reports this truthfully instead of offering a retry that cannot work. Restarting recovers, with no data loss and no security consequence. Examined and deliberately not changed under TASK-0029 and TASK-0030 |
+| Live Ollama connectivity, cancellation, and packaged-platform acceptance | **Closed** by TASK-0030: 0.32.3, 5 models, bounded run and 21.98 ms cancellation |
+| Live reminder timer, XDG notification portal, and restart acceptance | **Closed** by TASK-0026 and TASK-0030 |
+| Executing backup export / import / reset through the running GUI | **Closed** by TASK-0030; all three executed, each gated by a trusted native dialog |
+| `pacman -U` / packaged-binary smoke / `pacman -R` against the live system package database | **Closed** by TASK-0030; per-user data survived removal as the install hook promises |
+| Installed WebView, packaged accessibility, and live platform acceptance | **Closed** by TASK-0028 and TASK-0030; the keyboard-reachability defect that acceptance exposed is fixed and regressed |
+| Full sequential live acceptance and production gate | **Closed** by TASK-0030; release decision GO, version 1.0.0 |
 
 See [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for exact sequencing.
 

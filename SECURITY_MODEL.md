@@ -1,8 +1,10 @@
 # Security Model
 
-> **Current status:** version 0.5.1 is a development prototype, not a hardened
-> or production-ready control plane. This document distinguishes checked-in
-> controls from planned security invariants. TASK-0004 establishes the
+> **Current status:** version 1.0.0 passed the sequential live acceptance and
+> release gate under TASK-0030, including live proof that a high-risk action
+> fails closed unless a trusted desktop confirmation outside the renderer is
+> answered. This document still distinguishes checked-in controls from planned
+> security invariants; treat anything marked planned as not yet enforced. TASK-0004 establishes the
 > backend-authoritative approval, action-policy, privileged IPC, and WebView
 > boundary. TASK-0005 establishes authoritative single-run coordination,
 > lifecycle recovery, and bounded ledger evidence. TASK-0006 establishes exact
@@ -615,6 +617,8 @@ workarounds before any code change.
 ## Ownership and release gate
 
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) assigns each gap to a task.
-Security-relevant work is not complete merely because its UI exists. TASK-0020
-must validate the integrated system sequentially before documentation may call
-the application production-ready.
+Security-relevant work is not complete merely because its UI exists. That
+sequential validation was completed through the TASK-0021 - TASK-0030
+continuation and is recorded in <code>planning/acceptance/</code>, including live
+evidence that approving a high-risk action requires a trusted desktop
+confirmation outside the renderer and fails closed when it is dismissed.

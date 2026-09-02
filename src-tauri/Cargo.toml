@@ -1,6 +1,6 @@
 [package]
 name = "ai-agent-control-center"
-version = "0.5.1"
+version = "1.0.0"
 description = "Desktop control center for managing AI agents"
 authors = ["Aivars Rocens"]
 # Proprietary project license (SPDX: LicenseRef-proprietary). Cargo's `license`

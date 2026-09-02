@@ -1,7 +1,7 @@
 # Implementation Plan
 
-This is the authoritative repository roadmap for evolving the version 0.5.1
-prototype into a release candidate. It preserves the current application and
+This is the authoritative repository roadmap that took the version 0.5.1
+prototype to the released version 1.0.0. It preserves the current application and
 uses twenty ordered, coherent tasks. Current implementation facts remain owned
 by [CURRENT_STATE.md](CURRENT_STATE.md); execution state is tracked in
 [planning/TASK_STATUS.md](planning/TASK_STATUS.md).
@@ -208,8 +208,12 @@ the following are recorded:
 - the exact tested commit and package are identified;
 - release evidence and the final worktree are clean.
 
-Until then, every project authority must call the application development or
-pre-production software.
+Every criterion above was recorded under TASK-0030 on 2026-09-02 and the gate
+passed, with two cases carried as explicitly recorded exceptions rather than
+waived: the Codex bounded-run completion case, blocked by an external ChatGPT
+usage limit, and a spoken microphone command through the full GUI pipeline,
+which needs a human voice. Neither indicates a product defect. The evidence is
+in [planning/acceptance/](planning/acceptance/).
 
 ## Continuation roadmap (version 3.0)
 

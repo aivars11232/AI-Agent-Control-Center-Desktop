@@ -1171,6 +1171,71 @@ fn s7_management_handoff_history_is_sequential_bounded_and_scoped() {
 }
 
 // ===========================================================================
+// ---------------------------------------------------------------------------
+// Scenario — an exported backup actually reaches the disk (TASK-0030)
+// ---------------------------------------------------------------------------
+
+/// The TASK-0030 live-acceptance defect, held as a structural test.
+///
+/// Every deterministic backup scenario above proves the *bytes* are correct, and
+/// they all passed while the shipped application put those bytes somewhere the
+/// operator could not predict. The renderer handed the export to a `Blob` +
+/// `<a download>` click; WebKitGTK performs that download into the process's
+/// current working directory, and the desktop entry sets no `Path=`, so the
+/// file landed wherever the launcher's CWD pointed. The operator was told a byte
+/// count and never a destination, and had no way to choose one.
+///
+/// No unit test could catch that: the failure lived in the hand-off from the
+/// renderer to the platform. This scenario pins the contract that closed it —
+/// the desktop export leaves through a backend command that writes the file to
+/// an operator-chosen path, never through a webview download.
+#[test]
+fn s7_desktop_backup_export_is_written_by_the_backend_not_a_webview_download() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repository root")
+        .to_path_buf();
+    let settings = std::fs::read_to_string(root.join("src/features/settings/SettingsPage.tsx"))
+        .expect("the settings page is shipped");
+
+    let desktop_branch = settings
+        .split_once("if (isDesktopRuntime()) {")
+        .expect("the export path must branch on the desktop runtime")
+        .1;
+    let desktop_branch = desktop_branch
+        .split_once("\n      }\n")
+        .expect("the desktop branch is terminated")
+        .0;
+
+    assert!(
+        desktop_branch.contains("onSaveBackup("),
+        "the desktop export must hand its bytes to the backend save command"
+    );
+    assert!(
+        !desktop_branch.contains("downloadBackup("),
+        "the desktop export must not rely on a webview download; WebKitGTK \
+         performs none, which is how a successful-looking export wrote no file"
+    );
+
+    // The command the renderer calls has to exist and be registered, or the
+    // export fails at runtime while every test above still passes.
+    let backend =
+        std::fs::read_to_string(root.join("src-tauri/src/lib.rs")).expect("the backend is shipped");
+    assert!(
+        backend.contains("async fn save_backup_file("),
+        "the backend must expose the backup save command"
+    );
+    assert!(
+        backend.contains("\n            save_backup_file,\n"),
+        "save_backup_file must be registered in the Tauri invoke handler"
+    );
+    // The destination comes from the native dialog, never from the renderer.
+    assert!(
+        backend.contains("--getsavefilename"),
+        "the save destination must come from the native dialog"
+    );
+}
+
 // Live (S7) — `#[ignore]`d. Re-confirms only the reminder notification sink.
 //
 //   cargo test --manifest-path src-tauri/Cargo.toml --lib \

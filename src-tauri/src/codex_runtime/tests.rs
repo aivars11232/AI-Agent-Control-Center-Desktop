@@ -347,6 +347,58 @@ fn task_0007_runtime_reports_nonzero_malformed_missing_final_and_output_limit() 
 }
 
 #[test]
+fn task_0030_runtime_surfaces_the_reason_codex_gave_for_a_failed_turn() {
+    // TASK-0030 live acceptance hit a Codex usage limit. The CLI said so, naming
+    // the reset time, but the runtime replaced every `turn.failed` with a fixed
+    // "Codex reported a failed turn." string, so the operator saw an
+    // unactionable error and no way to tell a quota stop from a crash.
+    let workspace = FixtureWorkspace::new();
+    let observer = Arc::new(RecordingObserver::default());
+
+    for (scenario, expected) in [
+        (
+            "turn_failed",
+            Some("You've hit your usage limit. Try again at Sep 7th, 2026 12:44 PM."),
+        ),
+        ("turn_failed_bare", Some("upstream refused the request")),
+        ("turn_failed_unlabelled", None),
+    ] {
+        let spec = specification(
+            inspection(scenario, None).launch().unwrap(),
+            &workspace,
+            "read",
+            "none",
+            false,
+            Duration::from_secs(3),
+        );
+        let error = run_codex(
+            &context(observer.clone(), Arc::new(AtomicBool::new(false))),
+            spec,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.code,
+            ProviderErrorCode::ExecutionFailed,
+            "scenario {scenario} stays a typed execution failure"
+        );
+        match expected {
+            Some(reason) => assert_eq!(
+                error.message,
+                format!("Codex reported a failed turn: {reason}"),
+                "scenario {scenario} must carry the reason Codex gave"
+            ),
+            // With nothing to quote the message stays exactly as it was, rather
+            // than inventing a reason.
+            None => assert_eq!(
+                error.message, "Codex reported a failed turn.",
+                "scenario {scenario} has no reason to surface"
+            ),
+        }
+    }
+}
+
+#[test]
 fn task_0007_containment_cleans_normal_and_detached_pipe_holding_descendants() {
     let workspace = FixtureWorkspace::new();
     for scenario in ["descendant", "detached_descendant"] {

@@ -31,6 +31,7 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROBE_BYTES: usize = 64 * 1024;
 const MAX_JSON_LINE_BYTES: usize = 64 * 1024;
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
+const MAX_FAILURE_REASON_CHARS: usize = 300;
 const MAX_CURATED_PROGRESS_EVENTS: usize = 64;
 
 type JsonLineHandler<'a> = dyn FnMut(&[u8]) -> Result<(), ProviderError> + 'a;
@@ -503,6 +504,45 @@ fn apply_environment(command: &mut Command, environment: &[(OsString, OsString)]
     }
 }
 
+/// The reason Codex gave for a failed turn, bounded for display.
+///
+/// `turn.failed` carries `error.message`; a bare `error` event carries
+/// `message`, and older builds put a plain string in `error`. All three are
+/// untrusted provider output, so the result is trimmed, stripped of control
+/// characters (a newline would break the single-line error surface), and capped.
+fn failure_reason(event: &Value) -> Option<String> {
+    let raw = event
+        .get("error")
+        .and_then(|error| error.get("message").and_then(Value::as_str))
+        .or_else(|| event.get("message").and_then(Value::as_str))
+        .or_else(|| event.get("error").and_then(Value::as_str))?;
+
+    let cleaned: String = raw
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let mut reason: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if reason.is_empty() {
+        return None;
+    }
+    if reason.chars().count() > MAX_FAILURE_REASON_CHARS {
+        reason = reason
+            .chars()
+            .take(MAX_FAILURE_REASON_CHARS)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        reason.push('\u{2026}');
+    }
+    Some(reason)
+}
+
 fn sanitized_path(binary: &Path) -> Option<OsString> {
     let parent = binary.parent()?;
     if matches!(
@@ -850,11 +890,19 @@ impl CodexJsonl {
                 }
             }
             "turn.failed" | "error" => {
+                // Codex states *why* the turn failed, and discarding it left the
+                // operator with an unactionable "failed turn": a usage-limit
+                // stop, which names the reset time, read exactly like a crash.
+                // The reason is provider output, so it is bounded and stripped
+                // of control characters before it reaches a message.
                 return Err(ProviderError::new(
                     ProviderErrorCode::ExecutionFailed,
-                    "Codex reported a failed turn.",
+                    match failure_reason(&event) {
+                        Some(reason) => format!("Codex reported a failed turn: {reason}"),
+                        None => "Codex reported a failed turn.".to_string(),
+                    },
                     true,
-                ))
+                ));
             }
             _ => {}
         }

@@ -216,6 +216,14 @@ beforeEach(() => {
   window.localStorage?.clear();
 });
 
+// A scenario that walks all nine pages is the slowest work in the deterministic
+// frontend gate, and Vitest's implicit 5 s default gave it no headroom: the axe
+// walk measured 5168 ms on the pinned CI runner and 2.5 s on the development
+// machine, so the gate's verdict turned on which machine ran it. These two
+// scenarios declare their own budget instead of inheriting a default that
+// encodes an assumption about host speed.
+const PAGE_WALK_TIMEOUT_MS = 30_000;
+
 describe("integrated desktop UI acceptance", () => {
   it("navigates every core page from a first-run window and projects a truthful state", async () => {
     scenario.envelope = envelopeFor(firstRunState());
@@ -243,7 +251,7 @@ describe("integrated desktop UI acceptance", () => {
       ).toBe("page");
       expect(document.activeElement).toBe(heading);
     }
-  });
+  }, PAGE_WALK_TIMEOUT_MS);
 
   it("keeps the Activity page consistent with the authoritative active-agent count", async () => {
     const state = populatedState();
@@ -365,6 +373,29 @@ describe("integrated desktop UI acceptance", () => {
     ).toBeTruthy();
   });
 
+  // TASK-0030 live acceptance: tabbing from "Export backup" landed on "Reset
+  // portable state", skipping the import control entirely. It was a `<label>`
+  // wrapping a `display: none` file input — a label is not focusable and the
+  // hidden input is outside the tab order, so restoring a backup was impossible
+  // without a pointer. axe did not catch it: a hidden input raises no violation,
+  // and the label had no interactive role to check.
+  it("keeps both backup controls reachable from the keyboard", async () => {
+    const user = userEvent.setup();
+    await renderReadyApp();
+    await navigateTo(user, "Settings");
+
+    const exportButton = screen.getByRole("button", { name: "Export backup" });
+    const importButton = screen.getByRole("button", { name: "Import backup" });
+
+    exportButton.focus();
+    expect(document.activeElement).toBe(exportButton);
+
+    // The very next tab stop must be the import control, not whatever follows
+    // it in the panel.
+    await user.tab();
+    expect(document.activeElement).toBe(importButton);
+  });
+
   it("passes deterministic axe rules on every core page", async () => {
     const user = userEvent.setup();
     const { container } = await renderReadyApp();
@@ -383,5 +414,5 @@ describe("integrated desktop UI acceptance", () => {
         ),
       ).toEqual([]);
     }
-  });
+  }, PAGE_WALK_TIMEOUT_MS);
 });

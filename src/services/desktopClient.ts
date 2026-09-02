@@ -429,6 +429,13 @@ export function createDesktopClient(
       return invokeFn<BackupExport>("export_backup");
     },
 
+    saveBackupFile(fileName: string, backupJson: string) {
+      return invokeFn<string | null>("save_backup_file", {
+        fileName,
+        backupJson,
+      });
+    },
+
     previewBackupImport(
       expectedRevision: number,
       backupJson: string,

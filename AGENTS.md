@@ -87,7 +87,9 @@ run install/remove scripts, or perform desktop/system-control actions.
 - Do not claim behavior, safety, compatibility, or production readiness that
   was not demonstrated. Use **indeterminate** when required evidence is absent.
 - Planned features must remain visibly planned in docs, tests, and reports.
-- Treat the application as development/pre-production until TASK-0020 passes.
+- The version 1.0.0 release gate passed under TASK-0030. Do not describe the
+  application as pre-production; do describe any specific behaviour that is
+  still unproven as unproven, and keep recorded 1.0 limitations visible.
 
 ## Git and closure
 

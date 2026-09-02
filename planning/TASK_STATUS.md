@@ -41,7 +41,7 @@ ready merely because its predecessor's code was edited.
 | TASK-0017 | TASK-0016 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Bounded Coding, Debugging, Browser, and Financial agent capabilities |
 | TASK-0018 | TASK-0017 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Reminder scheduler, structured memory, and management handoff workspaces |
 | TASK-0019 | TASK-0018 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Packaging, privacy-safe removal, release metadata, and CI security gates |
-| TASK-0020 | TASK-0019 | COMPLETE | YES | IN PROGRESS | BLOCKED (S3) | — | Sequential live acceptance and version 1.0 release gate |
+| TASK-0020 | TASK-0019 | COMPLETE | YES | COMPLETE | PASSED (fulfilled through the TASK-0021 – TASK-0030 continuation; the S3 blocker was repaired by TASK-0021/0022 and replayed green, and TASK-0030 recorded the final GO) | COMPLETE (recorded through the TASK-0030 release evidence, per the no-successor rule) | Sequential live acceptance and version 1.0 release gate |
 
 ## Continuation tracker (version 3.0)
 
@@ -60,8 +60,8 @@ roadmap.
 | TASK-0026 | TASK-0025 | COMPLETE | YES | COMPLETE | PASSED | COMPLETE | Reminders, memory, backup/restore, and data-lifecycle stabilization |
 | TASK-0027 | TASK-0026 | COMPLETE | YES | COMPLETE | PASSED (`pacman -U`/`-R` exercised as namespaced root; live system-database transaction NOT EXECUTED) | COMPLETE | Install, upgrade, remove, purge, and Arch package stabilization |
 | TASK-0028 | TASK-0027 | COMPLETE | YES | COMPLETE | PASSED (live 1280x820 desktop pass on the real KDE Plasma 6 / Wayland session, keyboard-driven, against an isolated scratch data home) | COMPLETE (<code>0a43046</code> "task28"; backfilled by TASK-0029 Phase B) | Integrated desktop UI/UX and recovery acceptance |
-| TASK-0029 | TASK-0028 | COMPLETE | YES | COMPLETE | PASSED (<code>VERIFY_STRICT=1 npm run verify:full</code> green with zero skips and zero warnings; Rust advisory status <strong>PASSED</strong> rather than indeterminate for the first time; live-system-database <code>pacman</code> still NOT EXECUTED, unchanged from TASK-0027) | PENDING USER | Full regression, security, CI, and release-candidate hardening |
-| TASK-0030 | TASK-0029 | NOT STARTED | NO | NOT STARTED | — | — | Final version 1.0 acceptance, release evidence, and handoff |
+| TASK-0029 | TASK-0028 | COMPLETE | YES | COMPLETE | PASSED (<code>VERIFY_STRICT=1 npm run verify:full</code> green with zero skips and zero warnings; Rust advisory status <strong>PASSED</strong> rather than indeterminate for the first time; live-system-database <code>pacman</code> still NOT EXECUTED, unchanged from TASK-0027) | COMPLETE (<code>f87effb</code> "task29"; backfilled by TASK-0030 Phase B from verified history) | Full regression, security, CI, and release-candidate hardening |
+| TASK-0030 | TASK-0029 | COMPLETE | YES | COMPLETE | PASSED (condensed live acceptance on real Arch / KDE Plasma 6 / Wayland; <code>PATH=$HOME/.cargo/bin:$PATH VERIFY_STRICT=1 npm run verify:full</code> exit 0 with zero skips and Rust advisory status PASSED; live-system-database <code>pacman -U</code>/<code>-R</code> EXECUTED at last; two cases recorded as exceptions rather than waived — Codex bounded-run BLOCKED by an external usage limit, spoken-voice pipeline NOT EXECUTED) | PENDING USER | Final version 1.0 acceptance, release evidence, and handoff |
 
 ## TASK-0001 evidence
 
@@ -2853,6 +2853,133 @@ roadmap.
   <code>ExperimentalWarning: localStorage is not available</code> during Vitest;
   the CI <code>frontend</code> job log on Node 22 was checked and does not
   contain it, so it is a local-runtime artifact and not a product warning
+- Git closure: <code>PENDING USER</code>
+
+## TASK-0030 evidence
+
+- Starting repository:
+  <code>/mnt/F/AI Agent OS/ai-agent-control-center-desktop</code>
+- Starting branch <code>main</code>; starting HEAD
+  <code>f87effb</code> (<code>task29</code>); clean tree; <code>main</code> and
+  <code>origin/main</code> aligned zero ahead / zero behind
+- Dependency: all seven successor-preflight conditions passed for TASK-0029 —
+  tracker Phase A COMPLETE / approval YES / Phase B COMPLETE / verification
+  PASSED; implementation commit <code>f87effb</code> identified from actual Git
+  history and confirmed by its scope (<code>.github/workflows/ci.yml</code>,
+  <code>.nvmrc</code>, <code>deny.toml</code>,
+  <code>scripts/check-packaging.sh</code>, <code>package-lock.json</code>, and
+  the new <code>release_gate_acceptance.rs</code>); that commit is the
+  checked-out HEAD and reachable from <code>origin/main</code>; zero/zero; clean
+  tree; no unexplained intervening state. Its Git closure is backfilled to
+  COMPLETE in this task's update
+- Phase A outcome: <code>PHASE_A_READY</code>; approval: the v3.0 continuation
+  <code>RUN_PROMPT.txt</code> for TASK-0030 is the task-level approval
+- <strong>Defect CI-1 — the release candidate had never had a green CI run.</strong>
+  GitHub Actions run <code>33553945326</code>, the first on the hardened
+  TASK-0029 candidate, was red: the axe scenario in
+  <code>src/app/desktopUiAcceptance.test.tsx</code> measured 5168 ms on the
+  pinned runner against Vitest's implicit 5000 ms default and timed out, while
+  passing locally in about half that. TASK-0029's final gate had been run
+  locally only. A deterministic gate may not return a different verdict on a
+  slower host, so both page-walking scenarios now declare an explicit 30 s
+  budget, and a tenth S10 scenario
+  (<code>s10_page_walking_acceptance_scenarios_declare_an_explicit_time_budget</code>)
+  structurally forbids any page-walking scenario from inheriting the default.
+  Confirmed to fail against the pre-fix file
+- <strong>Defect D1 — backup export destination.</strong> The export saved
+  through a <code>Blob</code> + <code>&lt;a download&gt;</code> click. WebKitGTK
+  performs that download into the process's current working directory, and the
+  desktop entry sets no <code>Path=</code>, so the destination depended on how
+  the application was launched and was never reported to the operator, who also
+  could not choose it. Replaced with a backend <code>save_backup_file</code>
+  command driven by <code>kdialog --getsavefilename</code>, mirroring the
+  existing <code>choose_workspace_folder_sync</code> pattern; the destination
+  comes from the native dialog, never the renderer, and the suggested name is
+  reduced to its final path component. <strong>Correction on record:</strong>
+  this was first reported as "writes no file at all" and escalated to a
+  release-blocking data-loss trap. That was a diagnostic error —
+  <code>find / -xdev</code> cannot reach the repository, which is on a different
+  filesystem mounted at <code>/mnt/F</code> — and the pre-fix export did write a
+  12987-byte file into the working directory. The severity is usability and
+  predictability, not data loss. The owner reviewed the corrected rationale and
+  elected to keep the fix; the three code comments carrying the false claim were
+  corrected before any commit
+- <strong>Defect D2 — the import control was unreachable by keyboard.</strong>
+  "Import backup" was a <code>&lt;label&gt;</code> wrapping a
+  <code>display: none</code> file input. A label is not focusable and the hidden
+  input is outside the tab order, so a keyboard-only operator could never
+  restore a backup; axe raised nothing because a hidden input is no violation
+  and the label carried no interactive role. Observed live: Tab from "Export
+  backup" landed on "Reset portable state". Now a real
+  <code>&lt;button&gt;</code> owning the tab stop and forwarding to a
+  <code>tabIndex={-1}</code> input, with the frontend regression "keeps both
+  backup controls reachable from the keyboard"
+- <strong>Defect D3 — the provider's failure reason was discarded.</strong>
+  <code>codex_runtime.rs</code> mapped every <code>turn.failed</code> /
+  <code>error</code> event to the fixed string "Codex reported a failed turn.",
+  throwing away the message Codex supplied. A usage-limit stop, which names its
+  reset time, was therefore indistinguishable from a crash. The reason is now
+  surfaced, bounded to 300 characters and stripped of control characters because
+  it is untrusted provider output. Regressed by
+  <code>task_0030_runtime_surfaces_the_reason_codex_gave_for_a_failed_turn</code>
+  over three fixture shapes, including one with no reason to quote, which must
+  still produce the original message
+- <strong>Scope note, recorded rather than hidden:</strong> D1 and D2 are
+  functional changes inside <strong>TASK-0026</strong>'s data-lifecycle and
+  frontend scope, and D3 inside <strong>TASK-0024</strong>'s provider-runtime
+  scope. Both tasks were closed. TASK-0030 owns <em>executing</em> these cases,
+  which is how the defects surfaced, and the owner explicitly approved making
+  each correction here rather than reopening the predecessor tasks. The evidence
+  recorded for TASK-0024 and TASK-0026 is therefore no longer entirely
+  as-written; this entry is the pointer to what changed
+- Live acceptance, on the real machine with an isolated scratch data home
+  holding a <code>sqlite3 .backup</code> copy of the real prototype database:
+  startup and migration; approvals proven fail-closed in all three outcomes;
+  Codex identity and cancellation; Ollama discovery, bounded run, and 21.98 ms
+  cancellation; the XDG notification portal; KDE RemoteDesktop negotiation,
+  consent, bounded input and release; and backup export, reset, and import
+  executed through the running GUI, each gated by its own trusted native dialog.
+  The real user database was verified unchanged throughout — 430080 bytes,
+  mtime 2026-08-30 18:38:07
+- <strong>The live system-database <code>pacman</code> gap, open since
+  TASK-0027, is closed.</strong> The owner supplied the root password for that
+  authorized transaction only; it was never written to any file, log, evidence
+  document, or memory. <code>pacman -U</code> exit 0 against the live database,
+  all ten owned files present, the packaged binary ran, desktop entry and
+  AppStream validated; <code>pacman -R</code> exit 0, every owned file removed,
+  and per-user data survived exactly as the install hook promises — database
+  intact with 13 agents and voice models untouched, the user-local install
+  unaffected, PlasmaShell not restarted
+- Recorded exceptions, neither waived: the Codex bounded-run completion case is
+  <strong>BLOCKED</strong> by an external ChatGPT usage limit resetting
+  2026-09-07, verified outside the application by invoking <code>codex</code>
+  directly; and a spoken microphone command through the full GUI pipeline is
+  <strong>NOT EXECUTED</strong> because it needs a human voice
+- Release decision: <strong>GO</strong>, taken by the owner with both exceptions
+  visible. Version promoted 0.5.1 → 1.0.0 across all seven coupled locations,
+  with the AppStream release now <code>type="stable"</code> and the TASK-0019
+  <code>type="development"</code> tripwire inverted rather than deleted
+- Final gate on the released tree: <code>makepkg -f --noconfirm</code> exit 0
+  producing <code>ai-agent-control-center 1.0.0-1</code>, then
+  <code>PATH="$HOME/.cargo/bin:$PATH" VERIFY_STRICT=1 npm run verify:full</code>
+  exit <strong>0</strong> with zero skips — 26 frontend files / 97 tests, 7
+  Python tests, rustfmt, 305 Rust tests with 8 <code>#[ignore]</code>d live
+  scenarios excluded by design, 71-module build, Clippy with
+  <code>-D warnings</code>, both npm audits reporting 0 vulnerabilities, 541
+  crates all permissive, 89 script-gate <code>ok</code> checks, shellcheck, and
+  <code>cargo deny check advisories</code> → <code>advisories ok</code>. Rust
+  advisory status <strong>PASSED</strong>
+- Release artifacts:
+  <code>packaging/ai-agent-control-center-1.0.0-1-x86_64.pkg.tar.zst</code>
+  sha256
+  <code>9bded22019e01b59641c4f26e218b97da5328101a45e124bf423e5f1d09bbf8d</code>,
+  7440431 bytes; <code>src-tauri/target/release/ai-agent-control-center</code>
+  sha256
+  <code>516cbbaff6f4a84dbbc14772efbd273e26e28fe8c3ef0ec7e1a05be566d85825</code>,
+  30057080 bytes, reporting <code>ai-agent-control-center 1.0.0</code>
+- Evidence directory: <code>planning/acceptance/</code> — final matrix, release
+  evidence, known limitations, and owner handoff
+- No tag, GitHub release, publish, or external distribution step was performed
 - Git closure: <code>PENDING USER</code>
 
 ## Successor-preflight closure rule

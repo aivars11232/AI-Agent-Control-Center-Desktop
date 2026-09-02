@@ -584,9 +584,22 @@ fn s8_release_version_is_consistent_across_every_shipped_manifest() {
         metainfo.contains(&format!("<release version=\"{version}\"")),
         "the AppStream metainfo has no release entry for {version}"
     );
+    // TASK-0019 set this tripwire to keep the shipped metadata honest while the
+    // product was pre-production. TASK-0030 ran the final acceptance and the
+    // gate passed, so the newest release is now the stable 1.0.0 entry. The
+    // assertion is inverted rather than deleted: the newest release must not
+    // silently fall back to a development build.
+    let newest_release = metainfo
+        .split("<release ")
+        .nth(1)
+        .expect("the metainfo declares at least one release");
     assert!(
-        metainfo.contains("type=\"development\""),
-        "the release must stay marked development until the 1.0 gate passes"
+        newest_release.contains("type=\"stable\""),
+        "the newest release must be marked stable now that the 1.0 gate has passed"
+    );
+    assert!(
+        newest_release.contains(&format!("version=\"{version}\"")),
+        "the newest release entry must be {version}"
     );
 }
 

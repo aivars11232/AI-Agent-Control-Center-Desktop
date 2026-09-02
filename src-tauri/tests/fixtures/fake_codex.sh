@@ -113,6 +113,26 @@ case "$scenario" in
   malformed)
     printf '%s\n' '{not-json'
     ;;
+  turn_failed)
+    # Shaped like the real usage-limit stop, which is the case that exposed the
+    # discarded reason during TASK-0030 live acceptance.
+    printf '%s\n' \
+      '{"type":"thread.started","thread_id":"thread-failed"}' \
+      '{"type":"turn.started"}' \
+      '{"type":"turn.failed","error":{"message":"You'"'"'ve hit your usage limit. Try again at Sep 7th, 2026 12:44 PM."}}'
+    ;;
+  turn_failed_bare)
+    printf '%s\n' \
+      '{"type":"thread.started","thread_id":"thread-failed"}' \
+      '{"type":"turn.started"}' \
+      '{"type":"error","message":"upstream refused the request"}'
+    ;;
+  turn_failed_unlabelled)
+    printf '%s\n' \
+      '{"type":"thread.started","thread_id":"thread-failed"}' \
+      '{"type":"turn.started"}' \
+      '{"type":"turn.failed"}'
+    ;;
   missing_final)
     printf '%s\n' \
       '{"type":"thread.started","thread_id":"thread-fixture"}' \

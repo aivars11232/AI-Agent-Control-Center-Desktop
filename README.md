@@ -2,9 +2,10 @@
 
 AI Agent Control Center is a local Tauri desktop application for defining AI
 agents, assigning work, reviewing results, and controlling access to local
-workspaces. The checked-in application is a functional **version 0.5.1
-development prototype**. It is not production-ready; production readiness is
-reserved for the TASK-0020 release gate.
+workspaces. The checked-in application is **version 1.0.0**. The sequential live
+acceptance and release gate passed on Arch Linux with KDE Plasma 6 on
+Wayland; the evidence, the exact tested artifacts, and the known limitations
+are recorded in [planning/acceptance/](planning/acceptance/).
 
 Start with [START_HERE.md](START_HERE.md). It identifies the authoritative
 project documents, their ownership, and the rule used to resolve conflicting

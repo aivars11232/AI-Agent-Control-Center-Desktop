@@ -5,9 +5,11 @@ planning or implementing repository work.
 
 ## Release status
 
-The current checkout is a functional version 0.5.1 development prototype. It
-is **not production-ready**. Only successful completion of the TASK-0020 live
-acceptance and release gate may change that statement.
+The current checkout is **version 1.0.0**. The TASK-0020 live acceptance and
+release gate, completed through the TASK-0021 - TASK-0030 continuation, passed
+on Arch Linux with KDE Plasma 6 on Wayland. The release decision, the exact
+tested artifacts, and the known limitations are recorded in
+[planning/acceptance/](planning/acceptance/).
 
 ## Required reading order
 

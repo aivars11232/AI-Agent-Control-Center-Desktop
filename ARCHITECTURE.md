@@ -1,6 +1,6 @@
 # Architecture
 
-This document separates the architecture that exists in version 0.5.1 from the
+This document separates the architecture that exists in version 1.0.0 from the
 approved direction for later tasks. A **planned** component name is not evidence
 that a corresponding module or guarantee exists today.
 

@@ -974,6 +974,16 @@ export function AppController() {
     return desktopClient.exportBackup();
   }
 
+  async function saveApplicationBackup(
+    fileName: string,
+    backupJson: string,
+  ): Promise<string | null> {
+    if (!desktopRuntime) {
+      throw new Error("Application persistence is not ready.");
+    }
+    return desktopClient.saveBackupFile(fileName, backupJson);
+  }
+
   async function adoptMonitoringMutation(
     result: MonitoringMutationResult,
   ): Promise<void> {
@@ -1534,6 +1544,7 @@ export function AppController() {
             onImportBackup={importApplicationBackup}
             onPreviewBackup={previewApplicationBackup}
             onExportBackup={exportApplicationBackup}
+            onSaveBackup={saveApplicationBackup}
             onResetApplication={resetPersistedApplication}
             monitoringSnapshot={displayedMonitoringSnapshot}
           />

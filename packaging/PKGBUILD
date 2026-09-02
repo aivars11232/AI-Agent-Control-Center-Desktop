@@ -7,7 +7,7 @@
 # This is proprietary software (see LICENSE); it is not published to the AUR.
 
 pkgname=ai-agent-control-center
-pkgver=0.5.1
+pkgver=1.0.0
 pkgrel=1
 pkgdesc="Local desktop control center for governing, routing, and auditing bounded AI agents"
 arch=('x86_64')

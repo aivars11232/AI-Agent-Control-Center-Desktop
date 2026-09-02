@@ -678,3 +678,78 @@ fn s10_rust_and_npm_license_gates_encode_one_consistent_policy() {
         "an unknown crate source must fail the release gate"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 10 — the deterministic frontend gate does not depend on host speed
+// ---------------------------------------------------------------------------
+
+/// The TASK-0030 preflight defect, reproduced as a structural test.
+///
+/// CI run 33553945326 — the first run on the hardened TASK-0029 candidate —
+/// was red: `desktopUiAcceptance.test.tsx`'s axe walk over all nine pages took
+/// 5168 ms on the pinned runner and hit Vitest's implicit 5000 ms default,
+/// while the same scenario passed on the development machine in half that. The
+/// full local gate had been green, so the candidate looked releasable while its
+/// branch gate was failing.
+///
+/// A deterministic gate may not return a different verdict on a slower host.
+/// Every scenario that walks the whole page set is therefore required to
+/// declare its own budget rather than inherit the tool's default, which encodes
+/// an assumption about machine speed that no acceptance scenario should carry.
+#[test]
+fn s10_page_walking_acceptance_scenarios_declare_an_explicit_time_budget() {
+    let suite = read_shipped("src/app/desktopUiAcceptance.test.tsx");
+    let lines: Vec<&str> = suite.lines().collect();
+
+    // Scenarios are `it(` blocks at one level of indentation inside `describe`,
+    // closed by a terminator at the same indentation.
+    let scenario_starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("  it("))
+        .map(|(index, _)| index)
+        .collect();
+    assert!(
+        scenario_starts.len() >= 6,
+        "failed to parse the desktop acceptance scenarios; found {}",
+        scenario_starts.len()
+    );
+
+    let mut walkers = 0usize;
+    for (position, &start) in scenario_starts.iter().enumerate() {
+        let end = scenario_starts
+            .get(position + 1)
+            .copied()
+            .unwrap_or(lines.len());
+        let body = &lines[start..end];
+
+        // Only the scenarios that drive every page carry the cost that made
+        // the default budget unsafe.
+        let walks_every_page = body
+            .iter()
+            .any(|line| line.contains("of PAGES") || line.contains("PAGES.filter("));
+        if !walks_every_page {
+            continue;
+        }
+        walkers += 1;
+
+        let terminator = body
+            .iter()
+            .rev()
+            .find(|line| line.starts_with("  }"))
+            .unwrap_or_else(|| panic!("scenario at line {} has no terminator", start + 1));
+        assert!(
+            terminator.starts_with("  }, ") && terminator.ends_with(");"),
+            "the scenario at line {} walks every page but closes with `{}`, so \
+             it inherits Vitest's implicit default timeout and its verdict \
+             depends on how fast the host is — declare an explicit budget",
+            start + 1,
+            terminator.trim()
+        );
+    }
+
+    assert!(
+        walkers >= 2,
+        "expected the page-walking scenarios to be present; found {walkers}"
+    );
+}

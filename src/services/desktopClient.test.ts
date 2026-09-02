@@ -298,6 +298,7 @@ describe("typed desktop client command contracts", () => {
     });
     await client.clearMonitoringActivity(revision);
     await client.exportBackup();
+    await client.saveBackupFile("backup.json", "{\"version\":4}");
     await client.previewBackupImport(9, "{\"version\":3}");
     await client.applyBackupImport(9, "{\"version\":3}");
 
@@ -336,6 +337,10 @@ describe("typed desktop client command contracts", () => {
         args: { request: { expectedRevision: revision } },
       },
       { command: "export_backup", args: undefined },
+      {
+        command: "save_backup_file",
+        args: { fileName: "backup.json", backupJson: "{\"version\":4}" },
+      },
       {
         command: "preview_backup_import",
         args: {

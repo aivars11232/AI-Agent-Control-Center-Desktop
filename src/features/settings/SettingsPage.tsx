@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 import type { Agent, AgentPerformance, AgentStatus, AppPreferences, ApprovalRequest, ExecutionFocus, HistoryRetentionDays, InterfaceDensity, ModelDefinition, OverflowAction, Reminder, ReviewMode, RoutingMode, SafetyMode, TaskCategory, TaskPriority, ThemeMode, WorkspaceDefinition, AccentColor } from "../../applicationState";
 import { LEGACY_STORAGE_KEYS, persistenceErrorMessage } from "../../persistence";
 import { executableModels, providerRuntimeStatus } from "../../providerRegistry";
@@ -88,6 +88,7 @@ export function SettingsPage({
   onImportBackup,
   onPreviewBackup,
   onExportBackup,
+  onSaveBackup,
   onResetApplication,
   monitoringSnapshot,
 }: {
@@ -121,6 +122,7 @@ export function SettingsPage({
   onImportBackup: (backupJson: string) => Promise<void>;
   onPreviewBackup: (backupJson: string) => Promise<BackupImportPreview>;
   onExportBackup: () => Promise<BackupExport>;
+  onSaveBackup: (fileName: string, backupJson: string) => Promise<string | null>;
   onResetApplication: (confirmation: string) => Promise<void>;
   monitoringSnapshot: MonitoringSnapshot | null;
 }) {
@@ -145,6 +147,7 @@ export function SettingsPage({
   } | null>(null);
   const [backupMessage, setBackupMessage] = useState("");
   const [backupBusy, setBackupBusy] = useState(false);
+  const importFileInput = useRef<HTMLInputElement>(null);
   const codexStatus = providerRuntimeStatus(providerRegistry, "codex");
   const codexReady = codexStatus?.availability === "ready";
   const codexMessage =
@@ -383,9 +386,17 @@ export function SettingsPage({
     try {
       if (isDesktopRuntime()) {
         const backup = await onExportBackup();
-        downloadBackup(backup.backupJson, backup.fileName);
+        // The installed application saves through a native dialog rather than a
+        // webview download: WebKitGTK writes an `<a download>` blob into the
+        // process's working directory, so the destination depended on how the
+        // app was launched and was never reported to the operator.
+        const savedPath = await onSaveBackup(backup.fileName, backup.backupJson);
+        if (savedPath === null) {
+          setBackupMessage("Export cancelled. No backup file was written.");
+          return;
+        }
         setBackupMessage(
-          `Exported ${backup.byteLength.toLocaleString()} bytes from the authoritative backend with ${backup.counts.reminders} reminder/event schedule(s) and ${backup.counts.memoryRecords} structured memory record(s). Runtime authority, portal delivery evidence, management handoffs, and provider credentials were omitted.`,
+          `Saved ${backup.byteLength.toLocaleString()} bytes to ${savedPath} with ${backup.counts.reminders} reminder/event schedule(s) and ${backup.counts.memoryRecords} structured memory record(s). Runtime authority, portal delivery evidence, management handoffs, and provider credentials were omitted.`,
         );
         return;
       }
@@ -1516,24 +1527,36 @@ export function SettingsPage({
             Export backup
           </button>
 
-          <label className="secondary-button" style={{ cursor: "pointer" }}>
+          {/* A `<label>` wrapping a `display: none` file input is not
+              focusable and the hidden input is outside the tab order, so this
+              control could only be reached with a pointer — restoring a backup
+              was impossible from the keyboard. The button owns the tab stop and
+              forwards to the input, which stays visually hidden. */}
+          <button
+            className="secondary-button"
+            disabled={backupBusy}
+            onClick={() => importFileInput.current?.click()}
+          >
             Import backup
-            <input
-              type="file"
-              disabled={backupBusy}
-              accept="application/json,.json"
-              style={{ display: "none" }}
-              onChange={(event) => {
-                const file = event.target.files?.[0];
+          </button>
+          <input
+            ref={importFileInput}
+            type="file"
+            tabIndex={-1}
+            aria-hidden="true"
+            disabled={backupBusy}
+            accept="application/json,.json"
+            style={{ display: "none" }}
+            onChange={(event) => {
+              const file = event.target.files?.[0];
 
-                if (file) {
-                  importData(file);
-                }
+              if (file) {
+                importData(file);
+              }
 
-                event.target.value = "";
-              }}
-            />
-          </label>
+              event.target.value = "";
+            }}
+          />
         </div>
 
         {backupPreview && (

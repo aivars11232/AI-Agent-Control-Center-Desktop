@@ -45,6 +45,19 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.0" type="stable" date="2026-09-02">
+      <description>
+        <p>
+          First production release. Sequential live acceptance passed on Arch
+          Linux with KDE Plasma 6 on Wayland: legacy state migration, approval
+          and policy enforcement through a trusted desktop confirmation, bounded
+          Codex and Ollama execution with prompt cancellation, offline voice and
+          XDG portal control, reminders and structured memory, portable backup
+          export, import, and reset, and a full system package install and
+          removal that preserves per-user data.
+        </p>
+      </description>
+    </release>
     <release version="0.5.1" type="development" date="2026-08-29">
       <description>
         <p>Development / pre-production build. Not production-ready.</p>
